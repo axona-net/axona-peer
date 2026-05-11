@@ -331,11 +331,18 @@ function onBridgeClose(ev) {
   cleanupBridgeTimers();
   bridge.ws = null;
   bridge.myConnId = null;
-  // Tear down the entire mesh: those connections were brokered through
-  // this bridge, and without it we can't recover them via peer-left
-  // notifications.  When the bridge comes back, the new peer-list will
-  // tell us who's still around.
-  mesh.dispose();
+  // We deliberately do NOT tear down the mesh here.  Existing WebRTC
+  // DataChannels are peer-to-peer; the bridge is not in the data path
+  // for them once they're open.  If a peer dies, our PC's own
+  // connectionstatechange will tell us — we don't need the bridge to
+  // notify us via peer-left.  This lets the mesh survive a bridge
+  // outage: peers keep ping/pong'ing each other while we reconnect.
+  //
+  // When the bridge comes back, the new `peer-list` is purely
+  // additive: we initiate to any peers in it that we don't already
+  // have.  Stale entries in our mesh (peers that died during the
+  // outage) will already be cleaning themselves up via WebRTC's own
+  // health monitoring.
   setBridgeState('disconnected');
   scheduleBridgeReconnect();
 }
