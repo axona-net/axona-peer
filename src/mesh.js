@@ -44,14 +44,26 @@ const RETRY_AFTER_MS   = 5000;   // single retry after pc-failed (B10)
 // our own to avoid the soft dependency.
 //
 // TURN is the next escalation, used when direct peer-to-peer is
-// blocked by symmetric NATs or strict firewalls.  We don't run a
-// TURN server yet; cross-NAT pairs that need relay will fail.  If
-// it becomes the dominant failure mode, we'll stand up a coturn
-// instance.
+// blocked by symmetric NATs or strict firewalls (cellular carriers
+// typically, double-NATs on tethered hotspots).  We run a coturn
+// instance on the same droplet as the bridge.  Credentials are a
+// static long-term pair for now; later we'll switch to short-lived
+// HMAC-signed credentials handed out by the bridge so the password
+// can't be skimmed from the page source.
+//
+// The TURN URL is keyed by IP because turn.axona.net DNS + TLS cert
+// aren't provisioned yet.  Once they are, the `turn:` entry becomes
+// `turn:turn.axona.net:3478` and we add a `turns:turn.axona.net:5349`
+// entry alongside it for clients on networks that block UDP 3478.
 const RTC_CONFIG = {
   iceServers: [
     { urls: 'stun:stun.l.google.com:19302'  },
     { urls: 'stun:stun1.l.google.com:19302' },
+    {
+      urls: 'turn:64.227.2.28:3478',
+      username:   'axonademo',
+      credential: 'a0f479670d8f533d2c5a5449c1c3bbaa',
+    },
   ],
 };
 
