@@ -33,27 +33,26 @@ const RETRY_AFTER_MS   = 5000;   // single retry after pc-failed (B10)
 
 // ── ICE configuration ───────────────────────────────────────────────
 //
-// For local testing across two browser tabs on the same machine we
-// deliberately use an EMPTY iceServers list.  That restricts ICE to
-// host candidates only (the loopback IP and any LAN interfaces),
-// which keeps the data path on 127.0.0.1 ↔ 127.0.0.1 and avoids the
-// failure mode where Chrome picks a non-loopback candidate pair
-// (LAN IP or STUN-discovered srflx) whose ICE consent-freshness
-// checks can fail independently of the actual peer connection.
+// STUN servers let each peer discover its public-facing (post-NAT)
+// IP and offer that as a candidate.  Cross-NAT pairs (e.g., a phone
+// on cellular talking to a laptop on home Wi-Fi) need this — without
+// STUN, peers only see each other's private host IPs and can't
+// reach each other.
 //
-// For cross-network deployment (Phase 2 / E onward) we'll need to
-// restore STUN servers — and probably add TURN — so peers on
-// different NATs can find each other.  Pattern for that:
+// We use Google's free public STUN servers.  They're stable and
+// widely used for WebRTC dev; for production we'd consider running
+// our own to avoid the soft dependency.
 //
-//   const RTC_CONFIG = {
-//     iceServers: [
-//       { urls: 'stun:stun.l.google.com:19302' },
-//       { urls: 'stun:stun1.l.google.com:19302' },
-//       // Add TURN here when we have one
-//     ],
-//   };
+// TURN is the next escalation, used when direct peer-to-peer is
+// blocked by symmetric NATs or strict firewalls.  We don't run a
+// TURN server yet; cross-NAT pairs that need relay will fail.  If
+// it becomes the dominant failure mode, we'll stand up a coturn
+// instance.
 const RTC_CONFIG = {
-  iceServers: [],
+  iceServers: [
+    { urls: 'stun:stun.l.google.com:19302'  },
+    { urls: 'stun:stun1.l.google.com:19302' },
+  ],
 };
 
 /**
