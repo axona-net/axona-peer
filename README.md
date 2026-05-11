@@ -1,6 +1,6 @@
 # axona-peer
 
-Phase 1 browser client for the [Axona](https://github.com/axona) protocol. Connects to an [`axona-bridge`](https://github.com/axona/axona-bridge) over WebSocket, sends a ping every second, and renders the connection state as a colored indicator.
+Phase 1 browser client for the [Axona](https://github.com/axona) protocol. Connects to an [`axona-bridge`](https://github.com/axona-net/axona-bridge) over WebSocket, sends a ping every second, and renders the connection state as a colored indicator.
 
 This is the visible substrate of the network. Phase 2 will add browser-to-browser connections (WebRTC) and a QR code so you can join the mesh from a phone; for now it's a single client talking to a single bridge.
 
@@ -46,7 +46,7 @@ The URL must use `ws://` for plain TCP or `wss://` for TLS. Browsers refuse `ws:
 
 ## Wire format
 
-Mirrors [axona-bridge](https://github.com/axona/axona-bridge):
+Mirrors [axona-bridge](https://github.com/axona-net/axona-bridge):
 
 | Direction | Type | Payload |
 |---|---|---|
