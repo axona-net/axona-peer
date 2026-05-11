@@ -84,7 +84,11 @@ const mesh = new MeshManager({
       ? Object.entries(extra).map(([k, v]) => `${k}=${v}`).join(' ')
       : '';
     appendLog(`mesh:${event}`, detail);
-    render();   // most mesh events imply state change
+    // No render() here — mesh state changes already trigger render via
+    // mesh.onChange().  Log-only events (ice-candidate-local, stats,
+    // pc-state transitions that don't change our `state` field) should
+    // not cause re-renders, since render() unnecessarily often makes
+    // the CSS blink animation invisible.
   },
 });
 
@@ -108,17 +112,35 @@ function appendLog(event, detail, kind) {
 }
 
 // ── Renderer ─────────────────────────────────────────────────────────
-// One render() pass rebuilds the peer table from the bridge state +
-// the mesh snapshot.  This is cheap enough at our scale (≤ ~30 rows
-// even in a small mesh) to not bother with diffing.
+//
+// Diffing renderer.  Each row's <tr> is created once and kept alive
+// across renders; only its text content and indicator class change in
+// place.  This is what makes the CSS blink animation continue smoothly:
+// removing-and-reinserting an element restarts its CSS animation, so a
+// naive "rebuild tbody on every render" approach with the previous
+// renderer caused the indicator to never visibly blink under high
+// render frequency (every pong fires a render).
+//
+// Note that we deliberately allow the indicator class to swap between
+// `.indicator-green` and `.indicator-yellow` — both declare the same
+// `animation: blink 1s step-end infinite`, so the browser keeps the
+// running animation rather than restarting it.  Only transitions to
+// `.indicator-red` (which has no animation) reset the cycle.
 
-function fmtRelative(ms) {
-  if (!ms) return '—';
-  const delta = Date.now() - ms;
-  if (delta < 1000) return `${delta} ms ago`;
-  if (delta < 60_000) return `${(delta / 1000).toFixed(1)} s ago`;
-  return `${Math.floor(delta / 60_000)} m ago`;
-}
+const INDICATOR_CLASS = {
+  disconnected:           'indicator-red',
+  failed:                 'indicator-red',
+  closed:                 'indicator-red',
+  new:                    'indicator-yellow',
+  connecting:             'indicator-yellow',
+  signaling:              'indicator-yellow',
+  'datachannel-opening':  'indicator-yellow',
+  stale:                  'indicator-yellow',
+  open:                   'indicator-green',
+};
+
+/** Cached row references — peerId → DOM nodes we update directly. */
+const rowElements = new Map();
 
 function fmtUptime(openedAt) {
   if (!openedAt) return '—';
@@ -128,91 +150,121 @@ function fmtUptime(openedAt) {
   return `${m}m ${s % 60}s`;
 }
 
-function renderRow({ peerId, label, kind, state, rttLast, rttAvg, pings, pongs, openedAt }) {
+function setText(node, text) {
+  if (node.nodeValue !== text) node.nodeValue = text;
+}
+function setClass(el, cls) {
+  if (el.className !== cls) el.className = cls;
+}
+
+function buildRow(peerId) {
   const tr = document.createElement('tr');
-  tr.className = `peer-row peer-row-${kind}`;
   tr.dataset.peerId = peerId;
 
-  // ── Indicator cell ──
+  // Indicator cell — the only animated element.
   const tdInd = document.createElement('td');
-  const indClass = {
-    disconnected:           'indicator-red',
-    failed:                 'indicator-red',
-    closed:                 'indicator-red',
-    new:                    'indicator-yellow',
-    connecting:             'indicator-yellow',
-    signaling:              'indicator-yellow',
-    'datachannel-opening':  'indicator-yellow',
-    stale:                  'indicator-yellow',
-    open:                   'indicator-green',
-  }[state] ?? 'indicator-red';
-  const dot = document.createElement('div');
-  dot.className = `indicator ${indClass}`;
-  tdInd.appendChild(dot);
+  const indicator = document.createElement('div');
+  indicator.className = 'indicator';
+  tdInd.appendChild(indicator);
   tr.appendChild(tdInd);
 
-  // ── Peer cell ──
+  // Peer cell — label + state subtext.
   const tdPeer = document.createElement('td');
-  const lbl = document.createElement('div');
-  lbl.className = 'peer-label';
-  lbl.textContent = label;
-  const sub = document.createElement('div');
-  sub.className = 'peer-sub';
-  sub.textContent = state;
-  tdPeer.appendChild(lbl);
-  tdPeer.appendChild(sub);
+  const labelEl = document.createElement('div');
+  labelEl.className = 'peer-label';
+  const labelText = document.createTextNode('');
+  labelEl.appendChild(labelText);
+  const stateEl = document.createElement('div');
+  stateEl.className = 'peer-sub';
+  const stateText = document.createTextNode('');
+  stateEl.appendChild(stateText);
+  tdPeer.appendChild(labelEl);
+  tdPeer.appendChild(stateEl);
   tr.appendChild(tdPeer);
 
-  // ── RTT cell ──
+  // RTT cell — primary value + " ms · avg N.N" sub.
   const tdRtt = document.createElement('td');
   tdRtt.className = 'cell-num';
-  if (rttLast != null) {
-    tdRtt.innerHTML = `${rttLast.toFixed?.(0) ?? rttLast}<span class="cell-sub">ms · avg ${rttAvg.toFixed(1)}</span>`;
-  } else {
-    tdRtt.textContent = '—';
-  }
+  const rttPrimary = document.createTextNode('—');
+  const rttSub = document.createElement('span');
+  rttSub.className = 'cell-sub';
+  const rttSubText = document.createTextNode('');
+  rttSub.appendChild(rttSubText);
+  tdRtt.appendChild(rttPrimary);
+  tdRtt.appendChild(rttSub);
   tr.appendChild(tdRtt);
 
-  // ── Traffic cell ──
+  // Traffic cell — pongs / sent.
   const tdTraf = document.createElement('td');
   tdTraf.className = 'cell-num';
-  tdTraf.innerHTML = `${pongs}<span class="cell-sub">${pings} sent</span>`;
+  const trafPrimary = document.createTextNode('0');
+  const trafSub = document.createElement('span');
+  trafSub.className = 'cell-sub';
+  const trafSubText = document.createTextNode('');
+  trafSub.appendChild(trafSubText);
+  tdTraf.appendChild(trafPrimary);
+  tdTraf.appendChild(trafSub);
   tr.appendChild(tdTraf);
 
-  // ── Uptime cell ──
+  // Uptime cell.
   const tdUp = document.createElement('td');
   tdUp.className = 'cell-num';
-  tdUp.textContent = fmtUptime(openedAt);
+  const upText = document.createTextNode('—');
+  tdUp.appendChild(upText);
   tr.appendChild(tdUp);
 
-  return tr;
+  return {
+    tr,
+    indicator,
+    labelText, stateText,
+    rttPrimary, rttSubText,
+    trafPrimary, trafSubText,
+    upText,
+  };
+}
+
+function updateRow(refs, data) {
+  setClass(refs.tr, `peer-row peer-row-${data.kind}`);
+  setClass(refs.indicator, `indicator ${INDICATOR_CLASS[data.state] ?? 'indicator-red'}`);
+  setText(refs.labelText, data.label);
+  setText(refs.stateText, data.state);
+
+  if (data.rttLast != null) {
+    setText(refs.rttPrimary, String(Math.round(data.rttLast)));
+    setText(refs.rttSubText, ` ms · avg ${data.rttAvg.toFixed(1)}`);
+  } else {
+    setText(refs.rttPrimary, '—');
+    setText(refs.rttSubText, '');
+  }
+
+  setText(refs.trafPrimary, String(data.pongs));
+  setText(refs.trafSubText, ` ${data.pings} sent`);
+  setText(refs.upText, fmtUptime(data.openedAt));
 }
 
 function render() {
-  $peerTable.innerHTML = '';
+  // Build the desired ordered list of row data.
+  const peers = mesh.getPeers().sort((a, b) =>
+    a.peerId < b.peerId ? -1 : a.peerId > b.peerId ? 1 : 0);
 
-  // Row 0: bridge (always present, even when disconnected)
   const bridgeRtt = bridge.rttBuffer.at(-1) ?? null;
   const bridgeAvg = bridge.rttBuffer.length
     ? bridge.rttBuffer.reduce((a, b) => a + b, 0) / bridge.rttBuffer.length
     : null;
-  $peerTable.appendChild(renderRow({
-    peerId:   BRIDGE_ROW_ID,
-    label:    'bridge',
-    kind:     'bridge',
-    state:    bridge.state,
-    rttLast:  bridgeRtt,
-    rttAvg:   bridgeAvg,
-    pings:    bridge.pings,
-    pongs:    bridge.pongs,
-    openedAt: bridge.connectedAt,
-  }));
 
-  // Rows 1..N: WebRTC peers, sorted by peerId for stability
-  const peers = mesh.getPeers().sort((a, b) =>
-    a.peerId < b.peerId ? -1 : a.peerId > b.peerId ? 1 : 0);
-  for (const p of peers) {
-    $peerTable.appendChild(renderRow({
+  const ordered = [
+    {
+      peerId:   BRIDGE_ROW_ID,
+      label:    'bridge',
+      kind:     'bridge',
+      state:    bridge.state,
+      rttLast:  bridgeRtt,
+      rttAvg:   bridgeAvg,
+      pings:    bridge.pings,
+      pongs:    bridge.pongs,
+      openedAt: bridge.connectedAt,
+    },
+    ...peers.map(p => ({
       peerId:   p.peerId,
       label:    p.peerId,
       kind:     'rtc',
@@ -222,7 +274,40 @@ function render() {
       pings:    p.pings,
       pongs:    p.pongs,
       openedAt: p.openedAt,
-    }));
+    })),
+  ];
+
+  // Remove rows for peers that have left.
+  const wanted = new Set(ordered.map(d => d.peerId));
+  for (const [pid, refs] of rowElements) {
+    if (!wanted.has(pid)) {
+      refs.tr.remove();
+      rowElements.delete(pid);
+    }
+  }
+
+  // Walk the desired order, reconciling DOM position with cached refs.
+  // We only call insertBefore/appendChild when the DOM is actually out
+  // of sync — in steady state this is a no-op, which is what keeps the
+  // CSS animations running.
+  let domCursor = $peerTable.firstElementChild;
+  for (const data of ordered) {
+    let refs = rowElements.get(data.peerId);
+    if (!refs) {
+      refs = buildRow(data.peerId);
+      rowElements.set(data.peerId, refs);
+    }
+    updateRow(refs, data);
+
+    if (refs.tr !== domCursor) {
+      // Either refs.tr isn't in DOM yet, or it's in DOM but at the
+      // wrong position.  insertBefore handles both cases.
+      $peerTable.insertBefore(refs.tr, domCursor);
+      // domCursor is unchanged — refs.tr was inserted *before* it.
+    } else {
+      // Already in the right slot; advance.
+      domCursor = domCursor.nextElementSibling;
+    }
   }
 
   // Header counts.
