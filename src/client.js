@@ -14,7 +14,8 @@
 //   green  — open + pongs flowing on schedule
 //
 // Bridge URL: configurable via ?bridge=ws[s]://... query string.
-// Default: ws://localhost:8080 for local dev.
+// Default: wss://bridge.axona.net (production).  Override with
+// ?bridge=ws://localhost:8080 for local development.
 // =====================================================================
 
 import { MeshManager } from './mesh.js';
