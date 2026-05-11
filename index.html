@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Axona Peer — Phase 1</title>
+  <link rel="stylesheet" href="src/styles.css">
+</head>
+<body>
+  <main>
+    <header>
+      <h1>Axona Peer</h1>
+      <p class="subtitle">Phase 1 · bridge connectivity test</p>
+    </header>
+
+    <section class="status">
+      <div id="indicator" class="indicator indicator-red" aria-label="connection state"></div>
+      <div class="status-text">
+        <div id="state-label" class="state-label">Disconnected</div>
+        <div id="bridge-url" class="bridge-url"></div>
+      </div>
+    </section>
+
+    <section class="metrics">
+      <div class="metric">
+        <span class="metric-label">RTT (last)</span>
+        <span id="rtt-last" class="metric-value">—</span>
+      </div>
+      <div class="metric">
+        <span class="metric-label">RTT (avg 10)</span>
+        <span id="rtt-avg" class="metric-value">—</span>
+      </div>
+      <div class="metric">
+        <span class="metric-label">Pings sent</span>
+        <span id="ping-count" class="metric-value">0</span>
+      </div>
+      <div class="metric">
+        <span class="metric-label">Pongs received</span>
+        <span id="pong-count" class="metric-value">0</span>
+      </div>
+      <div class="metric">
+        <span class="metric-label">conn id</span>
+        <span id="conn-id" class="metric-value">—</span>
+      </div>
+      <div class="metric">
+        <span class="metric-label">Connected for</span>
+        <span id="conn-uptime" class="metric-value">—</span>
+      </div>
+    </section>
+
+    <section class="log">
+      <div class="log-header">
+        <h2>Event log</h2>
+        <button id="log-clear" class="log-clear" type="button">clear</button>
+      </div>
+      <ul id="log-list" class="log-list"></ul>
+    </section>
+
+    <footer>
+      <p>
+        Override the bridge URL with <code>?bridge=ws://&hellip;</code> in the query string.
+        Source: <a href="https://github.com/axona-net/axona-peer">axona-net/axona-peer</a>.
+      </p>
+    </footer>
+  </main>
+
+  <script type="module" src="src/client.js"></script>
+</body>
+</html>
