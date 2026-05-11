@@ -3,49 +3,46 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Axona Peer — Phase 1</title>
+  <title>Axona Peer — Phase 2</title>
   <link rel="stylesheet" href="src/styles.css">
 </head>
 <body>
   <main>
     <header>
       <h1>Axona Peer</h1>
-      <p class="subtitle">Phase 1 · bridge connectivity test</p>
+      <p class="subtitle">Phase 2 · WebRTC mesh</p>
     </header>
 
-    <section class="status">
-      <div id="indicator" class="indicator indicator-red" aria-label="connection state"></div>
-      <div class="status-text">
-        <div id="state-label" class="state-label">Disconnected</div>
-        <div id="bridge-url" class="bridge-url"></div>
+    <section class="me">
+      <div class="me-row">
+        <span class="me-label">my id</span>
+        <span id="my-id" class="me-value">—</span>
+      </div>
+      <div class="me-row">
+        <span class="me-label">bridge</span>
+        <span id="bridge-url" class="me-value mono"></span>
+      </div>
+      <div class="me-row">
+        <span class="me-label">mesh peers (open / known)</span>
+        <span id="mesh-count" class="me-value">0 of 0</span>
       </div>
     </section>
 
-    <section class="metrics">
-      <div class="metric">
-        <span class="metric-label">RTT (last)</span>
-        <span id="rtt-last" class="metric-value">—</span>
-      </div>
-      <div class="metric">
-        <span class="metric-label">RTT (avg 10)</span>
-        <span id="rtt-avg" class="metric-value">—</span>
-      </div>
-      <div class="metric">
-        <span class="metric-label">Pings sent</span>
-        <span id="ping-count" class="metric-value">0</span>
-      </div>
-      <div class="metric">
-        <span class="metric-label">Pongs received</span>
-        <span id="pong-count" class="metric-value">0</span>
-      </div>
-      <div class="metric">
-        <span class="metric-label">conn id</span>
-        <span id="conn-id" class="metric-value">—</span>
-      </div>
-      <div class="metric">
-        <span class="metric-label">Connected for</span>
-        <span id="conn-uptime" class="metric-value">—</span>
-      </div>
+    <section class="peers">
+      <table class="peer-table">
+        <thead>
+          <tr>
+            <th class="col-ind"></th>
+            <th class="col-peer">peer</th>
+            <th class="col-rtt">RTT</th>
+            <th class="col-traf">pongs</th>
+            <th class="col-up">up</th>
+          </tr>
+        </thead>
+        <tbody id="peer-table-body">
+          <!-- rows are rendered by client.js -->
+        </tbody>
+      </table>
     </section>
 
     <section class="log">
