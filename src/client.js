@@ -40,7 +40,10 @@ const $logClear    = document.getElementById('log-clear');
 function getBridgeUrl() {
   const fromQs = new URLSearchParams(location.search).get('bridge');
   if (fromQs) return fromQs;
-  return 'ws://localhost:8080';
+  // Default bridge: the project-operated public introducer.  Override
+  // via ?bridge=ws://localhost:8080 for local development against a
+  // bridge running on your own machine.
+  return 'wss://bridge.axona.net';
 }
 const bridgeUrl = getBridgeUrl();
 $bridgeUrl.textContent = bridgeUrl;
