@@ -225,6 +225,15 @@ export class MeshManager {
 
     pc.onicecandidate = (ev) => {
       if (!ev.candidate) return;
+      // Log every candidate we generate locally; helps diagnose which
+      // address family / interface is being offered.
+      this._log('ice-candidate-local', {
+        peerId: state.peerId,
+        type:   ev.candidate.type,                  // 'host' | 'srflx' | 'prflx' | 'relay'
+        proto:  ev.candidate.protocol,              // 'udp' | 'tcp'
+        addr:   ev.candidate.address,
+        port:   ev.candidate.port,
+      });
       this._sendSignal(state.peerId, {
         kind: 'ice',
         candidate: ev.candidate.toJSON(),
@@ -234,10 +243,11 @@ export class MeshManager {
     pc.onconnectionstatechange = () => {
       this._log('pc-state', {
         peerId: state.peerId,
-        pc: pc.connectionState,
+        pc:     pc.connectionState,
       });
       if (pc.connectionState === 'failed') {
         state.state = 'failed';
+        this._dumpStats(state, 'on-failed');
         this._scheduleRetry(state);
         this._notify();
       } else if (pc.connectionState === 'closed') {
@@ -246,7 +256,56 @@ export class MeshManager {
       }
     };
 
+    // ICE-level state transitions: 'new' → 'checking' → 'connected' →
+    // 'completed' → 'disconnected' → 'failed' → 'closed'.  More
+    // granular than connectionState; in particular it shows the
+    // 'disconnected' phase, where consent freshness has started to
+    // fail but the PC hasn't given up yet.
+    pc.oniceconnectionstatechange = () => {
+      this._log('ice-state', {
+        peerId: state.peerId,
+        ice:    pc.iceConnectionState,
+      });
+      if (pc.iceConnectionState === 'disconnected' ||
+          pc.iceConnectionState === 'failed') {
+        this._dumpStats(state, `ice-${pc.iceConnectionState}`);
+      }
+    };
+
     return pc;
+  }
+
+  /** Dump the nominated candidate pair + transport stats. */
+  async _dumpStats(state, when) {
+    if (!state.pc) return;
+    try {
+      const stats = await state.pc.getStats();
+      let pair = null, local = null, remote = null;
+      stats.forEach(s => {
+        if (s.type === 'candidate-pair' && s.nominated) pair = s;
+      });
+      if (pair) {
+        stats.forEach(s => {
+          if (s.id === pair.localCandidateId)  local  = s;
+          if (s.id === pair.remoteCandidateId) remote = s;
+        });
+      }
+      this._log('stats', {
+        peerId: state.peerId,
+        when,
+        pairState:    pair?.state,
+        bytesSent:    pair?.bytesSent,
+        bytesRecv:    pair?.bytesReceived,
+        local:  local
+          ? `${local.candidateType}/${local.protocol} ${local.ip ?? local.address}:${local.port}`
+          : 'unknown',
+        remote: remote
+          ? `${remote.candidateType}/${remote.protocol} ${remote.ip ?? remote.address}:${remote.port}`
+          : 'unknown',
+      });
+    } catch (err) {
+      this._log('stats-failed', { peerId: state.peerId, err: err.message });
+    }
   }
 
   async _initiateTo(peerId) {
@@ -329,6 +388,9 @@ export class MeshManager {
       }
       state.retryUsed = false;
       this._log('dc-open', { peerId: state.peerId, role: state.role });
+      // Dump the nominated candidate pair so we can see what
+      // address family / protocol the data path is actually using.
+      this._dumpStats(state, 'dc-open');
       this._startPingLoop(state);
       this._startStaleChecker(state);
       this._notify();
