@@ -31,11 +31,29 @@ const RTT_WINDOW       = 10;
 const DC_LABEL         = 'axona';
 const RETRY_AFTER_MS   = 5000;   // single retry after pc-failed (B10)
 
+// ── ICE configuration ───────────────────────────────────────────────
+//
+// For local testing across two browser tabs on the same machine we
+// deliberately use an EMPTY iceServers list.  That restricts ICE to
+// host candidates only (the loopback IP and any LAN interfaces),
+// which keeps the data path on 127.0.0.1 ↔ 127.0.0.1 and avoids the
+// failure mode where Chrome picks a non-loopback candidate pair
+// (LAN IP or STUN-discovered srflx) whose ICE consent-freshness
+// checks can fail independently of the actual peer connection.
+//
+// For cross-network deployment (Phase 2 / E onward) we'll need to
+// restore STUN servers — and probably add TURN — so peers on
+// different NATs can find each other.  Pattern for that:
+//
+//   const RTC_CONFIG = {
+//     iceServers: [
+//       { urls: 'stun:stun.l.google.com:19302' },
+//       { urls: 'stun:stun1.l.google.com:19302' },
+//       // Add TURN here when we have one
+//     ],
+//   };
 const RTC_CONFIG = {
-  iceServers: [
-    { urls: 'stun:stun.l.google.com:19302' },
-    { urls: 'stun:stun1.l.google.com:19302' },
-  ],
+  iceServers: [],
 };
 
 /**
