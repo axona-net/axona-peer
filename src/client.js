@@ -288,7 +288,7 @@ function updateRow(refs, data) {
   // empty so spacing collapses cleanly.  Tooltip on the row carries
   // the precise pair (e.g. "path: srflx ↔ relay") for the curious.
   const viaRelay = data.localCand === 'relay' || data.remoteCand === 'relay';
-  setText(refs.pathBadgeText, viaRelay ? ' · via TURN' : '');
+  setText(refs.pathBadgeText, viaRelay ? ' · TURN' : '');
   const title = (data.localCand && data.remoteCand)
     ? `path: ${data.localCand} ↔ ${data.remoteCand}`
     : '';
@@ -554,6 +554,74 @@ function scheduleBridgeReconnect() {
     connectBridge();
   }, bridge.backoffMs);
 }
+
+// ── Page-resume reset ────────────────────────────────────────────────
+//
+// When a phone backgrounds the tab (lock screen, app switcher) or the
+// laptop sleeps, mobile browsers heavily throttle our timers and the
+// OS often kills the WebSocket.  By the time we come back the remote
+// side has long since seen us peer-leave; our RTCPeerConnections are
+// zombie shells that won't recover on their own and the indicators
+// sit yellow indefinitely.
+//
+// The simplest fix that always works: when the page becomes visible
+// again after a non-trivial absence, tear down every WebRTC peer and
+// force-reconnect the bridge.  The fresh peer-list rebuilds the mesh
+// from scratch.  Cheap and correct — there's no per-peer state worth
+// salvaging once the underlying transport has died.
+
+const RESUME_HIDDEN_THRESHOLD_MS = 5000;   // ignore brief tab switches
+let hiddenAt = 0;
+
+function resetMesh(reason) {
+  appendLog('resume', reason, 'ok');
+  mesh.reset();
+  forceReconnectBridge();
+}
+
+function forceReconnectBridge() {
+  bridge.backoffMs = BACKOFF_INITIAL_MS;
+  clearTimeout(bridge.reconnectTimer);
+  bridge.reconnectTimer = null;
+  if (bridge.ws && bridge.ws.readyState !== WebSocket.CLOSED) {
+    // Closing here triggers onclose → scheduleBridgeReconnect, which
+    // honours the backoff we just reset.  No need to call connectBridge
+    // directly; that would race the close-handler's reconnect.
+    try { bridge.ws.close(1000, 'resume'); } catch {}
+  } else {
+    bridge.ws = null;
+    cleanupBridgeTimers();
+    setBridgeState('disconnected');
+    connectBridge();
+  }
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') {
+    hiddenAt = Date.now();
+    return;
+  }
+  // visibility === 'visible'
+  if (!hiddenAt) return;
+  const wasHiddenFor = Date.now() - hiddenAt;
+  hiddenAt = 0;
+  if (wasHiddenFor >= RESUME_HIDDEN_THRESHOLD_MS) {
+    resetMesh(`visible after ${(wasHiddenFor / 1000).toFixed(1)}s`);
+  }
+});
+
+// Network came back from offline.  Almost certainly a phone leaving
+// airplane mode or a laptop reattaching to Wi-Fi.  Always reset.
+window.addEventListener('online', () => {
+  resetMesh('network online');
+});
+
+// Restoration from the back-forward cache.  iOS Safari is aggressive
+// about putting backgrounded pages here.  When we come back from
+// bfcache, every timer and socket has been frozen — reset to be safe.
+window.addEventListener('pageshow', (ev) => {
+  if (ev.persisted) resetMesh('pageshow from bfcache');
+});
 
 // ── UI controls ──────────────────────────────────────────────────────
 $logClear.addEventListener('click', () => { $logList.innerHTML = ''; });

@@ -149,6 +149,21 @@ export class MeshManager {
     this._listeners.clear();
   }
 
+  /**
+   * Tear down every WebRTC peer but keep listeners + myId intact.
+   * Used by the page-resume handler: when the device wakes from sleep
+   * or the tab returns from background, every PC and DataChannel is
+   * likely zombie — the remote side has long since seen us go away.
+   * Easier to nuke and let the bridge's peer-list rebuild than to try
+   * to detect-and-renegotiate per peer.
+   */
+  reset() {
+    for (const id of [...this._peers.keys()]) {
+      this._teardown(id, 'reset');
+    }
+    this._notify();
+  }
+
   _notify() {
     const snap = this.getPeers();
     for (const cb of this._listeners) {

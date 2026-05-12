@@ -300,6 +300,7 @@ header .subtitle {
   text-transform: uppercase;
   letter-spacing: 0.08em;
   margin-top: 2px;
+  white-space: nowrap;
 }
 
 /* Yellow "via TURN" hint, appended to .peer-sub when the nominated
