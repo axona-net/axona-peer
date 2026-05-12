@@ -21,6 +21,13 @@
 import { MeshManager } from './mesh.js';
 import { renderQR }    from './qr.js';
 
+// Peer build number.  Bump the middle digit on every code change so
+// you can confirm a redeployed page actually loaded (esp. on iOS,
+// where the bfcache can serve a stale module set for ages).  The
+// bridge version arrives separately in its `welcome` message; the
+// "version" row in the me panel shows both side by side.
+const PEER_VERSION = '0.1.0';
+
 const BRIDGE_PING_INTERVAL_MS = 1000;
 const BRIDGE_STALE_PONG_MS    = 3000;
 const RTT_WINDOW              = 10;
@@ -37,6 +44,7 @@ const $meshCount   = document.getElementById('mesh-count');
 const $peerTable   = document.getElementById('peer-table-body');
 const $logList     = document.getElementById('log-list');
 const $logClear    = document.getElementById('log-clear');
+const $version     = document.getElementById('version');
 const $qrLauncher  = document.getElementById('qr-launcher');
 const $qrOverlay   = document.getElementById('qr-overlay');
 const $qrOverlayImg = document.getElementById('qr-overlay-image');
@@ -102,12 +110,22 @@ const bridge = {
   connectedAt:  0,
   backoffMs:    BACKOFF_INITIAL_MS,
   myConnId:     null,
+  version:      null,           // populated by `welcome`
   // timers
   pingTimer:    null,
   staleTimer:   null,
   uptimeTimer:  null,
   reconnectTimer: null,
 };
+
+// "peer v0.1.0 · bridge v0.3.0" once the bridge has welcomed us.
+// Bridge half stays "—" until welcome arrives — that gap is itself
+// useful UX since it signals "WS still negotiating."
+function renderVersion() {
+  const bridgeStr = bridge.version ? `v${bridge.version}` : '—';
+  $version.textContent = `peer v${PEER_VERSION} · bridge ${bridgeStr}`;
+}
+renderVersion();
 
 // ── Mesh manager ─────────────────────────────────────────────────────
 const mesh = new MeshManager({
@@ -438,8 +456,10 @@ function onBridgeMessage(ev) {
   switch (msg.type) {
     case 'welcome':
       bridge.myConnId = msg.connId;
+      bridge.version  = msg.version ?? null;
       mesh.setMyId(msg.connId);
       appendLog('bridge:welcome', `id=${msg.connId} v${msg.version ?? '?'}`, 'ok');
+      renderVersion();
       render();
       break;
 
@@ -487,6 +507,8 @@ function onBridgeClose(ev) {
   cleanupBridgeTimers();
   bridge.ws = null;
   bridge.myConnId = null;
+  bridge.version  = null;
+  renderVersion();
   // We deliberately do NOT tear down the mesh here.  Existing WebRTC
   // DataChannels are peer-to-peer; the bridge is not in the data path
   // for them once they're open.  If a peer dies, our PC's own
