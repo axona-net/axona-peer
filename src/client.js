@@ -19,6 +19,7 @@
 // =====================================================================
 
 import { MeshManager } from './mesh.js';
+import { renderQR }    from './qr.js';
 
 const BRIDGE_PING_INTERVAL_MS = 1000;
 const BRIDGE_STALE_PONG_MS    = 3000;
@@ -36,6 +37,8 @@ const $meshCount   = document.getElementById('mesh-count');
 const $peerTable   = document.getElementById('peer-table-body');
 const $logList     = document.getElementById('log-list');
 const $logClear    = document.getElementById('log-clear');
+const $qrCode      = document.getElementById('qr-code');
+const $shareUrl    = document.getElementById('share-url');
 
 // ── Bridge URL resolution ────────────────────────────────────────────
 function getBridgeUrl() {
@@ -48,6 +51,14 @@ function getBridgeUrl() {
 }
 const bridgeUrl = getBridgeUrl();
 $bridgeUrl.textContent = bridgeUrl;
+
+// ── Share QR ─────────────────────────────────────────────────────────
+// Encode the current full URL — including any ?bridge= override — so a
+// phone that scans it lands on the same mesh.  We don't reconstruct
+// the URL; location.href is the canonical source of truth for "where
+// am I right now."
+$shareUrl.textContent = location.href;
+renderQR($qrCode, location.href);
 
 // ── Bridge connection state (one "peer" for rendering purposes) ──────
 const bridge = {
