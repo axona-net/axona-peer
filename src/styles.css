@@ -302,6 +302,14 @@ header .subtitle {
   margin-top: 2px;
 }
 
+/* Yellow "via TURN" hint, appended to .peer-sub when the nominated
+   candidate pair is relayed.  Empty text node when path is direct
+   so it takes no space.  Inherits the uppercase + letter-spacing from
+   the parent. */
+.path-badge {
+  color: var(--yellow);
+}
+
 .cell-num {
   text-align: right;
   font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;

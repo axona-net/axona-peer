@@ -214,6 +214,9 @@ function buildRow(peerId) {
   tr.appendChild(tdInd);
 
   // Peer cell — label + state subtext.
+  // The state subtext gets an optional " · via TURN" badge appended
+  // as a child span; we keep them as separate nodes so the badge can
+  // be styled distinctly and hidden when the path is direct.
   const tdPeer = document.createElement('td');
   const labelEl = document.createElement('div');
   labelEl.className = 'peer-label';
@@ -223,6 +226,11 @@ function buildRow(peerId) {
   stateEl.className = 'peer-sub';
   const stateText = document.createTextNode('');
   stateEl.appendChild(stateText);
+  const pathBadge = document.createElement('span');
+  pathBadge.className = 'path-badge';
+  const pathBadgeText = document.createTextNode('');
+  pathBadge.appendChild(pathBadgeText);
+  stateEl.appendChild(pathBadge);
   tdPeer.appendChild(labelEl);
   tdPeer.appendChild(stateEl);
   tr.appendChild(tdPeer);
@@ -262,6 +270,7 @@ function buildRow(peerId) {
     tr,
     indicator,
     labelText, stateText,
+    pathBadgeText,
     rttPrimary, rttSubText,
     trafPrimary, trafSubText,
     upText,
@@ -273,6 +282,17 @@ function updateRow(refs, data) {
   setClass(refs.indicator, `indicator ${INDICATOR_CLASS[data.state] ?? 'indicator-red'}`);
   setText(refs.labelText, data.label);
   setText(refs.stateText, data.state);
+
+  // Path badge: empty by default, " · via TURN" when either end of the
+  // nominated candidate pair is a TURN relay.  Hidden visually when
+  // empty so spacing collapses cleanly.  Tooltip on the row carries
+  // the precise pair (e.g. "path: srflx ↔ relay") for the curious.
+  const viaRelay = data.localCand === 'relay' || data.remoteCand === 'relay';
+  setText(refs.pathBadgeText, viaRelay ? ' · via TURN' : '');
+  const title = (data.localCand && data.remoteCand)
+    ? `path: ${data.localCand} ↔ ${data.remoteCand}`
+    : '';
+  if (refs.tr.title !== title) refs.tr.title = title;
 
   if (data.rttLast != null) {
     setText(refs.rttPrimary, String(Math.round(data.rttLast)));
@@ -299,26 +319,32 @@ function render() {
 
   const ordered = [
     {
-      peerId:   BRIDGE_ROW_ID,
-      label:    'bridge',
-      kind:     'bridge',
-      state:    bridge.state,
-      rttLast:  bridgeRtt,
-      rttAvg:   bridgeAvg,
-      pings:    bridge.pings,
-      pongs:    bridge.pongs,
-      openedAt: bridge.connectedAt,
+      peerId:     BRIDGE_ROW_ID,
+      label:      'bridge',
+      kind:       'bridge',
+      state:      bridge.state,
+      rttLast:    bridgeRtt,
+      rttAvg:     bridgeAvg,
+      pings:      bridge.pings,
+      pongs:      bridge.pongs,
+      openedAt:   bridge.connectedAt,
+      // Bridge connection is plain WebSocket, no ICE involved.  Null
+      // here means "no path badge, no tooltip" — bridges aren't relayed.
+      localCand:  null,
+      remoteCand: null,
     },
     ...peers.map(p => ({
-      peerId:   p.peerId,
-      label:    p.peerId,
-      kind:     'rtc',
-      state:    p.state,
-      rttLast:  p.rttLast,
-      rttAvg:   p.rttAvg,
-      pings:    p.pings,
-      pongs:    p.pongs,
-      openedAt: p.openedAt,
+      peerId:     p.peerId,
+      label:      p.peerId,
+      kind:       'rtc',
+      state:      p.state,
+      rttLast:    p.rttLast,
+      rttAvg:     p.rttAvg,
+      pings:      p.pings,
+      pongs:      p.pongs,
+      openedAt:   p.openedAt,
+      localCand:  p.localCand,
+      remoteCand: p.remoteCand,
     })),
   ];
 

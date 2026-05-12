@@ -89,6 +89,9 @@ const RTC_CONFIG = {
  * @property {number | null} staleTimer
  * @property {number | null} retryTimer
  * @property {boolean} retryUsed
+ * @property {string | null} localCand   — 'host'|'srflx'|'prflx'|'relay'|null
+ * @property {string | null} remoteCand  — same; nominated candidate pair types
+ * @property {number | null} pathPollTimer
  */
 
 export class MeshManager {
@@ -130,6 +133,11 @@ export class MeshManager {
       rttAvg:     p.rttBuffer.length
                     ? p.rttBuffer.reduce((a, b) => a + b, 0) / p.rttBuffer.length
                     : null,
+      // Nominated candidate-pair types — null until the DC opens and
+      // we've had a chance to inspect getStats().  Either end being
+      // 'relay' means this specific connection is going through TURN.
+      localCand:  p.localCand,
+      remoteCand: p.remoteCand,
     }));
   }
 
@@ -229,6 +237,9 @@ export class MeshManager {
       staleTimer: null,
       retryTimer: null,
       retryUsed: false,
+      localCand:  null,
+      remoteCand: null,
+      pathPollTimer: null,
     };
   }
 
@@ -262,7 +273,7 @@ export class MeshManager {
       });
       if (pc.connectionState === 'failed') {
         state.state = 'failed';
-        this._dumpStats(state, 'on-failed');
+        this._refreshPath(state, 'on-failed');
         this._scheduleRetry(state);
         this._notify();
       } else if (pc.connectionState === 'closed') {
@@ -283,28 +294,58 @@ export class MeshManager {
       });
       if (pc.iceConnectionState === 'disconnected' ||
           pc.iceConnectionState === 'failed') {
-        this._dumpStats(state, `ice-${pc.iceConnectionState}`);
+        this._refreshPath(state, `ice-${pc.iceConnectionState}`);
       }
     };
 
     return pc;
   }
 
-  /** Dump the nominated candidate pair + transport stats. */
-  async _dumpStats(state, when) {
+  /**
+   * Look up the nominated candidate pair, cache its `candidateType`s on
+   * the peer state (`localCand`, `remoteCand`), and log the details.
+   *
+   * Called at:
+   *   - dc-open                 — initial path discovery
+   *   - ice-disconnected/failed — what was the path when it died?
+   *   - periodic (every 10s)    — catch ICE renegotiations silently
+   *
+   * If `silent` is true, the log line is suppressed UNLESS the path
+   * actually changed.  The periodic poll uses silent=true so the event
+   * log doesn't get spammed once per peer per ten seconds.  Every call
+   * still updates the cache and triggers a UI re-render when the path
+   * changes — that's how the "via TURN" badge appears/disappears.
+   */
+  async _refreshPath(state, when, { silent = false } = {}) {
     if (!state.pc) return;
+    let stats;
     try {
-      const stats = await state.pc.getStats();
-      let pair = null, local = null, remote = null;
+      stats = await state.pc.getStats();
+    } catch (err) {
+      this._log('stats-failed', { peerId: state.peerId, err: err.message });
+      return;
+    }
+
+    let pair = null, local = null, remote = null;
+    stats.forEach(s => {
+      if (s.type === 'candidate-pair' && s.nominated) pair = s;
+    });
+    if (pair) {
       stats.forEach(s => {
-        if (s.type === 'candidate-pair' && s.nominated) pair = s;
+        if (s.id === pair.localCandidateId)  local  = s;
+        if (s.id === pair.remoteCandidateId) remote = s;
       });
-      if (pair) {
-        stats.forEach(s => {
-          if (s.id === pair.localCandidateId)  local  = s;
-          if (s.id === pair.remoteCandidateId) remote = s;
-        });
-      }
+    }
+
+    const newLocal  = local?.candidateType  ?? null;
+    const newRemote = remote?.candidateType ?? null;
+    const changed = (state.localCand !== newLocal) ||
+                    (state.remoteCand !== newRemote);
+
+    state.localCand  = newLocal;
+    state.remoteCand = newRemote;
+
+    if (!silent || changed) {
       this._log('stats', {
         peerId: state.peerId,
         when,
@@ -318,9 +359,23 @@ export class MeshManager {
           ? `${remote.candidateType}/${remote.protocol} ${remote.ip ?? remote.address}:${remote.port}`
           : 'unknown',
       });
-    } catch (err) {
-      this._log('stats-failed', { peerId: state.peerId, err: err.message });
     }
+
+    if (changed) this._notify();
+  }
+
+  /**
+   * Re-poll getStats() every 10s once the DC is open.  ICE can
+   * renegotiate underneath us — e.g. a network change moves us from
+   * srflx to relay, or our laptop wakes from sleep on a new IP — and
+   * we want the UI to reflect the new path.  Silent unless something
+   * actually shifts.
+   */
+  _startPathPoll(state) {
+    if (state.pathPollTimer) clearInterval(state.pathPollTimer);
+    state.pathPollTimer = setInterval(() => {
+      this._refreshPath(state, 'periodic', { silent: true });
+    }, 10_000);
   }
 
   async _initiateTo(peerId) {
@@ -404,8 +459,10 @@ export class MeshManager {
       state.retryUsed = false;
       this._log('dc-open', { peerId: state.peerId, role: state.role });
       // Dump the nominated candidate pair so we can see what
-      // address family / protocol the data path is actually using.
-      this._dumpStats(state, 'dc-open');
+      // address family / protocol the data path is actually using —
+      // and keep polling so we notice ICE renegotiations later on.
+      this._refreshPath(state, 'dc-open');
+      this._startPathPoll(state);
       this._startPingLoop(state);
       this._startStaleChecker(state);
       this._notify();
@@ -515,9 +572,10 @@ export class MeshManager {
       pings:   state.pings,
       pongs:   state.pongs,
     });
-    if (state.pingTimer)  clearInterval(state.pingTimer);
-    if (state.staleTimer) clearInterval(state.staleTimer);
-    if (state.retryTimer) clearTimeout(state.retryTimer);
+    if (state.pingTimer)     clearInterval(state.pingTimer);
+    if (state.staleTimer)    clearInterval(state.staleTimer);
+    if (state.retryTimer)    clearTimeout (state.retryTimer);
+    if (state.pathPollTimer) clearInterval(state.pathPollTimer);
     if (state.dc) try { state.dc.close(); } catch {}
     if (state.pc) try { state.pc.close(); } catch {}
     this._peers.delete(peerId);
@@ -528,8 +586,9 @@ export class MeshManager {
   _teardownButKeep(peerId) {
     const state = this._peers.get(peerId);
     if (!state) return;
-    if (state.pingTimer)  clearInterval(state.pingTimer);
-    if (state.staleTimer) clearInterval(state.staleTimer);
+    if (state.pingTimer)     clearInterval(state.pingTimer);
+    if (state.staleTimer)    clearInterval(state.staleTimer);
+    if (state.pathPollTimer) clearInterval(state.pathPollTimer);
     if (state.dc) try { state.dc.close(); } catch {}
     if (state.pc) try { state.pc.close(); } catch {}
     this._peers.delete(peerId);
