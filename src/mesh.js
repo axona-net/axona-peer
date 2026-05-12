@@ -35,41 +35,27 @@ const RETRY_AFTER_MS   = 5000;   // single retry after pc-failed (B10)
 //
 // STUN servers let each peer discover its public-facing (post-NAT)
 // IP and offer that as a candidate.  Cross-NAT pairs (e.g., a phone
-// on cellular talking to a laptop on home Wi-Fi) need this — without
-// STUN, peers only see each other's private host IPs and can't
-// reach each other.
+// on cellular talking to a laptop on home Wi-Fi) need STUN — without
+// it, peers only see each other's private host IPs and can't reach
+// each other.
 //
-// We use Google's free public STUN servers.  They're stable and
-// widely used for WebRTC dev; for production we'd consider running
-// our own to avoid the soft dependency.
+// We use Google's free public STUN servers — stable, ubiquitous for
+// WebRTC dev.  For production we'd consider self-hosting to avoid
+// the soft dependency.
 //
-// TURN is the next escalation, used when direct peer-to-peer is
-// blocked by symmetric NATs or strict firewalls (cellular carriers
-// typically, double-NATs on tethered hotspots).  We run a coturn
-// instance on the same droplet as the bridge.  Credentials are a
-// static long-term pair for now; later we'll switch to short-lived
-// HMAC-signed credentials handed out by the bridge so the password
-// can't be skimmed from the page source.
-//
-// Two entries on turn.axona.net:
-//   turn:  UDP/TCP 3478 — preferred (no TLS overhead on the relay)
-//   turns: TLS/DTLS 5349 — for clients on networks that block UDP
-//          3478 entirely or only allow port-443-style egress.  ICE
-//          tries both; whichever connects first wins.
-const RTC_CONFIG = {
-  iceServers: [
-    { urls: 'stun:stun.l.google.com:19302'  },
-    { urls: 'stun:stun1.l.google.com:19302' },
-    {
-      urls: [
-        'turn:turn.axona.net:3478',
-        'turns:turn.axona.net:5349',
-      ],
-      username:   'axonademo',
-      credential: 'a0f479670d8f533d2c5a5449c1c3bbaa',
-    },
-  ],
-};
+// TURN (relay) entries are NOT hardcoded.  The bridge hands us an
+// HMAC-signed short-lived (2h) credential in its `welcome` message;
+// we cache it via `setTurnConfig()` and splice it into the iceServers
+// list whenever we build a fresh RTCPeerConnection.  This means the
+// shipped peer JS contains zero long-term TURN credentials — anyone
+// View-Source-ing axona.net learns nothing useful about how to use
+// our relay.  If the bridge ever omits TURN config (e.g. its
+// TURN_AUTH_SECRET env isn't set), we gracefully degrade to
+// STUN-only — direct ICE still works for most pairs.
+const STUN_SERVERS = [
+  { urls: 'stun:stun.l.google.com:19302'  },
+  { urls: 'stun:stun1.l.google.com:19302' },
+];
 
 /**
  * @typedef {object} PeerState
@@ -104,12 +90,32 @@ export class MeshManager {
     this._listeners = new Set();
     /** @type {string | null} */
     this._myId = null;
+    /** @type {{urls: string[]|string, username: string, credential: string} | null} */
+    this._turn = null;
   }
 
   // ── External lifecycle ────────────────────────────────────────────
 
   setMyId(id) {
     this._myId = id;
+  }
+
+  /** Cache the bridge-supplied TURN credential (or null to clear).
+   *  Future PCs use this; existing PCs keep their original config. */
+  setTurnConfig(turn) {
+    this._turn = turn ?? null;
+    this._log('turn-config', {
+      hasTurn: !!turn,
+      username: turn?.username ?? null,
+      urlCount: Array.isArray(turn?.urls) ? turn.urls.length : (turn ? 1 : 0),
+    });
+  }
+
+  /** Build a fresh RTCConfiguration from STUN + the cached TURN. */
+  _iceConfig() {
+    const iceServers = [...STUN_SERVERS];
+    if (this._turn) iceServers.push(this._turn);
+    return { iceServers };
   }
 
   /** Subscribe to mesh-state changes.  Returns an unsubscribe fn. */
@@ -260,7 +266,7 @@ export class MeshManager {
 
   /** Build a PC for either role and wire its common event handlers. */
   _attachPc(state) {
-    const pc = new RTCPeerConnection(RTC_CONFIG);
+    const pc = new RTCPeerConnection(this._iceConfig());
     state.pc = pc;
     state.state = 'signaling';
 

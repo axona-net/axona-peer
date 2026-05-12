@@ -26,7 +26,7 @@ import { renderQR }    from './qr.js';
 // where the bfcache can serve a stale module set for ages).  The
 // bridge version arrives separately in its `welcome` message; the
 // "version" row in the me panel shows both side by side.
-const PEER_VERSION = '0.1.0';
+const PEER_VERSION = '0.2.0';
 
 const BRIDGE_PING_INTERVAL_MS = 1000;
 const BRIDGE_STALE_PONG_MS    = 3000;
@@ -458,7 +458,12 @@ function onBridgeMessage(ev) {
       bridge.myConnId = msg.connId;
       bridge.version  = msg.version ?? null;
       mesh.setMyId(msg.connId);
-      appendLog('bridge:welcome', `id=${msg.connId} v${msg.version ?? '?'}`, 'ok');
+      // Hand any bridge-supplied TURN credential to the mesh BEFORE
+      // peer-list arrives.  peer-list will trigger _initiateTo, which
+      // builds RTCPeerConnections using mesh._iceConfig() — by then
+      // we want the TURN entry in place so the new PCs can relay.
+      mesh.setTurnConfig(msg.turn ?? null);
+      appendLog('bridge:welcome', `id=${msg.connId} v${msg.version ?? '?'}${msg.turn ? ' turn=on' : ''}`, 'ok');
       renderVersion();
       render();
       break;
@@ -508,6 +513,12 @@ function onBridgeClose(ev) {
   bridge.ws = null;
   bridge.myConnId = null;
   bridge.version  = null;
+  // Drop the cached TURN credential.  When we reconnect, the bridge
+  // hands us a fresh one in welcome — minted right then with a full
+  // 2h TTL.  Holding the old one risks racing the expiry boundary on
+  // a long-running tab that reconnects right before its credential
+  // would have expired.
+  mesh.setTurnConfig(null);
   renderVersion();
   // We deliberately do NOT tear down the mesh here.  Existing WebRTC
   // DataChannels are peer-to-peer; the bridge is not in the data path
