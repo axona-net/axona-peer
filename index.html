@@ -28,14 +28,6 @@
       </div>
     </section>
 
-    <section class="share">
-      <div id="qr-code" class="qr-code" aria-label="QR code linking to this page"></div>
-      <div class="share-info">
-        <p class="share-prompt">Scan to join from a phone:</p>
-        <code id="share-url" class="mono share-url"></code>
-      </div>
-    </section>
-
     <section class="peers">
       <table class="peer-table">
         <thead>
@@ -68,6 +60,24 @@
       </p>
     </footer>
   </main>
+
+  <!-- Floating QR launcher: small thumbnail in the top-right corner.
+       Tap to open the overlay with a large scannable version. -->
+  <button id="qr-launcher" class="qr-launcher" type="button"
+          aria-label="Show join QR code" aria-haspopup="dialog"></button>
+
+  <!-- Modal overlay with the large QR.  Hidden by default; shown when
+       the launcher is clicked.  Click anywhere (backdrop, card, or the
+       × button) to dismiss. -->
+  <div id="qr-overlay" class="qr-overlay" role="dialog"
+       aria-modal="true" aria-label="Join this mesh" hidden>
+    <div class="qr-overlay-card">
+      <button id="qr-overlay-close" class="qr-overlay-close" type="button"
+              aria-label="Close">&times;</button>
+      <div id="qr-overlay-image" class="qr-overlay-image"></div>
+      <code id="qr-overlay-url" class="qr-overlay-url"></code>
+    </div>
+  </div>
 
   <script type="module" src="src/client.js"></script>
 </body>

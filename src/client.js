@@ -37,8 +37,11 @@ const $meshCount   = document.getElementById('mesh-count');
 const $peerTable   = document.getElementById('peer-table-body');
 const $logList     = document.getElementById('log-list');
 const $logClear    = document.getElementById('log-clear');
-const $qrCode      = document.getElementById('qr-code');
-const $shareUrl    = document.getElementById('share-url');
+const $qrLauncher  = document.getElementById('qr-launcher');
+const $qrOverlay   = document.getElementById('qr-overlay');
+const $qrOverlayImg = document.getElementById('qr-overlay-image');
+const $qrOverlayUrl = document.getElementById('qr-overlay-url');
+const $qrOverlayClose = document.getElementById('qr-overlay-close');
 
 // ── Bridge URL resolution ────────────────────────────────────────────
 function getBridgeUrl() {
@@ -57,8 +60,35 @@ $bridgeUrl.textContent = bridgeUrl;
 // phone that scans it lands on the same mesh.  We don't reconstruct
 // the URL; location.href is the canonical source of truth for "where
 // am I right now."
-$shareUrl.textContent = location.href;
-renderQR($qrCode, location.href);
+//
+// Two renderings of the same QR:
+//   - Small thumbnail in the floating top-right launcher button.
+//   - Large version inside the overlay, rendered once at load so the
+//     overlay opens instantly on first click.
+renderQR($qrLauncher,   location.href);
+renderQR($qrOverlayImg, location.href);
+$qrOverlayUrl.textContent = location.href;
+
+// Open / close the overlay.  Per the brief: tapping anywhere on the
+// overlay — backdrop, card, or the × button — dismisses it.  We also
+// honour ESC because it's the universal modal-close keystroke and
+// costs nothing.
+function openQrOverlay() {
+  $qrOverlay.hidden = false;
+  // Defer the focus shift so the click event that opened us doesn't
+  // immediately trigger the close handler bound to the overlay.
+  requestAnimationFrame(() => $qrOverlayClose.focus());
+}
+function closeQrOverlay() {
+  if ($qrOverlay.hidden) return;
+  $qrOverlay.hidden = true;
+  $qrLauncher.focus();
+}
+$qrLauncher.addEventListener('click', openQrOverlay);
+$qrOverlay  .addEventListener('click', closeQrOverlay);
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') closeQrOverlay();
+});
 
 // ── Bridge connection state (one "peer" for rendering purposes) ──────
 const bridge = {
