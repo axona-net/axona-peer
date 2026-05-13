@@ -28,10 +28,10 @@ Or just `open index.html` — modern browsers will run it from `file://` for loc
 | Color  | Animation | Meaning |
 |---|---|---|
 | Red    | solid    | Not connected (boot, after socket close, between reconnect attempts) |
-| Yellow | blinking | Connecting, awaiting the first pong, or stale (no pong in > 3 s) |
+| Orange | blinking | Connecting, awaiting the first pong, or stale (no pong in > 3 s) |
 | Green  | blinking | Connected and receiving pongs on schedule (≤ 3 s old) |
 
-Yellow handles both "we're trying" and "the line went quiet" because they're both states where the connection is uncertain. Green requires *confirmed bidirectional* traffic — opening the socket alone isn't enough; we wait for the first pong.
+Orange handles both "we're trying" and "the line went quiet" because they're both states where the connection is uncertain. (Orange not orange: orange is hard to tell from green for red-green colorblind viewers.) Green requires *confirmed bidirectional* traffic — opening the socket alone isn't enough; we wait for the first pong.
 
 ## Configuration
 
@@ -72,8 +72,8 @@ axona-peer/
 
 - **1 Hz ping loop.** `setInterval(send, 1000)`. Each ping carries `t = Date.now()`.
 - **Auto-reconnect.** Exponential backoff starting at 1 s, doubling up to 16 s. Reset to 1 s on any successful open.
-- **Stale-pong detection.** A 500 ms checker watches `lastPongAt`. If no pong arrives within 3 s the indicator drops to yellow without waiting for the socket to close — production wires can sit half-open for minutes before the OS notices.
-- **First-pong gate.** The indicator stays yellow after `open` until the first pong actually arrives. Just having the socket up isn't enough; we want a confirmed round-trip.
+- **Stale-pong detection.** A 500 ms checker watches `lastPongAt`. If no pong arrives within 3 s the indicator drops to orange without waiting for the socket to close — production wires can sit half-open for minutes before the OS notices.
+- **First-pong gate.** The indicator stays orange after `open` until the first pong actually arrives. Just having the socket up isn't enough; we want a confirmed round-trip.
 
 ## License
 

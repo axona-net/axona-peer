@@ -5,7 +5,7 @@
    connection (bridge + each WebRTC peer) gets its own row with its
    own indicator dot:
      .indicator-red     — solid red, not connected / failed / closed
-     .indicator-yellow  — blinking yellow, connecting / signaling / stale
+     .indicator-orange  — blinking orange, connecting / signaling / stale
      .indicator-green   — blinking green, open + pongs flowing
    ===================================================================== */
 
@@ -19,11 +19,17 @@
   --muted-2:  #5a6370;
   --accent:   #5fbfd0;
   --red:      #d05050;
-  --yellow:   #d8b840;
+  --orange:   #e88c20;
   --green:    #50c060;
   --shadow-red:    rgba(208,  80,  80, 0.55);
-  --shadow-yellow: rgba(216, 184,  64, 0.65);
+  --shadow-orange: rgba(232, 140,  32, 0.65);
   --shadow-green:  rgba( 80, 192,  96, 0.65);
+  /* Orange (not yellow) for the intermediate state.  Yellow sits
+     uncomfortably close to green for deuteranopic / protanopic
+     viewers (the most common red-green color blindness, ~8% of
+     men).  Orange shifts toward red on the hue wheel, giving real
+     separation from green at the cost of a less-traditional traffic
+     light metaphor — worth it. */
 }
 
 * { box-sizing: border-box; }
@@ -271,9 +277,9 @@ header .subtitle {
   background: var(--red);
   box-shadow: 0 0 10px var(--shadow-red);
 }
-.indicator-yellow {
-  background: var(--yellow);
-  box-shadow: 0 0 10px var(--shadow-yellow);
+.indicator-orange {
+  background: var(--orange);
+  box-shadow: 0 0 10px var(--shadow-orange);
   animation: blink 1s step-end infinite;
 }
 .indicator-green {
@@ -303,12 +309,12 @@ header .subtitle {
   white-space: nowrap;
 }
 
-/* Yellow "via TURN" hint, appended to .peer-sub when the nominated
+/* Orange "via TURN" hint, appended to .peer-sub when the nominated
    candidate pair is relayed.  Empty text node when path is direct
    so it takes no space.  Inherits the uppercase + letter-spacing from
    the parent. */
 .path-badge {
-  color: var(--yellow);
+  color: var(--orange);
 }
 
 .cell-num {

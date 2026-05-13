@@ -10,7 +10,7 @@
 // as they come and go.  Each row has its own indicator:
 //
 //   red    — disconnected / failed
-//   yellow — connecting, signaling, awaiting first pong, or stale
+//   orange — connecting, signaling, awaiting first pong, or stale
 //   green  — open + pongs flowing on schedule
 //
 // Bridge URL: configurable via ?bridge=ws[s]://... query string.
@@ -26,7 +26,7 @@ import { renderQR }    from './qr.js';
 // where the bfcache can serve a stale module set for ages).  The
 // bridge version arrives separately in its `welcome` message; the
 // "version" row in the me panel shows both side by side.
-const PEER_VERSION = '0.2.0';
+const PEER_VERSION = '0.3.0';
 
 const BRIDGE_PING_INTERVAL_MS = 1000;
 const BRIDGE_STALE_PONG_MS    = 3000;
@@ -185,7 +185,7 @@ function appendLog(event, detail, kind) {
 // render frequency (every pong fires a render).
 //
 // Note that we deliberately allow the indicator class to swap between
-// `.indicator-green` and `.indicator-yellow` — both declare the same
+// `.indicator-green` and `.indicator-orange` — both declare the same
 // `animation: blink 1s step-end infinite`, so the browser keeps the
 // running animation rather than restarting it.  Only transitions to
 // `.indicator-red` (which has no animation) reset the cycle.
@@ -194,11 +194,11 @@ const INDICATOR_CLASS = {
   disconnected:           'indicator-red',
   failed:                 'indicator-red',
   closed:                 'indicator-red',
-  new:                    'indicator-yellow',
-  connecting:             'indicator-yellow',
-  signaling:              'indicator-yellow',
-  'datachannel-opening':  'indicator-yellow',
-  stale:                  'indicator-yellow',
+  new:                    'indicator-orange',
+  connecting:             'indicator-orange',
+  signaling:              'indicator-orange',
+  'datachannel-opening':  'indicator-orange',
+  stale:                  'indicator-orange',
   open:                   'indicator-green',
 };
 
@@ -595,7 +595,7 @@ function scheduleBridgeReconnect() {
 // OS often kills the WebSocket.  By the time we come back the remote
 // side has long since seen us peer-leave; our RTCPeerConnections are
 // zombie shells that won't recover on their own and the indicators
-// sit yellow indefinitely.
+// sit orange indefinitely.
 //
 // The simplest fix that always works: when the page becomes visible
 // again after a non-trivial absence, tear down every WebRTC peer and
