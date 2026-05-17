@@ -42,7 +42,7 @@ function startBridge(env = {}) {
       BRIDGE_LAT: '51.5', BRIDGE_LNG: '-0.1',
       BRIDGE_REGION_LABEL: 'London',
       LOG_LEVEL: 'info',
-      MIN_PEER_VERSION: '0.12.0',
+      MIN_PEER_VERSION: '0.14.0',
       HELLO_TIMEOUT_MS: '500',
       ...env,
     },
@@ -111,19 +111,19 @@ async function main() {
 
   try {
     // ── 1. Compliant client: at min version ───────────────────────────
-    const ok = await probe({ helloVersion: '0.12.0' });
+    const ok = await probe({ helloVersion: '0.14.0' });
     check('compliant peer admitted', ok.admitted === true);
     check('compliant peer saw welcome',
       ok.messages.some(m => m.type === 'welcome'));
     check('compliant peer saw version-gate announcement',
-      ok.messages.some(m => m.type === 'version-gate' && m.minPeerVersion === '0.12.0'));
+      ok.messages.some(m => m.type === 'version-gate' && m.minPeerVersion === '0.14.0'));
 
     // ── 2. Compliant client: ABOVE min version (forward-compatible) ──
-    const newer = await probe({ helloVersion: '0.13.5' });
+    const newer = await probe({ helloVersion: '0.15.0' });
     check('newer-than-min peer admitted', newer.admitted === true);
 
     // ── 3. Old client below min ──────────────────────────────────────
-    const old = await probe({ helloVersion: '0.11.0' });
+    const old = await probe({ helloVersion: '0.13.0' });
     check('old peer rejected (not admitted)', old.admitted === false);
     check('old peer closed with 4426',         old.code === 4426);
     check('old peer reason mentions versions',
@@ -139,7 +139,7 @@ async function main() {
     // ── 5. /healthz reports gate config + admitted/pending counters ──
     const health = await fetch(`http://localhost:${BRIDGE_PORT}/healthz`).then(r => r.json());
     check('healthz reports minPeerVersion',
-      health.minPeerVersion === '0.12.0');
+      health.minPeerVersion === '0.14.0');
     check('healthz reports admitted/pending counters',
       typeof health.admitted === 'number' && typeof health.pending === 'number');
 

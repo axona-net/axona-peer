@@ -11,19 +11,21 @@
 // there's only one peer, so we give it a minimal stand-in that
 // satisfies AxonaPeer's read/write surface.
 //
-// The per-node refactor's eventual Phase 6 will move most of this
-// state onto AxonaPeer directly and the engine reference disappears.
-// Until then, BrowserEngine fills the role.
+// What this class does (Phase 3+ — pub/sub on):
+//   - `axonFor(node)` returns a cached per-node AxonManager wired to
+//     the AxonaPeer's DHT primitives.  AxonaPeer.publish/subscribe now
+//     reach the real protocol pubsub layer.  Caller passes the peer
+//     reference via `setPeerForNode(node, peer)` after constructing
+//     the AxonaPeer (since the engine is built first by AxonaNode).
 //
 // What this class does NOT do:
 //   - Manage multiple nodes (no `nodeMap` — production peer is one)
-//   - Pub/sub (no AxonManager wiring — axonFor() throws clearly).
-//     Pub/sub support in the browser awaits a Web-Crypto port of
-//     post.js or an esbuild bundling step.
 //   - Drive a benchmark cycle (no `snapshotMetrics`, no `_tickDecay`
 //     called from outside).  `_tickDecay` here is fired only via
 //     AxonaPeer.lookup()'s periodic decay trigger.
 // =====================================================================
+
+import { AxonManager } from '../vendor/axona-protocol/src/pubsub/AxonManager.js';
 
 export class BrowserEngine {
   constructor(config = {}) {
@@ -84,6 +86,16 @@ export class BrowserEngine {
 
     // ── The one and only peer reference (production: one per tab) ────
     /** @type {object | null} */  this._theNode = null;
+
+    // ── Per-node AxonManager + AxonaPeer back-ref ────────────────────
+    // `setPeerForNode(node, peer)` is called by AxonaNode after it
+    // constructs the AxonaPeer (engine is built first, peer second).
+    // axonFor(node) reads _peerByNode to build the dht adapter the
+    // AxonManager constructor needs.
+    /** @type {Map<object, object>}  node → AxonaPeer        */
+    this._peerByNode = new Map();
+    /** @type {Map<object, object>}  node → AxonManager       */
+    this._axonByNode = new Map();
   }
 
   // ── Engine surface AxonaPeer relies on ─────────────────────────────
@@ -138,18 +150,81 @@ export class BrowserEngine {
     }
   }
 
-  // ── Pub/sub: not supported in the browser MVP ──────────────────────
+  // ── Pub/sub: real AxonManager wiring ───────────────────────────────
   //
-  // AxonaPeer.subscribe / publish / unsubscribe call
-  // `engine.axonFor(node)`.  We throw with a clear message so the
-  // application sees what's missing.  Pub/sub support arrives with
-  // the Web-Crypto port of post.js or an esbuild bundle.
+  // `axonFor(node)` returns a cached AxonManager for this node.  The
+  // AxonManager talks to a `dht` adapter that fronts the AxonaPeer's
+  // DHT primitives (findKClosest, sendDirect, routeMessage, …).
+  // AxonaPeer's onDirectMessage / onRoutedMessage installs the wire
+  // listeners via transport.onNotification, so we don't have to wire
+  // those here.
 
-  axonFor(_node) {
-    throw new Error(
-      'BrowserEngine.axonFor: pub/sub not supported in the browser ' +
-      'MVP.  Requires Web-Crypto port of post.js or bundled build.'
-    );
+  /**
+   * Set by AxonaNode after it constructs the AxonaPeer.  Without this,
+   * `axonFor` can't build the dht adapter (it needs the peer's DHT
+   * primitives).  Idempotent.
+   */
+  setPeerForNode(node, peer) {
+    if (!node || !peer) throw new Error('setPeerForNode: node and peer required');
+    this._peerByNode.set(node, peer);
+  }
+
+  axonFor(node) {
+    if (!node) throw new Error('axonFor: node required');
+    const cached = this._axonByNode.get(node);
+    if (cached) return cached;
+
+    const peer = this._peerByNode.get(node);
+    if (!peer) {
+      throw new Error(
+        'BrowserEngine.axonFor: AxonaPeer not registered for this node. ' +
+        'Call engine.setPeerForNode(node, peer) after constructing the peer.'
+      );
+    }
+
+    // The dht adapter the AxonManager talks to.  AxonaPeer exposes
+    // every primitive; we add the one missing alias (getSelfId vs
+    // getNodeId) and forward everything else.
+    //
+    // sendDirect: AxonManager's K-closest mode sends 'pubsub:publish-k'
+    // to ALL K roots, including self when self is among them — but
+    // AxonaPeer.sendDirect does `transport.notify(self, ...)` which
+    // CompositeTransport silently drops (self isn't in any sub-
+    // transport's binding map).  Result: a publisher that's also an
+    // axon for its own topic never delivers to that axon-role's
+    // children locally.  Intercept self-targeted sendDirect and
+    // dispatch synchronously into the locally-registered direct
+    // handler instead.  This matches the simulator's
+    // SimulatedNetwork.sendDirect, which has a global view and
+    // delivers self-targets in-process.
+    const self = peer.getNodeId();
+    const engine = this;
+    const dht = {
+      getSelfId:       () => peer.getNodeId(),
+      findKClosest:    (...args) => peer.findKClosest(...args),
+      routeMessage:    (...args) => peer.routeMessage(...args),
+      sendDirect:      async (peerId, type, payload) => {
+        if (peerId === self) {
+          const table = engine._directHandlers.get(node);
+          const h = table?.get(type);
+          if (!h) return false;
+          try {
+            await h(payload, { fromId: self.toString(16).padStart(16, '0'), type });
+            return true;
+          } catch (err) {
+            console.error('BrowserEngine self-sendDirect handler threw:', err);
+            return false;
+          }
+        }
+        return peer.sendDirect(peerId, type, payload);
+      },
+      onRoutedMessage: (type, h) => peer.onRoutedMessage(type, h),
+      onDirectMessage: (type, h) => peer.onDirectMessage(type, h),
+    };
+
+    const axon = new AxonManager({ dht });
+    this._axonByNode.set(node, axon);
+    return axon;
   }
 
   // ── Register the one node this engine wraps ────────────────────────

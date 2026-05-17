@@ -41,7 +41,7 @@ import { BridgeTransport,
                               from './bridge_transport.js';
 import { CompositeTransport } from './composite_transport.js';
 import { deriveIdentity, getCurrentIdentity } from './identity.js';
-import { mountPubsub }         from './pubsub.js';
+import { mountAxonalPubsub }   from './pubsub_axonal.js';
 
 // ── ID encoding helpers ──────────────────────────────────────────────
 
@@ -145,13 +145,28 @@ export class AxonaNode {
 
     this._registerNH1Handlers();
 
-    // Application-layer pub/sub (flood-publish with dedup).  Mounted
-    // AFTER NH-1 handlers so the dedup map exists by the time anyone
-    // could fire a notification at us.
-    this._pubsub = mountPubsub(this._node, this._transport, { log: this._log });
-
     this._peer = new AxonaPeer({ engine: this._engine, node: this._node });
     await this._peer.start();
+
+    // Real DHT-based pub/sub via the protocol's AxonManager.  Engine
+    // needs the peer back-ref to construct the dht adapter.  Mount
+    // AFTER peer.start() so AxonaPeer's onDirectMessage / findKClosest
+    // wiring is alive when AxonManager registers its 'pubsub:deliver'
+    // listener.
+    this._engine.setPeerForNode(this._node, this._peer);
+    this._axon = this._engine.axonFor(this._node);
+    this._pubsub = mountAxonalPubsub({
+      axon: this._axon,
+      peer: this._peer,
+      log:  this._log,
+    });
+
+    // Register the wire-level 'route_msg' request handler so multi-hop
+    // routed DHT messages (used by AxonManager's fallback paths +
+    // future reshare/metrics paths) actually forward.  AxonaPeer
+    // exposes routeMessage to SEND, but the wire format is a
+    // 'route_msg' REQUEST that downstream peers need to handle.
+    this._registerRouteMsgHandler();
 
     // Observe mesh state: send hello when a peer's channel reaches
     // open, install Synapse when its hello-ack arrives.
@@ -370,6 +385,25 @@ export class AxonaNode {
     if (!node._deadPeers) node._deadPeers = new Set();
     t.onPeerDied((deadNodeId) => {
       if (typeof deadNodeId === 'bigint') node._deadPeers.add(deadNodeId);
+    });
+  }
+
+  /**
+   * Multi-hop routed-message dispatch.  AxonaPeer.routeMessage sends
+   * `'route_msg'` REQUESTs hop-by-hop; we have to register a handler
+   * so downstream peers (a) deliver locally if they have a routed
+   * handler for the inner type, and (b) forward toward the target
+   * otherwise.  Re-entering peer().routeMessage from here gives us
+   * the same greedy-next-hop selection + local delivery the original
+   * send did — no need to duplicate that logic.
+   */
+  _registerRouteMsgHandler() {
+    const t = this._transport;
+    const peer = () => this._peer;
+    t.onRequest('route_msg', async (_fromId, body) => {
+      const { type, payload, targetId, originId } = body ?? {};
+      if (!peer()) return { consumed: false, atNode: null, hops: 0, exhausted: true };
+      return peer().routeMessage(targetId, type, payload, { fromId: originId });
     });
   }
 

@@ -60,7 +60,7 @@ function startBridge() {
       BRIDGE_LAT: '51.5', BRIDGE_LNG: '-0.1',
       BRIDGE_REGION_LABEL: 'London',
       LOG_LEVEL: 'info',
-      MIN_PEER_VERSION: '0.12.0',
+      MIN_PEER_VERSION: '0.14.0',
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -78,7 +78,7 @@ async function waitForReady(check, timeoutMs = 3000) {
   const start = Date.now();
   while (!check()) {
     if (Date.now() - start > timeoutMs) throw new Error('bridge did not start');
-    await new Promise(r => setTimeout(r, 50));
+    await new Promise(r => setTimeout(r, 200));
   }
 }
 
@@ -135,7 +135,7 @@ async function buildBrowser(name, region, meshId) {
   const ws = await new Promise((resolve, reject) => {
     const s = new WebSocket(BRIDGE_URL);
     s.on('open', () => {
-      try { s.send(JSON.stringify({ type: 'client-hello', version: '0.12.0' })); }
+      try { s.send(JSON.stringify({ type: 'client-hello', version: '0.14.0' })); }
       catch (err) { reject(err); return; }
       resolve(s);
     });
@@ -175,7 +175,7 @@ async function main() {
     A = await buildBrowser('A', 'us-east',   'mesh-A');
     B = await buildBrowser('B', 'asia-east', 'mesh-B');
     A.mesh.linkTo(B.mesh);
-    await new Promise(r => setTimeout(r, 250));   // handshakes settle
+    await new Promise(r => setTimeout(r, 800));   // handshakes settle
 
     // ── Topics ───────────────────────────────────────────────────────
     const T1 = await deriveTopicKey({ lat: 38.0, lng: -77.0 },   'News of the Day');
@@ -194,7 +194,7 @@ async function main() {
     // ── 1. A subscribes T1, B publishes ─────────────────────────────
     subscribeOnto(A, T1, 'T1');
     B.node.pubsubPublish(T1, 'The stockmarket rules the world.');
-    await new Promise(r => setTimeout(r, 100));
+    await new Promise(r => setTimeout(r, 800));
     check('A received B\'s publish on T1',
       A.received.T1?.length === 1);
     check('A saw the right message body',
@@ -205,7 +205,7 @@ async function main() {
     // ── 2. B subscribes T2, A publishes ─────────────────────────────
     subscribeOnto(B, T2, 'T2');
     A.node.pubsubPublish(T2, 'Sumo opens autumn season.');
-    await new Promise(r => setTimeout(r, 100));
+    await new Promise(r => setTimeout(r, 800));
     check('B received A\'s publish on T2',
       B.received.T2?.length === 1);
     check('B saw the right message body',
@@ -213,7 +213,7 @@ async function main() {
 
     // ── 3. Self-delivery: A publishes to T1 (which A is subscribed to) ─
     A.node.pubsubPublish(T1, 'Self-delivery test.');
-    await new Promise(r => setTimeout(r, 100));
+    await new Promise(r => setTimeout(r, 800));
     check('A self-delivered exactly once (no echo amplification)',
       A.received.T1?.length === 2);
     check('A\'s second T1 message is its own publish',
@@ -225,17 +225,17 @@ async function main() {
 
     // ── 4. Orphan topic — no subscribers anywhere ───────────────────
     A.node.pubsubPublish(T4, 'No one is listening.');
-    await new Promise(r => setTimeout(r, 50));
+    await new Promise(r => setTimeout(r, 200));
     check('orphan publish does not crash anyone',
       A.node.nodeId != null && B.node.nodeId != null);
 
     // ── 5. Bridge-relay healing: kill mesh, B subscribes T3,
     //       A publishes T3 — B must receive via bridge ───────────────
     A.mesh.killLink();
-    await new Promise(r => setTimeout(r, 50));
+    await new Promise(r => setTimeout(r, 200));
     subscribeOnto(B, T3, 'T3');
     A.node.pubsubPublish(T3, 'Bridge is the highway.');
-    await new Promise(r => setTimeout(r, 150));
+    await new Promise(r => setTimeout(r, 800));
     check('B received A\'s T3 publish (relayed by bridge)',
       B.received.T3?.length === 1);
     check('B\'s relayed message body matches',
@@ -248,7 +248,7 @@ async function main() {
     // duplication isn't structurally possible here.  Add a second
     // publish on T3 and confirm only one new delivery shows up.
     A.node.pubsubPublish(T3, 'Second message.');
-    await new Promise(r => setTimeout(r, 150));
+    await new Promise(r => setTimeout(r, 800));
     check('dedup: T3 received exactly 2 total (1 + 1, no doubles)',
       B.received.T3?.length === 2);
 

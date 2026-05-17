@@ -71,7 +71,7 @@ function startBridge() {
       BRIDGE_LAT: '51.5', BRIDGE_LNG: '-0.1',
       BRIDGE_REGION_LABEL: 'London',
       LOG_LEVEL: 'info',
-      MIN_PEER_VERSION: '0.12.0',
+      MIN_PEER_VERSION: '0.14.0',
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -162,7 +162,7 @@ async function buildBrowser(name, region, meshId) {
   const ws = await new Promise((resolve, reject) => {
     const sock = new WebSocket(BRIDGE_URL);
     sock.on('open', () => {
-      try { sock.send(JSON.stringify({ type: 'client-hello', version: '0.12.0' })); }
+      try { sock.send(JSON.stringify({ type: 'client-hello', version: '0.14.0' })); }
       catch (err) { reject(err); return; }
       resolve(sock);
     });

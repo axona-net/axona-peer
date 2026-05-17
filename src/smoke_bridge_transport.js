@@ -59,7 +59,7 @@ function startBridge() {
       LOG_LEVEL: 'info',
       // Pin the gate to the version the smoke client sends; keeps
       // smokes independent of whatever the production default is.
-      MIN_PEER_VERSION: '0.12.0',
+      MIN_PEER_VERSION: '0.14.0',
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -117,7 +117,7 @@ async function main() {
   const ws = await new Promise((resolve, reject) => {
     const sock = new WebSocket(BRIDGE_URL);
     sock.on('open', () => {
-      try { sock.send(JSON.stringify({ type: 'client-hello', version: '0.12.0' })); }
+      try { sock.send(JSON.stringify({ type: 'client-hello', version: '0.14.0' })); }
       catch (err) { reject(err); return; }
       resolve(sock);
     });
