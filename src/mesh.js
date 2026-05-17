@@ -92,6 +92,30 @@ export class MeshManager {
     this._myId = null;
     /** @type {{urls: string[]|string, username: string, credential: string} | null} */
     this._turn = null;
+
+    // ── v0.4.0 — Transport-contract hooks ──────────────────────────────
+    //
+    // These let a WebRTCTransport instance (src/transport.js) ride on
+    // top of MeshManager without touching its existing UI-driving
+    // state machine.  Two new event channels:
+    //
+    //   onMessage(cb)  — fired for every non-ping/non-pong frame that
+    //                    arrives on a data channel.  The Transport's
+    //                    req/res/ntf envelopes flow through here.
+    //
+    //   onPeerLost(cb) — fired when a peer's data channel goes from
+    //                    open to closed/failed.  Used by Transport to
+    //                    fire its `onPeerDied` listeners and reject
+    //                    outstanding requests to that peer.
+    //
+    // The existing application-level ping/pong remains the UI's source
+    // of liveness signal (drives indicator colors).  WebRTCTransport
+    // reads `getLatency(peerId)` for AP scoring and `isConnected(peerId)`
+    // for cap-admission checks; both derive from existing per-peer state.
+    /** @type {Set<(peerId: string, message: any) => void>} */
+    this._messageListeners = new Set();
+    /** @type {Set<(peerId: string) => void>} */
+    this._peerLostListeners = new Set();
   }
 
   // ── External lifecycle ────────────────────────────────────────────
@@ -122,6 +146,64 @@ export class MeshManager {
   onChange(callback) {
     this._listeners.add(callback);
     return () => this._listeners.delete(callback);
+  }
+
+  /**
+   * v0.4.0 — Subscribe to incoming Transport-level frames from peers.
+   * The callback fires with `(peerId, parsedMessage)` for every JSON
+   * message that's NOT an internal ping/pong (those drive the UI's
+   * indicator state and stay private to MeshManager).
+   * Returns an unsubscribe fn.
+   */
+  onMessage(callback) {
+    this._messageListeners.add(callback);
+    return () => this._messageListeners.delete(callback);
+  }
+
+  /**
+   * v0.4.0 — Subscribe to peer-death events.  Fires once when a peer's
+   * data channel transitions from `open` to a teardown state
+   * (peer-left, pc-failed, pc-closed, or local dispose/reset).  The
+   * Transport contract's `onPeerDied` semantics ride this signal.
+   * Returns an unsubscribe fn.
+   */
+  onPeerLost(callback) {
+    this._peerLostListeners.add(callback);
+    return () => this._peerLostListeners.delete(callback);
+  }
+
+  /**
+   * v0.4.0 — Send a JSON-serializable payload to a peer's data channel.
+   * Synchronous; throws if the peer isn't currently open.  Used by
+   * WebRTCTransport to write req / res / ntf envelopes onto the wire.
+   * The existing ping/pong loop continues independently of this.
+   */
+  send(peerId, payload) {
+    const state = this._peers.get(peerId);
+    if (!state || state.dc?.readyState !== 'open') {
+      throw new Error(`mesh.send: peer ${peerId} not open`);
+    }
+    state.dc.send(JSON.stringify(payload));
+  }
+
+  /**
+   * v0.4.0 — Whether a data channel to peer is currently open.
+   * Cheap O(1) check used by Transport.isConnected.
+   */
+  isConnected(peerId) {
+    return this._peers.get(peerId)?.dc?.readyState === 'open';
+  }
+
+  /**
+   * v0.4.0 — Most recent RTT to peer in milliseconds, or -1 if not
+   * known yet (no completed ping/pong round-trip).  Equivalent to the
+   * Transport contract's `getLatency`.
+   */
+  getLatency(peerId) {
+    const state = this._peers.get(peerId);
+    if (!state) return -1;
+    const last = state.rttBuffer.at(-1);
+    return (typeof last === 'number') ? last : -1;
   }
 
   /** Snapshot of all known peers, suitable for rendering. */
@@ -529,6 +611,18 @@ export class MeshManager {
         if (state.rttBuffer.length > RTT_WINDOW) state.rttBuffer.shift();
         if (state.state === 'stale') state.state = 'open';
         this._notify();
+      } else {
+        // v0.4.0 — non-ping/pong frame: forward to Transport listeners.
+        // WebRTCTransport routes by msg.k (req / res / ntf) downstream;
+        // MeshManager itself doesn't care about the envelope shape.
+        for (const cb of this._messageListeners) {
+          try { cb(state.peerId, msg); }
+          catch (err) {
+            this._log('msg-listener-threw', {
+              peerId: state.peerId, err: err.message,
+            });
+          }
+        }
       }
     };
   }
@@ -585,6 +679,7 @@ export class MeshManager {
   _teardown(peerId, reason) {
     const state = this._peers.get(peerId);
     if (!state) return;
+    const wasOpen = state.dc?.readyState === 'open';
     this._log('teardown', {
       peerId, reason,
       role:    state.role,
@@ -600,6 +695,20 @@ export class MeshManager {
     if (state.dc) try { state.dc.close(); } catch {}
     if (state.pc) try { state.pc.close(); } catch {}
     this._peers.delete(peerId);
+    // v0.4.0 — fire onPeerLost for Transport listeners.  Only when the
+    // channel actually went from open → closed; teardown of a never-
+    // opened peer (e.g. failed ICE) does NOT count as a peer death
+    // from the Transport's perspective because no one was using it.
+    if (wasOpen) {
+      for (const cb of this._peerLostListeners) {
+        try { cb(peerId); }
+        catch (err) {
+          this._log('peer-lost-listener-threw', {
+            peerId, err: err.message,
+          });
+        }
+      }
+    }
   }
 
   /** Like _teardown but used by the retry path: keep the map entry
