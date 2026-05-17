@@ -41,6 +41,7 @@ import { BridgeTransport,
                               from './bridge_transport.js';
 import { CompositeTransport } from './composite_transport.js';
 import { deriveIdentity, getCurrentIdentity } from './identity.js';
+import { mountPubsub }         from './pubsub.js';
 
 // ── ID encoding helpers ──────────────────────────────────────────────
 
@@ -144,6 +145,11 @@ export class AxonaNode {
 
     this._registerNH1Handlers();
 
+    // Application-layer pub/sub (flood-publish with dedup).  Mounted
+    // AFTER NH-1 handlers so the dedup map exists by the time anyone
+    // could fire a notification at us.
+    this._pubsub = mountPubsub(this._node, this._transport, { log: this._log });
+
     this._peer = new AxonaPeer({ engine: this._engine, node: this._node });
     await this._peer.start();
 
@@ -196,6 +202,20 @@ export class AxonaNode {
 
   // ── DHT operations passed through to AxonaPeer ─────────────────────
   async lookup(targetKey) { return this._peer?.lookup(targetKey); }
+
+  // ── Application-layer pub/sub ──────────────────────────────────────
+  pubsubSubscribe(topicKey, handler) {
+    if (!this._pubsub) throw new Error('AxonaNode: not started');
+    return this._pubsub.subscribe(topicKey, handler);
+  }
+  pubsubUnsubscribe(topicKey) {
+    if (!this._pubsub) return;
+    return this._pubsub.unsubscribe(topicKey);
+  }
+  pubsubPublish(topicKey, msg) {
+    if (!this._pubsub) throw new Error('AxonaNode: not started');
+    return this._pubsub.publish(topicKey, msg);
+  }
 
   // ─────────────────────────────────────────────────────────────────
   //   Internal: hello/hello-ack handshake + Synapse admission

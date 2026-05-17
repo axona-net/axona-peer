@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Axona Peer — Phase 2</title>
   <link rel="stylesheet" href="src/styles.css">
-  <!-- v0.10.0 — importmap resolves `@axona/protocol/*` to the
+  <!-- v0.11.0 — importmap resolves `@axona/protocol/*` to the
        vendored slim subset under vendor/axona-protocol/.  Sync the
        vendored files from the canonical source at
        github.com/axona-net/axona-protocol by running
@@ -85,6 +85,63 @@
         <button id="lookup-go" class="lookup-go" type="button" disabled>lookup</button>
       </div>
       <pre id="lookup-result" class="lookup-result"></pre>
+    </section>
+
+    <!-- Pub/Sub harness.  Topic addresses share the 64-bit node-id
+         space: top 8 bits = chosen region's S2 prefix, low 56 bits =
+         SHA-256 of the event name.  Publishes flood to every direct
+         synapse with dedup; subscribers anywhere in the mesh see the
+         message under the matching subscription card. -->
+    <section class="pubsub">
+      <h2>Pub / Sub</h2>
+
+      <!-- Publish form ─────────────────────────────────────────────── -->
+      <div class="pubsub-publish">
+        <div class="pubsub-row">
+          <label class="me-label" for="pub-region">prefix</label>
+          <select id="pub-region" class="pubsub-region"></select>
+        </div>
+        <div class="pubsub-row">
+          <input id="pub-event" type="text"
+                 class="pubsub-input"
+                 placeholder="event name (e.g. News of the Day)"
+                 spellcheck="false" autocomplete="off">
+        </div>
+        <div class="pubsub-row">
+          <input id="pub-message" type="text"
+                 class="pubsub-input"
+                 placeholder="message body — Enter or Send to publish"
+                 spellcheck="false" autocomplete="off">
+          <button id="pub-send" class="pubsub-send" type="button" disabled>send</button>
+        </div>
+        <div class="pubsub-key" id="pub-key">—</div>
+      </div>
+
+      <!-- Subscription list ────────────────────────────────────────── -->
+      <div class="pubsub-subs-header">
+        <h3>Subscriptions</h3>
+        <button id="sub-add" class="pubsub-add" type="button" disabled>+ add subscription</button>
+      </div>
+
+      <!-- Modal form for adding a subscription. -->
+      <div id="sub-form" class="pubsub-sub-form" hidden>
+        <div class="pubsub-row">
+          <label class="me-label" for="sub-region">prefix</label>
+          <select id="sub-region" class="pubsub-region"></select>
+        </div>
+        <div class="pubsub-row">
+          <input id="sub-event" type="text"
+                 class="pubsub-input"
+                 placeholder="subscription event name"
+                 spellcheck="false" autocomplete="off">
+          <button id="sub-save" class="pubsub-send" type="button">subscribe</button>
+          <button id="sub-cancel" class="pubsub-cancel" type="button">cancel</button>
+        </div>
+      </div>
+
+      <ul id="sub-list" class="pubsub-sub-list">
+        <!-- rendered by client.js: one <li> per active subscription -->
+      </ul>
     </section>
 
     <section class="peers">

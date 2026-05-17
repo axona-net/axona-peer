@@ -29,13 +29,14 @@ import {
 // Shared codec: same BigInt + Set conventions as mesh.js and the
 // bridge's server.js — keeps every channel on one wire format.
 import { encode, decode } from './wire.js';
+import { deriveTopicKey, topicKeyToHex } from './pubsub_topic.js';
 
 // Peer build number.  Bump the middle digit on every code change so
 // you can confirm a redeployed page actually loaded (esp. on iOS,
 // where the bfcache can serve a stale module set for ages).  The
 // bridge version arrives separately in its `welcome` message; the
 // "version" row in the me panel shows both side by side.
-const PEER_VERSION = '0.10.0';
+const PEER_VERSION = '0.11.0';
 
 const BRIDGE_PING_INTERVAL_MS = 1000;
 const BRIDGE_STALE_PONG_MS    = 3000;
@@ -70,6 +71,20 @@ const $synaptomeSize  = document.getElementById('synaptome-size');
 const $lookupTarget   = document.getElementById('lookup-target');
 const $lookupGo       = document.getElementById('lookup-go');
 const $lookupResult   = document.getElementById('lookup-result');
+
+// Pub/Sub harness
+const $pubRegion      = document.getElementById('pub-region');
+const $pubEvent       = document.getElementById('pub-event');
+const $pubMessage     = document.getElementById('pub-message');
+const $pubSend        = document.getElementById('pub-send');
+const $pubKey         = document.getElementById('pub-key');
+const $subAdd         = document.getElementById('sub-add');
+const $subForm        = document.getElementById('sub-form');
+const $subRegion      = document.getElementById('sub-region');
+const $subEvent       = document.getElementById('sub-event');
+const $subSave        = document.getElementById('sub-save');
+const $subCancel      = document.getElementById('sub-cancel');
+const $subList        = document.getElementById('sub-list');
 
 // ── Bridge URL resolution ────────────────────────────────────────────
 function getBridgeUrl() {
@@ -795,6 +810,20 @@ async function bootAxonaNode(opts = {}) {
   appendLog('axona:ready', { nodeId: fmtNodeId(identity.id) });
   $lookupGo.disabled = false;
 
+  // Pub/Sub: populate region dropdowns (default to user's home region),
+  // enable the controls, and re-attach any persisted subscriptions.
+  const homeRegionId = identity.region?.id ?? REGIONS[0].id;
+  populatePubsubRegionDropdowns(homeRegionId);
+  $pubSend.disabled = false;
+  $subAdd.disabled = false;
+  refreshPublishKeyPreview();
+
+  const persisted = loadPersistedSubscriptions();
+  for (const s of persisted) {
+    try { await addSubscription(s.regionId, s.eventName); }
+    catch (err) { appendLog('pubsub:restore-failed', err.message, 'error'); }
+  }
+
   // Refresh synaptome counter on any mesh change (cheap proxy).
   const updateSynaptomeBadge = () => {
     if (!axonaNode) return;
@@ -803,6 +832,226 @@ async function bootAxonaNode(opts = {}) {
   mesh.onChange(updateSynaptomeBadge);
   setInterval(updateSynaptomeBadge, 1000);
 }
+
+// ── Pub/Sub UI ────────────────────────────────────────────────────────
+//
+// State shape — kept entirely in client.js memory + localStorage:
+//
+//   subscriptions: [
+//     { regionId, eventName, key: bigint, messages: [{publisher, msg, ts}, ...] }
+//   ]
+//
+// `key` is reconstituted from (regionId, eventName) on every reload via
+// deriveTopicKey, so we don't have to persist BigInt-typed values.
+// `messages` is ephemeral — a fresh inbox on every reload.
+
+const SUBSCRIPTIONS_LS_KEY = 'axona-peer:subscriptions:v1';
+const MAX_MESSAGES_PER_SUB = 50;
+
+/** @type {Array<{regionId:string, eventName:string, key:bigint, messages:Array}>} */
+let subscriptions = [];
+
+function populatePubsubRegionDropdowns(homeRegionId) {
+  for (const $sel of [$pubRegion, $subRegion]) {
+    $sel.replaceChildren();
+    for (const r of REGIONS) {
+      const opt = document.createElement('option');
+      opt.value = r.id;
+      opt.textContent = r.label;
+      if (r.id === homeRegionId) opt.selected = true;
+      $sel.appendChild(opt);
+    }
+  }
+}
+
+function loadPersistedSubscriptions() {
+  try {
+    const raw = localStorage.getItem(SUBSCRIPTIONS_LS_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(s =>
+      s && typeof s.regionId === 'string' && typeof s.eventName === 'string');
+  } catch { return []; }
+}
+
+function persistSubscriptions() {
+  // Store only the durable bits (regionId + eventName).  Keys are
+  // derived; inboxes are session-scoped.
+  const serial = subscriptions.map(s => ({
+    regionId: s.regionId, eventName: s.eventName,
+  }));
+  try { localStorage.setItem(SUBSCRIPTIONS_LS_KEY, JSON.stringify(serial)); }
+  catch (err) { appendLog('pubsub:persist-failed', err.message, 'error'); }
+}
+
+/** Render the entire subscription list (idempotent — wipes + rebuilds). */
+function renderSubscriptions() {
+  $subList.replaceChildren();
+  for (let idx = 0; idx < subscriptions.length; idx++) {
+    const sub = subscriptions[idx];
+    const li = document.createElement('li');
+    li.className = 'pubsub-sub';
+    li.dataset.idx = String(idx);
+
+    const region = REGIONS.find(r => r.id === sub.regionId);
+
+    const head = document.createElement('div');
+    head.className = 'pubsub-sub-head';
+    const title = document.createElement('div');
+    title.className = 'pubsub-sub-title';
+    title.innerHTML =
+      `<span class="region-tag">${region?.id ?? sub.regionId}</span>` +
+      escapeHtml(sub.eventName);
+    const key = document.createElement('span');
+    key.className = 'pubsub-sub-key';
+    key.textContent = topicKeyToHex(sub.key);
+    const rm = document.createElement('button');
+    rm.className = 'pubsub-sub-remove';
+    rm.type = 'button';
+    rm.title = 'remove subscription';
+    rm.textContent = '×';
+    rm.addEventListener('click', () => removeSubscription(idx));
+
+    head.appendChild(title);
+    head.appendChild(key);
+    head.appendChild(rm);
+    li.appendChild(head);
+
+    if (sub.messages.length === 0) {
+      const empty = document.createElement('p');
+      empty.className = 'pubsub-sub-empty';
+      empty.textContent = 'no messages yet — waiting for the network…';
+      li.appendChild(empty);
+    } else {
+      const ul = document.createElement('ul');
+      ul.className = 'pubsub-sub-msgs';
+      // Newest first.
+      for (let i = sub.messages.length - 1; i >= 0; i--) {
+        const m = sub.messages[i];
+        const mli = document.createElement('li');
+        const meta = document.createElement('span');
+        meta.className = 'msg-meta';
+        const time = new Date(m.ts).toLocaleTimeString();
+        meta.textContent = `${time} · from ${fmtNodeId(m.publisher)}`;
+        const body = document.createElement('span');
+        body.textContent = m.msg;
+        mli.appendChild(meta);
+        mli.appendChild(body);
+        ul.appendChild(mli);
+      }
+      li.appendChild(ul);
+    }
+    $subList.appendChild(li);
+  }
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  }[c]));
+}
+
+async function addSubscription(regionId, eventName) {
+  if (!axonaNode) throw new Error('axona node not started yet');
+  const region = REGIONS.find(r => r.id === regionId);
+  if (!region) throw new Error('unknown region: ' + regionId);
+  const key = await deriveTopicKey(region, eventName);
+
+  // De-dup: same regionId + same eventName is already there.
+  if (subscriptions.some(s => s.regionId === regionId && s.eventName === eventName)) {
+    return;
+  }
+  const sub = { regionId, eventName, key, messages: [] };
+  subscriptions.push(sub);
+
+  axonaNode.pubsubSubscribe(key, ({ publisher, msg, ts }) => {
+    sub.messages.push({ publisher, msg, ts });
+    if (sub.messages.length > MAX_MESSAGES_PER_SUB) {
+      sub.messages.shift();
+    }
+    renderSubscriptions();
+  });
+
+  persistSubscriptions();
+  renderSubscriptions();
+  appendLog('pubsub:subscribed', `${regionId}/${eventName} → ${topicKeyToHex(key)}`);
+}
+
+function removeSubscription(idx) {
+  const sub = subscriptions[idx];
+  if (!sub) return;
+  if (axonaNode) axonaNode.pubsubUnsubscribe(sub.key);
+  subscriptions.splice(idx, 1);
+  persistSubscriptions();
+  renderSubscriptions();
+  appendLog('pubsub:unsubscribed', `${sub.regionId}/${sub.eventName}`);
+}
+
+// Live-update the publish-key preview as the user types the event name
+// or changes the prefix.  Pure UX — confirms what's about to be sent.
+async function refreshPublishKeyPreview() {
+  const regionId = $pubRegion.value;
+  const eventName = $pubEvent.value.trim();
+  if (!regionId || !eventName) { $pubKey.textContent = '—'; return; }
+  const region = REGIONS.find(r => r.id === regionId);
+  if (!region) { $pubKey.textContent = '—'; return; }
+  try {
+    const key = await deriveTopicKey(region, eventName);
+    $pubKey.textContent = `topic key: ${topicKeyToHex(key)}`;
+  } catch { $pubKey.textContent = '—'; }
+}
+$pubRegion.addEventListener('change', refreshPublishKeyPreview);
+$pubEvent.addEventListener('input',  refreshPublishKeyPreview);
+
+async function publishFromForm() {
+  if (!axonaNode) return;
+  const regionId = $pubRegion.value;
+  const eventName = $pubEvent.value.trim();
+  const message = $pubMessage.value;
+  if (!eventName) { appendLog('pubsub:publish-skip', 'event name required', 'error'); return; }
+  if (!message)   { appendLog('pubsub:publish-skip', 'message required',    'error'); return; }
+  const region = REGIONS.find(r => r.id === regionId);
+  if (!region)   { appendLog('pubsub:publish-skip', 'unknown region', 'error'); return; }
+  try {
+    const key = await deriveTopicKey(region, eventName);
+    axonaNode.pubsubPublish(key, message);
+    appendLog('pubsub:published', `${regionId}/${eventName} → ${topicKeyToHex(key)}`);
+    $pubMessage.value = '';
+  } catch (err) {
+    appendLog('pubsub:publish-failed', err.message, 'error');
+  }
+}
+$pubSend.addEventListener('click', publishFromForm);
+$pubMessage.addEventListener('keydown', (ev) => {
+  if (ev.key === 'Enter' && !ev.shiftKey) {
+    ev.preventDefault();
+    publishFromForm();
+  }
+});
+
+// Subscription form: + → reveal → fill → subscribe / cancel
+$subAdd.addEventListener('click', () => {
+  $subEvent.value = '';
+  $subForm.hidden = false;
+  $subEvent.focus();
+});
+$subCancel.addEventListener('click', () => { $subForm.hidden = true; });
+$subSave.addEventListener('click', async () => {
+  const regionId  = $subRegion.value;
+  const eventName = $subEvent.value.trim();
+  if (!eventName) return;
+  try {
+    await addSubscription(regionId, eventName);
+    $subForm.hidden = true;
+  } catch (err) {
+    appendLog('pubsub:sub-failed', err.message, 'error');
+  }
+});
+$subEvent.addEventListener('keydown', (ev) => {
+  if (ev.key === 'Enter') { ev.preventDefault(); $subSave.click(); }
+  if (ev.key === 'Escape'){ ev.preventDefault(); $subCancel.click(); }
+});
 
 // ── Lookup UI ────────────────────────────────────────────────────────
 $lookupGo.addEventListener('click', async () => {
