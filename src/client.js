@@ -36,7 +36,7 @@ import { deriveTopicKey, topicKeyToHex } from './pubsub_topic.js';
 // where the bfcache can serve a stale module set for ages).  The
 // bridge version arrives separately in its `welcome` message; the
 // "version" row in the me panel shows both side by side.
-const PEER_VERSION = '0.11.0';
+const PEER_VERSION = '0.12.0';
 
 const BRIDGE_PING_INTERVAL_MS = 1000;
 const BRIDGE_STALE_PONG_MS    = 3000;
@@ -73,11 +73,8 @@ const $lookupGo       = document.getElementById('lookup-go');
 const $lookupResult   = document.getElementById('lookup-result');
 
 // Pub/Sub harness
-const $pubRegion      = document.getElementById('pub-region');
-const $pubEvent       = document.getElementById('pub-event');
-const $pubMessage     = document.getElementById('pub-message');
-const $pubSend        = document.getElementById('pub-send');
-const $pubKey         = document.getElementById('pub-key');
+const $pubAdd         = document.getElementById('pub-add');
+const $pubList        = document.getElementById('pub-list');
 const $subAdd         = document.getElementById('sub-add');
 const $subForm        = document.getElementById('sub-form');
 const $subRegion      = document.getElementById('sub-region');
@@ -200,7 +197,21 @@ function appendLog(event, detail, kind) {
   ts.textContent = new Date().toLocaleTimeString();
   const ev = document.createElement('span');
   ev.className = `ev${kind ? ' ev-' + kind : ''}`;
-  ev.textContent = detail ? `${event} ${detail}` : event;
+  // detail can be a string, number, or an object — stringify objects
+  // as compact JSON (BigInt → "<hex>n", arrays inline) so pubsub /
+  // mesh traces are actually readable in the log.
+  let detailText = '';
+  if (detail != null) {
+    if (typeof detail === 'object') {
+      try {
+        detailText = ' ' + JSON.stringify(detail, (_k, v) =>
+          typeof v === 'bigint' ? v.toString(16) + 'n' : v);
+      } catch { detailText = ' ' + String(detail); }
+    } else {
+      detailText = ' ' + String(detail);
+    }
+  }
+  ev.textContent = event + detailText;
   li.appendChild(ts);
   li.appendChild(ev);
   $logList.insertBefore(li, $logList.firstChild);
@@ -810,13 +821,19 @@ async function bootAxonaNode(opts = {}) {
   appendLog('axona:ready', { nodeId: fmtNodeId(identity.id) });
   $lookupGo.disabled = false;
 
-  // Pub/Sub: populate region dropdowns (default to user's home region),
-  // enable the controls, and re-attach any persisted subscriptions.
+  // Pub/Sub: populate dropdowns + restore persisted publish forms and
+  // subscriptions, then enable the controls.
   const homeRegionId = identity.region?.id ?? REGIONS[0].id;
-  populatePubsubRegionDropdowns(homeRegionId);
-  $pubSend.disabled = false;
+  populateSubRegionDropdown(homeRegionId);
+
+  publishForms = loadPersistedPublishForms();
+  if (publishForms.length === 0) {
+    publishForms = [newPublishForm(homeRegionId, '')];
+    persistPublishForms();
+  }
+  renderPublishForms();
+  $pubAdd.disabled = false;
   $subAdd.disabled = false;
-  refreshPublishKeyPreview();
 
   const persisted = loadPersistedSubscriptions();
   for (const s of persisted) {
@@ -851,17 +868,19 @@ const MAX_MESSAGES_PER_SUB = 50;
 /** @type {Array<{regionId:string, eventName:string, key:bigint, messages:Array}>} */
 let subscriptions = [];
 
-function populatePubsubRegionDropdowns(homeRegionId) {
-  for (const $sel of [$pubRegion, $subRegion]) {
-    $sel.replaceChildren();
-    for (const r of REGIONS) {
-      const opt = document.createElement('option');
-      opt.value = r.id;
-      opt.textContent = r.label;
-      if (r.id === homeRegionId) opt.selected = true;
-      $sel.appendChild(opt);
-    }
+function populateRegionSelect($sel, selectedRegionId) {
+  $sel.replaceChildren();
+  for (const r of REGIONS) {
+    const opt = document.createElement('option');
+    opt.value = r.id;
+    opt.textContent = r.label;
+    if (r.id === selectedRegionId) opt.selected = true;
+    $sel.appendChild(opt);
   }
+}
+
+function populateSubRegionDropdown(homeRegionId) {
+  populateRegionSelect($subRegion, homeRegionId);
 }
 
 function loadPersistedSubscriptions() {
@@ -988,47 +1007,204 @@ function removeSubscription(idx) {
   appendLog('pubsub:unsubscribed', `${sub.regionId}/${sub.eventName}`);
 }
 
-// Live-update the publish-key preview as the user types the event name
-// or changes the prefix.  Pure UX — confirms what's about to be sent.
-async function refreshPublishKeyPreview() {
-  const regionId = $pubRegion.value;
-  const eventName = $pubEvent.value.trim();
-  if (!regionId || !eventName) { $pubKey.textContent = '—'; return; }
-  const region = REGIONS.find(r => r.id === regionId);
-  if (!region) { $pubKey.textContent = '—'; return; }
-  try {
-    const key = await deriveTopicKey(region, eventName);
-    $pubKey.textContent = `topic key: ${topicKeyToHex(key)}`;
-  } catch { $pubKey.textContent = '—'; }
-}
-$pubRegion.addEventListener('change', refreshPublishKeyPreview);
-$pubEvent.addEventListener('input',  refreshPublishKeyPreview);
+// ── Publish forms (multi-card) ───────────────────────────────────────
+//
+// State: an array of { id, regionId, eventName }.  Each card is a
+// separate `<div class="pubsub-publish">` rendered by renderPublishForms.
+// The message body is per-card and ephemeral (held in the DOM input);
+// regionId + eventName persist so users keep their topic configs
+// across reloads.
 
-async function publishFromForm() {
+const PUBLISH_FORMS_LS_KEY = 'axona-peer:publishForms:v1';
+
+/** @type {Array<{id:string, regionId:string, eventName:string}>} */
+let publishForms = [];
+
+function loadPersistedPublishForms() {
+  try {
+    const raw = localStorage.getItem(PUBLISH_FORMS_LS_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter(f => f && typeof f.regionId === 'string' && typeof f.eventName === 'string')
+      .map(f => ({
+        id: typeof f.id === 'string' ? f.id : crypto.randomUUID(),
+        regionId: f.regionId, eventName: f.eventName,
+      }));
+  } catch { return []; }
+}
+
+function persistPublishForms() {
+  try {
+    localStorage.setItem(PUBLISH_FORMS_LS_KEY,
+      JSON.stringify(publishForms));
+  } catch (err) {
+    appendLog('pubsub:persist-failed', err.message, 'error');
+  }
+}
+
+function newPublishForm(homeRegionId, eventName = '') {
+  return {
+    id: crypto.randomUUID(),
+    regionId: homeRegionId ?? REGIONS[0].id,
+    eventName,
+  };
+}
+
+async function recomputeKeyLabel(form, $keyEl) {
+  if (!form.eventName) { $keyEl.textContent = '—'; return; }
+  const region = REGIONS.find(r => r.id === form.regionId);
+  if (!region) { $keyEl.textContent = '—'; return; }
+  try {
+    const key = await deriveTopicKey(region, form.eventName);
+    $keyEl.textContent = `topic key: ${topicKeyToHex(key)}`;
+  } catch { $keyEl.textContent = '—'; }
+}
+
+async function publishFromForm(form, $messageEl) {
   if (!axonaNode) return;
-  const regionId = $pubRegion.value;
-  const eventName = $pubEvent.value.trim();
-  const message = $pubMessage.value;
+  const eventName = form.eventName.trim();
+  const message   = $messageEl.value;
   if (!eventName) { appendLog('pubsub:publish-skip', 'event name required', 'error'); return; }
   if (!message)   { appendLog('pubsub:publish-skip', 'message required',    'error'); return; }
-  const region = REGIONS.find(r => r.id === regionId);
+  const region = REGIONS.find(r => r.id === form.regionId);
   if (!region)   { appendLog('pubsub:publish-skip', 'unknown region', 'error'); return; }
   try {
     const key = await deriveTopicKey(region, eventName);
     axonaNode.pubsubPublish(key, message);
-    appendLog('pubsub:published', `${regionId}/${eventName} → ${topicKeyToHex(key)}`);
-    $pubMessage.value = '';
+    appendLog('pubsub:published', `${form.regionId}/${eventName} → ${topicKeyToHex(key)}`);
+    $messageEl.value = '';
   } catch (err) {
     appendLog('pubsub:publish-failed', err.message, 'error');
   }
 }
-$pubSend.addEventListener('click', publishFromForm);
-$pubMessage.addEventListener('keydown', (ev) => {
-  if (ev.key === 'Enter' && !ev.shiftKey) {
-    ev.preventDefault();
-    publishFromForm();
+
+/**
+ * Build a publish card.  The card holds its own input refs and a
+ * focus-friendly render: editing the region or event name updates
+ * `form` in place + persists, without re-rendering the whole list
+ * (which would steal focus mid-typing).
+ */
+function buildPublishCard(form) {
+  const card = document.createElement('div');
+  card.className = 'pubsub-publish';
+  card.dataset.id = form.id;
+
+  // Remove (×) — hidden if this is the only card.
+  const rm = document.createElement('button');
+  rm.className = 'pubsub-sub-remove';
+  rm.type = 'button';
+  rm.title = 'remove publish card';
+  rm.textContent = '×';
+  rm.addEventListener('click', () => removePublishForm(form.id));
+  card.appendChild(rm);
+
+  // Row 1: prefix + region select
+  const row1 = document.createElement('div');
+  row1.className = 'pubsub-row';
+  const lbl = document.createElement('label');
+  lbl.className = 'me-label';
+  lbl.textContent = 'prefix';
+  const $region = document.createElement('select');
+  $region.className = 'pubsub-region';
+  populateRegionSelect($region, form.regionId);
+  $region.addEventListener('change', () => {
+    form.regionId = $region.value;
+    persistPublishForms();
+    recomputeKeyLabel(form, $key);
+  });
+  row1.appendChild(lbl);
+  row1.appendChild($region);
+  card.appendChild(row1);
+
+  // Row 2: event name
+  const row2 = document.createElement('div');
+  row2.className = 'pubsub-row';
+  const $event = document.createElement('input');
+  $event.type = 'text';
+  $event.className = 'pubsub-input';
+  $event.placeholder = 'event name (e.g. News of the Day)';
+  $event.spellcheck = false;
+  $event.autocomplete = 'off';
+  $event.value = form.eventName;
+  $event.addEventListener('input', () => {
+    form.eventName = $event.value;
+    persistPublishForms();
+    recomputeKeyLabel(form, $key);
+  });
+  row2.appendChild($event);
+  card.appendChild(row2);
+
+  // Row 3: message body + send
+  const row3 = document.createElement('div');
+  row3.className = 'pubsub-row';
+  const $message = document.createElement('input');
+  $message.type = 'text';
+  $message.className = 'pubsub-input';
+  $message.placeholder = 'message body — Enter or Send to publish';
+  $message.spellcheck = false;
+  $message.autocomplete = 'off';
+  const $send = document.createElement('button');
+  $send.className = 'pubsub-send';
+  $send.type = 'button';
+  $send.textContent = 'send';
+  $send.disabled = !axonaNode;
+  $send.addEventListener('click', () => publishFromForm(form, $message));
+  $message.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Enter' && !ev.shiftKey) {
+      ev.preventDefault();
+      publishFromForm(form, $message);
+    }
+  });
+  row3.appendChild($message);
+  row3.appendChild($send);
+  card.appendChild(row3);
+
+  // Key preview
+  const $key = document.createElement('div');
+  $key.className = 'pubsub-key';
+  $key.textContent = '—';
+  card.appendChild($key);
+  recomputeKeyLabel(form, $key);
+
+  return card;
+}
+
+function renderPublishForms() {
+  $pubList.replaceChildren();
+  for (const form of publishForms) {
+    $pubList.appendChild(buildPublishCard(form));
   }
-});
+  // Hide the × button if there's only one card (avoid the "removed
+  // everything, can't publish" trap).
+  const removeBtns = $pubList.querySelectorAll('.pubsub-sub-remove');
+  if (publishForms.length === 1) {
+    removeBtns[0].style.display = 'none';
+  }
+}
+
+function addPublishForm() {
+  const home = axonaNode?._identity?.region?.id ?? REGIONS[0].id;
+  publishForms.push(newPublishForm(home, ''));
+  persistPublishForms();
+  renderPublishForms();
+}
+
+function removePublishForm(id) {
+  const idx = publishForms.findIndex(f => f.id === id);
+  if (idx < 0) return;
+  publishForms.splice(idx, 1);
+  if (publishForms.length === 0) {
+    // Keep at least one form on screen.
+    const home = axonaNode?._identity?.region?.id ?? REGIONS[0].id;
+    publishForms.push(newPublishForm(home, ''));
+  }
+  persistPublishForms();
+  renderPublishForms();
+}
+
+$pubAdd.addEventListener('click', addPublishForm);
 
 // Subscription form: + → reveal → fill → subscribe / cancel
 $subAdd.addEventListener('click', () => {

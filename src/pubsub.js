@@ -29,12 +29,34 @@
 // `node` is the protocol's NeuronNode (used for .id + .synaptome).
 // `transport` is the CompositeTransport (used to notify by nodeId).
 //
-// The handler arg shape mirrors the wire frame body without the
-// transport-internal publishId/topicKey; consumers don't care which
-// peer relayed the message, only who published it.
+// Tracing
+// ───────
+// Every observable decision is logged via the `opts.log(event, data)`
+// callback (defaults to a no-op).  Events are tagged with the
+// publishId so a single message can be correlated across nodes:
+//
+//   pubsub:tx-start    publisher about to fan out — { topic, publishId,
+//                                                    msgLen, targets, synSize }
+//   pubsub:tx          per-target send — { to, publishId }
+//   pubsub:tx-error    transport error during fan-out — { to, publishId, err }
+//   pubsub:tx-skip     fan-out target skipped — { reason, to?, publishId }
+//   pubsub:rx          incoming 'pubsub:deliver' — { publishId, from }
+//   pubsub:rx-bad      malformed frame — { reason, body }
+//   pubsub:rx-dup      publishId already seen — { publishId }
+//   pubsub:rx-deliver  matched local subscription — { publishId, topic }
+//   pubsub:rx-forward  forwarding (per target) — { publishId, to }
+//   pubsub:rx-noop     no local sub + no forward targets — { publishId }
+//
+// The browser appendLog renders these in the event-log section, and
+// the bridge's structured logger writes them to journalctl.  Filter
+// by 'pubsub:' to see only pubsub events.
 // =====================================================================
 
 const SEEN_LRU_CAP = 256;
+
+function idToHex(id) {
+  return typeof id === 'bigint' ? id.toString(16).padStart(16, '0') : String(id);
+}
 
 /**
  * @param {object} node       protocol NeuronNode (has .id + .synaptome)
@@ -70,31 +92,77 @@ export function mountPubsub(node, transport, opts = {}) {
    * Errors are swallowed with a log — a single dead peer mustn't
    * abort the broadcast.
    */
-  function fanOut(frame, exceptPeerId) {
+  function fanOut(frame, exceptPeerId, kind /* 'tx' | 'rx-forward' */) {
+    const targets = [];
+    let skippedSelf = 0;
     for (const syn of node.synaptome.values()) {
-      if (exceptPeerId !== undefined && syn.peerId === exceptPeerId) continue;
-      transport.notify(syn.peerId, 'pubsub:deliver', frame)
-        .catch(err => log('pubsub-fanout-failed', {
-          to: syn.peerId.toString(16),
-          err: err.message,
-        }));
+      if (exceptPeerId !== undefined && syn.peerId === exceptPeerId) {
+        skippedSelf++;
+        continue;
+      }
+      targets.push(syn.peerId);
     }
+
+    if (skippedSelf > 0) {
+      log('pubsub:tx-skip', {
+        reason: 'is-sender',
+        publishId: frame.publishId,
+        skipped: skippedSelf,
+      });
+    }
+
+    for (const peerId of targets) {
+      const toHex = idToHex(peerId);
+      log(kind === 'tx' ? 'pubsub:tx' : 'pubsub:rx-forward', {
+        to: toHex,
+        publishId: frame.publishId,
+      });
+      transport.notify(peerId, 'pubsub:deliver', frame)
+        .catch(err => log(
+          kind === 'tx' ? 'pubsub:tx-error' : 'pubsub:rx-forward-error',
+          { to: toHex, publishId: frame.publishId, err: err.message }
+        ));
+    }
+
+    return targets.length;
   }
 
   transport.onNotification('pubsub:deliver', (fromNodeIdOrChannel, body) => {
-    if (!body || typeof body !== 'object')   return;
+    // Defensive shape check + per-field validation; if anything is off,
+    // log once and drop (don't blow up the dispatcher).
+    if (!body || typeof body !== 'object') {
+      log('pubsub:rx-bad', { reason: 'no-body' });
+      return;
+    }
     const { topicKey, publishId, publisher, msg, ts } = body;
-    if (typeof topicKey !== 'bigint')        return;
-    if (typeof publishId !== 'string')       return;
-    if (typeof publisher !== 'bigint')       return;
-    if (typeof msg !== 'string')             return;
-    if (!markSeen(publishId))                return;  // already handled
+    if (typeof topicKey  !== 'bigint') { log('pubsub:rx-bad', { reason: 'topicKey-not-bigint',  publishId }); return; }
+    if (typeof publishId !== 'string') { log('pubsub:rx-bad', { reason: 'publishId-not-string', publishId }); return; }
+    if (typeof publisher !== 'bigint') { log('pubsub:rx-bad', { reason: 'publisher-not-bigint', publishId }); return; }
+    if (typeof msg       !== 'string') { log('pubsub:rx-bad', { reason: 'msg-not-string',       publishId }); return; }
+
+    const fromHex = (typeof fromNodeIdOrChannel === 'bigint')
+      ? idToHex(fromNodeIdOrChannel)
+      : String(fromNodeIdOrChannel ?? 'unknown');
+
+    log('pubsub:rx', {
+      publishId,
+      from: fromHex,
+      publisher: idToHex(publisher),
+      topic: idToHex(topicKey),
+      msgLen: msg.length,
+    });
+
+    if (!markSeen(publishId)) {
+      log('pubsub:rx-dup', { publishId, from: fromHex });
+      return;
+    }
 
     // Deliver locally if I'm subscribed to this topic.
     const handler = subs.get(topicKey);
     if (handler) {
+      log('pubsub:rx-deliver', { publishId, topic: idToHex(topicKey) });
       try { handler({ publisher, msg, ts }); }
-      catch (err) { log('pubsub-handler-threw', { err: err.message }); }
+      catch (err) { log('pubsub:rx-deliver-error', { publishId, err: err.message }); }
     }
 
     // Forward to all my synapses EXCEPT the peer who sent me this
@@ -103,7 +171,10 @@ export function mountPubsub(node, transport, opts = {}) {
     // ever carry pubsub frames in practice, but be defensive.
     const exceptPeerId = (typeof fromNodeIdOrChannel === 'bigint')
       ? fromNodeIdOrChannel : undefined;
-    fanOut(body, exceptPeerId);
+    const forwarded = fanOut(body, exceptPeerId, 'rx-forward');
+    if (forwarded === 0 && !handler) {
+      log('pubsub:rx-noop', { publishId });
+    }
   });
 
   return {
@@ -125,6 +196,19 @@ export function mountPubsub(node, transport, opts = {}) {
       const publishId = publisher.toString(16) + ':' + (++publishCounter);
       const ts        = Date.now();
 
+      const synSize   = node.synaptome.size;
+      const targetIds = [];
+      for (const syn of node.synaptome.values()) targetIds.push(idToHex(syn.peerId));
+
+      log('pubsub:tx-start', {
+        topic:     idToHex(topicKey),
+        publishId,
+        msgLen:    msg.length,
+        synSize,
+        targets:   targetIds,
+        localSub:  subs.has(topicKey),
+      });
+
       const frame = { topicKey, publishId, publisher, msg, ts };
       markSeen(publishId);     // we'll see our own fan-out echoes; dedup them
 
@@ -132,11 +216,15 @@ export function mountPubsub(node, transport, opts = {}) {
       // message they just sent without a network round-trip.
       const handler = subs.get(topicKey);
       if (handler) {
+        log('pubsub:tx-self-deliver', { publishId, topic: idToHex(topicKey) });
         try { handler({ publisher, msg, ts }); }
-        catch (err) { log('pubsub-self-deliver-threw', { err: err.message }); }
+        catch (err) { log('pubsub:tx-self-deliver-error', { publishId, err: err.message }); }
       }
 
-      fanOut(frame, undefined);
+      const sent = fanOut(frame, undefined, 'tx');
+      if (sent === 0 && !handler) {
+        log('pubsub:tx-isolated', { publishId, synSize });
+      }
     },
 
     /** Debug surface — exposed for smokes. */

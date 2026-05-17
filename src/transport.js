@@ -259,7 +259,14 @@ export class WebRTCTransport extends Transport {
   async notify(nodeId, type, body) {
     if (!this._started) throw new Error('Transport.notify: not started');
     const meshId = this._meshIdByNodeId.get(nodeId);
-    if (!meshId || !this._mesh.isConnected(meshId)) return;
+    if (!meshId) {
+      this._log('mesh-notify-no-binding', { nodeId: nodeId.toString(16), type });
+      return;
+    }
+    if (!this._mesh.isConnected(meshId)) {
+      this._log('mesh-notify-not-connected', { nodeId: nodeId.toString(16), meshId, type });
+      return;
+    }
     try {
       this._mesh.send(meshId, { k: 'ntf', type, body });
     } catch (err) {

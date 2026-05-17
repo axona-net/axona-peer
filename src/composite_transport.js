@@ -128,7 +128,17 @@ export class CompositeTransport extends Transport {
 
   async notify(nodeId, type, body) {
     const t = this._routeFor(nodeId);
-    if (!t) return;   // silent drop (fire-and-forget semantics)
+    if (!t) {
+      // Fire-and-forget but log: pubsub diagnostics correlate with
+      // this when fan-out targets can't be reached.
+      this._log('notify-no-route', {
+        nodeId: typeof nodeId === 'bigint'
+          ? nodeId.toString(16).padStart(16, '0')
+          : String(nodeId),
+        type,
+      });
+      return;
+    }
     return t.notify(nodeId, type, body);
   }
 

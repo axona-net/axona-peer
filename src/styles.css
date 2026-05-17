@@ -531,12 +531,29 @@ footer a:hover { text-decoration: underline; }
   text-transform: uppercase;
   letter-spacing: 0.05em;
 }
+.pubsub-publish-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin: 0 0 10px;
+}
+.pubsub-publish-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin: 0 0 14px;
+}
 .pubsub-publish {
   background: var(--bg-sub);
   border: 1px solid var(--border);
   border-radius: 6px;
   padding: 12px 14px;
-  margin: 0 0 14px;
+  position: relative;
+}
+.pubsub-publish .pubsub-sub-remove {
+  position: absolute;
+  top: 6px;
+  right: 8px;
 }
 .pubsub-row {
   display: flex;

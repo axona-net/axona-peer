@@ -161,8 +161,18 @@ export class BridgeTransport extends Transport {
     // to send a notification BEFORE bindPeer happens (e.g., a hello
     // reply targeting BRIDGE_CONN_ID).  Allow that by accepting the
     // sentinel.  Otherwise: peer must be the bound bridge.
-    if (!this.ownsPeer(nodeId) && nodeId !== BRIDGE_CONN_ID) return;
-    if (!this._isBridgeOpen()) return;
+    if (!this.ownsPeer(nodeId) && nodeId !== BRIDGE_CONN_ID) {
+      this._log('bridge-notify-not-bridge-peer', {
+        nodeId: typeof nodeId === 'bigint'
+          ? nodeId.toString(16).padStart(16, '0') : String(nodeId),
+        type,
+      });
+      return;
+    }
+    if (!this._isBridgeOpen()) {
+      this._log('bridge-notify-ws-closed', { type });
+      return;
+    }
     try {
       this._sendToBridge({ type: 'axona', payload: { k: 'ntf', type, body } });
     } catch (err) {

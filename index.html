@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Axona Peer — Phase 2</title>
   <link rel="stylesheet" href="src/styles.css">
-  <!-- v0.11.0 — importmap resolves `@axona/protocol/*` to the
+  <!-- v0.12.0 — importmap resolves `@axona/protocol/*` to the
        vendored slim subset under vendor/axona-protocol/.  Sync the
        vendored files from the canonical source at
        github.com/axona-net/axona-protocol by running
@@ -95,26 +95,16 @@
     <section class="pubsub">
       <h2>Pub / Sub</h2>
 
-      <!-- Publish form ─────────────────────────────────────────────── -->
-      <div class="pubsub-publish">
-        <div class="pubsub-row">
-          <label class="me-label" for="pub-region">prefix</label>
-          <select id="pub-region" class="pubsub-region"></select>
-        </div>
-        <div class="pubsub-row">
-          <input id="pub-event" type="text"
-                 class="pubsub-input"
-                 placeholder="event name (e.g. News of the Day)"
-                 spellcheck="false" autocomplete="off">
-        </div>
-        <div class="pubsub-row">
-          <input id="pub-message" type="text"
-                 class="pubsub-input"
-                 placeholder="message body — Enter or Send to publish"
-                 spellcheck="false" autocomplete="off">
-          <button id="pub-send" class="pubsub-send" type="button" disabled>send</button>
-        </div>
-        <div class="pubsub-key" id="pub-key">—</div>
+      <!-- Publish forms.  One card per configured publisher; client.js
+           manages them as a list so the user can keep several topics
+           pre-configured.  Each card has its own region, event-name,
+           message, and send-on-Enter wiring. -->
+      <div class="pubsub-publish-header">
+        <h3>Publish</h3>
+        <button id="pub-add" class="pubsub-add" type="button" disabled>+ add publish</button>
+      </div>
+      <div id="pub-list" class="pubsub-publish-list">
+        <!-- rendered by client.js: one <div class="pubsub-publish"> per form -->
       </div>
 
       <!-- Subscription list ────────────────────────────────────────── -->
