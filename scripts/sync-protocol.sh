@@ -8,19 +8,13 @@
 # What gets copied:
 #   contracts/  (all 5 contract files)
 #   dht/        (AxonaPeer, DHTNode, NeuronNode, Synapse)
+#   pubsub/     (AxonManager, AxonPubSub, post.js (Web Crypto), ed25519.js)
 #   utils/      (geo.js, s2.js)
+#   index.js    (barrel)
 #
-# What stays vendored slim:
-#   index.js   — DELIBERATELY NOT OVERWRITTEN.  The vendored version
-#                omits the `./pubsub/*` re-exports (post.js uses
-#                node:crypto which doesn't exist in browsers).  If
-#                you change the upstream `index.js` non-pubsub
-#                exports, manually reconcile.
-#
-# What gets skipped:
-#   pubsub/    — post.js imports node:crypto and won't run in a
-#                browser without a Web-Crypto port or an esbuild
-#                bundling step.  Re-vendor pubsub once that lands.
+# v0.6.0 — pubsub is now browser-safe.  post.js was ported to Web
+# Crypto (async sha256 + Ed25519); ed25519.js is the new Web Crypto
+# Ed25519 helper.  See axona-protocol v1.0.0 changelog.
 #
 # After running, commit the changed files.
 # =====================================================================
@@ -43,7 +37,7 @@ echo "→ Syncing from ${PROTOCOL_SRC}"
 echo "  to            ${VENDOR_DST}"
 
 mkdir -p "${VENDOR_DST}"
-for dir in contracts dht utils; do
+for dir in contracts dht pubsub utils; do
   if [ -d "${PROTOCOL_SRC}/${dir}" ]; then
     rm -rf "${VENDOR_DST}/${dir}"
     cp -r "${PROTOCOL_SRC}/${dir}" "${VENDOR_DST}/${dir}"
@@ -51,12 +45,8 @@ for dir in contracts dht utils; do
   fi
 done
 
-echo
-echo "→ Skipped (browser-incompatible):"
-echo "  ✗ pubsub/  (post.js uses node:crypto)"
-echo
-echo "→ Preserved (slim subset, manual reconcile if needed):"
-echo "  ◇ index.js"
+cp "${PROTOCOL_SRC}/index.js" "${VENDOR_DST}/index.js"
+echo "  ✓ index.js"
 echo
 echo "Diff:"
 ( cd "${REPO_ROOT}" && git status --porcelain vendor/axona-protocol/ )

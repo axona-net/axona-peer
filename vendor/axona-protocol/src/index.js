@@ -1,16 +1,14 @@
 // =====================================================================
-// @axona/protocol (browser-vendored slim) — public barrel export.
+// @axona/protocol — public barrel export.
 //
-// Subset of @axona/protocol that runs in browsers without a build
-// step.  Omits the pub/sub layer (AxonManager, AxonPubSub, post.js)
-// because post.js imports `node:crypto`.  Pub/sub support in the
-// browser awaits either a Web Crypto port of post.js or an esbuild
-// bundle step in axona-peer.
+// Pure-JS protocol kernel for the Axona peer-to-peer mesh.  Three
+// contract surfaces, one per-node DHT implementation (AxonaPeer with
+// NH-1 routing + axonal pub/sub), supporting state classes, and
+// geographic / hashing helpers.
 //
-// This file mirrors the upstream package's index.js MINUS the
-// `./pubsub/*` re-exports.  Resync with the canonical source at
-// github.com/axona-net/axona-protocol/src/index.js when its
-// non-pubsub exports change.
+// Consumers (axona-peer, axona-bridge, dht-sim) import named symbols
+// from here.  Sub-path imports (e.g. `@axona/protocol/contracts/DHT.js`)
+// are also supported via the `exports` map in package.json.
 // =====================================================================
 
 // ── Contracts ────────────────────────────────────────────────────────
@@ -24,7 +22,39 @@ export { DHTNode, GEO_CELL_BITS } from './dht/DHTNode.js';
 export { NeuronNode } from './dht/NeuronNode.js';
 export { Synapse }    from './dht/Synapse.js';
 
+// ── Pub/sub primitives ─────────────────────────────────────────────
+export { AxonManager } from './pubsub/AxonManager.js';
+export { AxonPubSub }  from './pubsub/AxonPubSub.js';
+export {
+  makePost,
+  deriveTopicId,
+  verifyPostHash,
+  verifyTopicOwnership,
+  verifySignature,
+} from './pubsub/post.js';
+
+// ── Ed25519 helpers (Web Crypto wrapper) ─────────────────────────
+// Optional companion to post.js for runtimes that support Web Crypto
+// Ed25519 (Chrome 110+, Safari 17+, Firefox 130+, Node 20+).
+// Applications on older runtimes can substitute @noble/ed25519 with
+// the same shape — post.js's signer/verifier contracts are
+// implementation-agnostic.
+export {
+  generateKeyPair,
+  exportPublicKey,
+  importPublicKey,
+  sign,
+  verify,
+  makeSigner,
+  makeVerifier,
+} from './pubsub/ed25519.js';
+
 // ── Utilities ──────────────────────────────────────────────────────
+// The big ones the protocol uses directly are re-exported; the
+// remaining geo.js helpers (haversine, roundTripLatency, continent
+// detection, XOR routing-table builders, etc.) are reachable via
+// the `@axona/protocol/utils/geo.js` sub-path import for consumers
+// that need them.
 export {
   clz64,
   randomU32,
