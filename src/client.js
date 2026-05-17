@@ -36,7 +36,7 @@ import { deriveTopicKey, topicKeyToHex } from './pubsub_topic.js';
 // where the bfcache can serve a stale module set for ages).  The
 // bridge version arrives separately in its `welcome` message; the
 // "version" row in the me panel shows both side by side.
-const PEER_VERSION = '0.13.0';
+const PEER_VERSION = '0.13.1';
 
 const BRIDGE_PING_INTERVAL_MS = 1000;
 const BRIDGE_STALE_PONG_MS    = 3000;
@@ -858,6 +858,40 @@ async function bootAxonaNode(opts = {}) {
     log: (event, detail) => appendLog(`axona:${event}`, detail),
   });
   await axonaNode.start(mesh, bridgeAdapter);
+
+  // Debug surface for DevTools.  Exposed on window so operators can
+  // introspect live state without rebuilding — `window.axona.synaptome()`,
+  // `window.axona.subs()`, etc.  All read-only — no setters that could
+  // accidentally tamper with running state.
+  window.axona = {
+    /** Raw node reference — for poking around when needed. */
+    node:        axonaNode,
+    /** Identity object (nodeId + region + geoBits). */
+    identity,
+    /** Snapshot of every Synapse currently in our routing table. */
+    synaptome:   () => axonaNode.getSynaptome(),
+    /** Active subscriptions (UI-side state) with their topic keys + msg counts. */
+    subs:        () => subscriptions.map(s => ({
+                   regionId: s.regionId,
+                   eventName: s.eventName,
+                   key: s.key.toString(16).padStart(16, '0'),
+                   messageCount: s.messages.length,
+                 })),
+    /** Configured publish cards. */
+    publishForms: () => publishForms.slice(),
+    /** Live bridge connection state — useful when handshake stalls. */
+    bridge:      () => ({
+                   state:    bridge.state,
+                   myConnId: bridge.myConnId,
+                   version:  bridge.version,
+                   url:      bridge.url,
+                   wsReady:  bridge.ws?.readyState,
+                 }),
+    /** Mesh peers with their connection states. */
+    mesh:        () => mesh.getPeers(),
+    /** Pubsub LRU snapshot (which publishIds we've already seen). */
+    pubsubDebug: () => axonaNode._pubsub?._debug?.() ?? null,
+  };
 
   // Drain any axona frames that arrived during the async boot.  The
   // bridge sends `hello` right after `welcome`; identity derivation
