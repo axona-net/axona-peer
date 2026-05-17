@@ -133,7 +133,11 @@ async function buildBrowser(name, region, meshId) {
   forgetIdentity();
   const ws = await new Promise((resolve, reject) => {
     const s = new WebSocket(BRIDGE_URL);
-    s.on('open', () => resolve(s));
+    s.on('open', () => {
+      try { s.send(JSON.stringify({ type: 'client-hello', version: '0.12.0' })); }
+      catch (err) { reject(err); return; }
+      resolve(s);
+    });
     s.on('error', reject);
   });
   const identity = await deriveIdentity({ region: REGIONS.find(r => r.id === region) });

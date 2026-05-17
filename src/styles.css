@@ -510,6 +510,32 @@ footer a:hover { text-decoration: underline; }
   min-height: 1.4em;
 }
 
+/* ── Upgrade-required banner ─────────────────────────────────────
+   Shown when the bridge closes our connection with code 4426
+   (client below MIN_PEER_VERSION).  Sticks to the top of the page
+   and stays put until the user reloads. */
+
+.upgrade-banner {
+  position: sticky;
+  top: 0;
+  z-index: 100;
+  background: #4a1f1f;
+  color: #ffd9d9;
+  border-bottom: 2px solid #ff6b6b;
+  padding: 14px 20px;
+  font-size: 14px;
+  line-height: 1.5;
+  text-align: center;
+}
+.upgrade-banner strong { color: #ff6b6b; font-size: 16px; }
+.upgrade-banner code {
+  background: rgba(0,0,0,0.3);
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
 /* ── Pub/Sub harness (Phase 3) ──────────────────────────────────── */
 
 .pubsub {

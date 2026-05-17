@@ -1,6 +1,6 @@
 {
   "name": "axona-peer",
-  "version": "0.12.0",
+  "version": "0.13.0",
   "private": true,
   "description": "Axona browser peer: WebRTC mesh + AxonaPeer (NH-1 routing).  Static-served; no build step.  This package.json exists only for Node-side smoke tests.",
   "type": "module",
@@ -11,7 +11,8 @@
     "smoke:peer":      "node src/smoke_axona_peer.js",
     "smoke:bridge":    "node src/smoke_bridge_transport.js",
     "smoke:three":     "node src/smoke_three_node.js",
-    "smoke:pubsub":    "node src/smoke_pubsub.js"
+    "smoke:pubsub":    "node src/smoke_pubsub.js",
+    "smoke:gate":      "node src/smoke_version_gate.js"
   },
   "engines": { "node": ">=20.0.0" },
   "devDependencies": {

@@ -160,7 +160,11 @@ async function buildBrowser(name, region, meshId) {
 
   const ws = await new Promise((resolve, reject) => {
     const sock = new WebSocket(BRIDGE_URL);
-    sock.on('open', () => resolve(sock));
+    sock.on('open', () => {
+      try { sock.send(JSON.stringify({ type: 'client-hello', version: '0.12.0' })); }
+      catch (err) { reject(err); return; }
+      resolve(sock);
+    });
     sock.on('error', reject);
   });
 

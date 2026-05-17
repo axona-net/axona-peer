@@ -36,7 +36,7 @@ import { deriveTopicKey, topicKeyToHex } from './pubsub_topic.js';
 // where the bfcache can serve a stale module set for ages).  The
 // bridge version arrives separately in its `welcome` message; the
 // "version" row in the me panel shows both side by side.
-const PEER_VERSION = '0.12.0';
+const PEER_VERSION = '0.13.0';
 
 const BRIDGE_PING_INTERVAL_MS = 1000;
 const BRIDGE_STALE_PONG_MS    = 3000;
@@ -482,6 +482,18 @@ function connectBridge() {
 function onBridgeOpen() {
   appendLog('bridge:open', null, 'ok');
   setBridgeState('connecting');     // green only after first pong
+
+  // Identify ourselves so the bridge's version gate can decide whether
+  // to admit us.  This MUST be the first message we send — the bridge
+  // drops anything else from un-admitted connections.  If we're too
+  // old (or this message is missing), the bridge closes with
+  // CLOSE_UPGRADE_REQUIRED (4426) and onBridgeClose surfaces a banner.
+  try {
+    bridge.ws.send(encode({ type: 'client-hello', version: PEER_VERSION }));
+  } catch (err) {
+    appendLog('bridge:client-hello-send-failed', err.message, 'error');
+  }
+
   bridge.backoffMs = BACKOFF_INITIAL_MS;
   bridge.pings = 0;
   bridge.pongs = 0;
@@ -547,6 +559,14 @@ function onBridgeMessage(ev) {
       break;
     }
 
+    case 'version-gate':
+      // The bridge announces the minimum peer version it'll admit
+      // BEFORE waiting for client-hello.  Pure informational here —
+      // our own version is fixed at PEER_VERSION; if we're below
+      // the gate, the bridge will close us with code 4426 next.
+      appendLog('bridge:version-gate', `min=${msg.minPeerVersion}`);
+      break;
+
     case 'axona':
       // Axona protocol frame (hello / hello-ack / req / res / ntf).
       // Hand off to the AxonaNode's BridgeTransport.  Frames can arrive
@@ -600,7 +620,38 @@ function onBridgeClose(ev) {
   // outage) will already be cleaning themselves up via WebRTC's own
   // health monitoring.
   setBridgeState('disconnected');
+
+  // The bridge enforces a version gate.  If our peer build is below
+  // its minimum, it closes with CLOSE_UPGRADE_REQUIRED (4426) and a
+  // reason string.  Reconnecting would just fail again the same way,
+  // so we stop the retry loop and surface a banner instructing the
+  // user to hard-reload the page (Pages may need a cache-bust).
+  if (ev.code === 4426) {
+    showUpgradeBanner(ev.reason || 'Your client is out of date.');
+    return;
+  }
+
   scheduleBridgeReconnect();
+}
+
+/**
+ * Render a visible, persistent banner when the bridge rejects this
+ * client as too old.  The user needs to hard-reload (or close & re-
+ * open) to pick up the new peer build.  No automatic reload — that
+ * could disrupt typing or in-flight work.
+ */
+function showUpgradeBanner(reason) {
+  if (document.getElementById('upgrade-banner')) return;   // idempotent
+  const div = document.createElement('div');
+  div.id = 'upgrade-banner';
+  div.className = 'upgrade-banner';
+  div.innerHTML =
+    '<strong>Client out of date</strong><br>' +
+    `<span class="upgrade-reason"></span><br><br>` +
+    'Reload the page (<code>Cmd&nbsp;+&nbsp;Shift&nbsp;+&nbsp;R</code> on macOS, ' +
+    '<code>Ctrl&nbsp;+&nbsp;Shift&nbsp;+&nbsp;R</code> elsewhere) to upgrade.';
+  div.querySelector('.upgrade-reason').textContent = reason;
+  document.body.insertBefore(div, document.body.firstChild);
 }
 
 function onBridgeError() {
