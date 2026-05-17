@@ -82,14 +82,23 @@ function check(label, condition) {
   else           { console.log(`  ✗ ${label}`); failed++; }
 }
 
+// v0.6.0 — WebRTCTransport now requires BigInt nodeIds with an
+// explicit bindPeer(nodeId, meshId) registration.  For tests, we
+// pair BigInt nodeIds with the string meshIds the FakeMesh uses.
+const A_NODE = 0xAAAAn;
+const B_NODE = 0xBBBBn;
+
 async function setup() {
   const meshA = new FakeMesh('A');
   const meshB = new FakeMesh('B');
   meshA.linkTo(meshB);
   const tA = new WebRTCTransport({ mesh: meshA });
   const tB = new WebRTCTransport({ mesh: meshB });
-  await tA.start('A');
-  await tB.start('B');
+  await tA.start(A_NODE);
+  await tB.start(B_NODE);
+  // Skip the hello handshake in this low-level smoke — bind directly.
+  tA.bindPeer(B_NODE, 'B');
+  tB.bindPeer(A_NODE, 'A');
   return { tA, tB, meshA, meshB };
 }
 
@@ -97,7 +106,7 @@ async function testRequestResponse() {
   console.log('\n── Request/response ──');
   const { tA, tB } = await setup();
   tB.onRequest('add', async (_from, { a, b }) => a + b);
-  const result = await tA.send('B', 'add', { a: 2, b: 3 });
+  const result = await tA.send(B_NODE, 'add', { a: 2, b: 3 });
   check('A→B add returns 5', result === 5);
   await tA.stop(); await tB.stop();
 }
@@ -107,7 +116,7 @@ async function testNotification() {
   const { tA, tB } = await setup();
   let received = null;
   tB.onNotification('hello', (_from, payload) => { received = payload; });
-  await tA.notify('B', 'hello', { msg: 'hi' });
+  await tA.notify(B_NODE, 'hello', { msg: 'hi' });
   // wait a microtask
   await new Promise(r => setTimeout(r, 10));
   check('notify delivered', received !== null && received.msg === 'hi');
@@ -122,7 +131,7 @@ async function testTimeout() {
   // shortcut by patching the constant in the test.  But the test
   // should still complete.  Use a short manual race.
   const raced = await Promise.race([
-    tA.send('B', 'slow', {}).then(() => 'resolved').catch(e => `rejected: ${e.message}`),
+    tA.send(B_NODE, 'slow', {}).then(() => 'resolved').catch(e => `rejected: ${e.message}`),
     new Promise(r => setTimeout(() => r('still-waiting'), 200)),
   ]);
   check('5s timeout not yet fired (200ms wait)', raced === 'still-waiting');
@@ -134,7 +143,7 @@ async function testRemoteError() {
   const { tA, tB } = await setup();
   tB.onRequest('boom', () => { throw new Error('kaboom'); });
   let caught = null;
-  try { await tA.send('B', 'boom', {}); }
+  try { await tA.send(B_NODE, 'boom', {}); }
   catch (err) { caught = err.message; }
   check('A.send rejects with remote error', caught === 'kaboom');
   await tA.stop(); await tB.stop();
@@ -148,14 +157,14 @@ async function testPeerDied() {
 
   // Send a request that will be pending when B dies.
   tB.onRequest('hang', () => new Promise(() => {}));
-  const reqPromise = tA.send('B', 'hang', {}).catch(e => e.message);
+  const reqPromise = tA.send(B_NODE, 'hang', {}).catch(e => e.message);
 
   // Now kill the link.
   await new Promise(r => setTimeout(r, 10));
   meshA.killLink();
   await new Promise(r => setTimeout(r, 10));
 
-  check('onPeerDied fired', died === 'B');
+  check('onPeerDied fired', died === B_NODE);
   const rejection = await reqPromise;
   check('pending send rejected with peer-died', rejection === 'peer-died');
   await tA.stop(); await tB.stop();
@@ -164,7 +173,7 @@ async function testPeerDied() {
 async function testLatency() {
   console.log('\n── getLatency ──');
   const { tA, tB } = await setup();
-  check('A.getLatency(B) reports mesh RTT', tA.getLatency('B') === 42);
+  check('A.getLatency(B) reports mesh RTT', tA.getLatency(B_NODE) === 42);
   check('A.getLatency(unknown) returns -1', tA.getLatency('UNKNOWN') === -1);
   await tA.stop(); await tB.stop();
 }
@@ -172,9 +181,9 @@ async function testLatency() {
 async function testIsConnected() {
   console.log('\n── isConnected ──');
   const { tA, meshA } = await setup();
-  check('A.isConnected(B) true before link killed', tA.isConnected('B') === true);
+  check('A.isConnected(B) true before link killed', tA.isConnected(B_NODE) === true);
   meshA.killLink();
-  check('A.isConnected(B) false after link killed', tA.isConnected('B') === false);
+  check('A.isConnected(B) false after link killed', tA.isConnected(B_NODE) === false);
 }
 
 async function main() {

@@ -66,20 +66,35 @@ export class WebRTCTransport extends Transport {
     this._localNodeId = localNodeId;
     this._log         = log ?? (() => {});
 
-    /** @type {Map<string, (fromId:string, payload:any)=>Promise<any>>} */
+    /** @type {Map<string, (fromId:bigint, payload:any)=>Promise<any>>} */
     this._reqHandlers = new Map();
-    /** @type {Map<string, (fromId:string, payload:any)=>void>} */
+    /** @type {Map<string, (fromId:bigint, payload:any)=>void>} */
     this._ntfHandlers = new Map();
 
     /**
      * Outstanding requests awaiting response.  Keyed by correlation id.
-     * @type {Map<number, { peerId:string, resolve:Function, reject:Function, timer:any }>}
+     * @type {Map<number, { nodeId:bigint, resolve:Function, reject:Function, timer:any }>}
      */
     this._pending = new Map();
     this._nextId  = 1;
 
-    /** @type {Array<(peerId:string) => void>} */
+    /** @type {Array<(nodeId:bigint) => void>} */
     this._peerDiedHandlers = [];
+
+    // v0.6.0 — Two-space identifier translation.
+    //
+    // Mesh layer uses string `meshId`s (the bridge-assigned UUID-ish
+    // connId).  Axona protocol layer uses 64-bit BigInt `nodeId`s
+    // (S2 prefix + 56 bottom bits).  The two coexist: an Axona
+    // hello/hello-ack handshake on each fresh WebRTC channel
+    // exchanges nodeIds; the application calls bindPeer(nodeId,
+    // meshId) to teach the transport.  After that, AxonaPeer can
+    // address peers by their 64-bit nodeId and the transport
+    // routes correctly.  Unbind on peer-left to keep maps clean.
+    /** @type {Map<bigint, string>} */
+    this._meshIdByNodeId = new Map();
+    /** @type {Map<string, bigint>} */
+    this._nodeIdByMeshId = new Map();
 
     this._started        = false;
     this._unsubMessage   = null;
@@ -117,6 +132,44 @@ export class WebRTCTransport extends Transport {
     return this._localNodeId;
   }
 
+  // ─── nodeId ↔ meshId binding (v0.6.0) ──────────────────────────────
+  //
+  // The Axona protocol layer addresses peers by 64-bit BigInt nodeId.
+  // The mesh layer (MeshManager + the bridge's signaling) uses
+  // opaque string meshIds (UUID-ish connIds).  An external
+  // orchestrator runs the hello/hello-ack handshake on each fresh
+  // WebRTC channel; once both sides know each other's nodeId, the
+  // orchestrator calls bindPeer(nodeId, meshId) to teach the
+  // transport.  After that, AxonaPeer can do transport.send(nodeId,
+  // ...) and the transport routes via the mesh.
+  //
+  // unbindPeer is called when the underlying mesh channel closes;
+  // any subsequent send/notify to that nodeId fails.
+
+  bindPeer(nodeId, meshId) {
+    if (typeof nodeId !== 'bigint') throw new TypeError('nodeId must be bigint');
+    if (typeof meshId !== 'string') throw new TypeError('meshId must be string');
+    this._meshIdByNodeId.set(nodeId, meshId);
+    this._nodeIdByMeshId.set(meshId, nodeId);
+    this._log('bindPeer', { nodeId: nodeId.toString(16), meshId });
+  }
+
+  unbindPeer(meshId) {
+    const nodeId = this._nodeIdByMeshId.get(meshId);
+    if (nodeId !== undefined) this._meshIdByNodeId.delete(nodeId);
+    this._nodeIdByMeshId.delete(meshId);
+  }
+
+  /** Look up the meshId for a nodeId; null if not bound. */
+  meshIdFor(nodeId) {
+    return this._meshIdByNodeId.get(nodeId) ?? null;
+  }
+
+  /** Look up the nodeId for a meshId; null if not bound. */
+  nodeIdFor(meshId) {
+    return this._nodeIdByMeshId.get(meshId) ?? null;
+  }
+
   // ─── Channel pool ──────────────────────────────────────────────────
   //
   // MeshManager owns connection setup; WebRTCTransport just observes.
@@ -127,15 +180,15 @@ export class WebRTCTransport extends Transport {
   // semantics are still correct because the underlying mesh.send()
   // will throw on a peer that left.
 
-  async openConnection(peerId) {
-    if (this._mesh.isConnected(peerId)) return true;
+  async openConnection(nodeId) {
+    const meshId = this._meshIdByNodeId.get(nodeId);
+    if (!meshId) return false;   // not yet handshook
+    if (this._mesh.isConnected(meshId)) return true;
 
     return new Promise((resolve) => {
       const unsub = this._mesh.onChange((peers) => {
-        const p = peers.find(x => x.peerId === peerId);
+        const p = peers.find(x => x.peerId === meshId);
         if (!p) {
-          // Peer disappeared from the list — we never connected and
-          // can't anymore.
           unsub(); clearTimeout(timer); resolve(false);
         } else if (p.state === 'open') {
           unsub(); clearTimeout(timer); resolve(true);
@@ -149,17 +202,17 @@ export class WebRTCTransport extends Transport {
     });
   }
 
-  async closeConnection(_peerId) {
-    // No-op: MeshManager's lifecycle is driven by the bridge's
-    // peer-list / peer-left signals.  A protocol layer that wants to
-    // "evict" a peer just stops sending to it; the channel persists
-    // until the bridge announces peer-left or the connection fails.
-    // A future revision may add an explicit teardown method on
-    // MeshManager and call it here.
+  async closeConnection(nodeId) {
+    // Unbind the nodeId↔meshId mapping so further send/notify fail
+    // fast.  MeshManager's WebRTC teardown is still driven by the
+    // bridge's peer-left / pc-failed; we don't force it here.
+    const meshId = this._meshIdByNodeId.get(nodeId);
+    if (meshId) this.unbindPeer(meshId);
   }
 
-  isConnected(peerId) {
-    return this._mesh.isConnected(peerId);
+  isConnected(nodeId) {
+    const meshId = this._meshIdByNodeId.get(nodeId);
+    return meshId != null && this._mesh.isConnected(meshId);
   }
 
   // ─── Messaging ─────────────────────────────────────────────────────
@@ -170,10 +223,11 @@ export class WebRTCTransport extends Transport {
    * arrives.  Rejects on timeout, transport stop, or handler error
    * propagated from the remote (`ok:false`).
    */
-  async send(peerId, type, body) {
+  async send(nodeId, type, body) {
     if (!this._started) throw new Error('Transport.send: not started');
-    if (!this._mesh.isConnected(peerId)) {
-      throw new Error(`Transport.send: peer ${peerId} not connected`);
+    const meshId = this._meshIdByNodeId.get(nodeId);
+    if (!meshId || !this._mesh.isConnected(meshId)) {
+      throw new Error(`Transport.send: peer ${nodeId} not connected`);
     }
 
     const id = this._nextId;
@@ -185,10 +239,10 @@ export class WebRTCTransport extends Transport {
         reject(new Error('timeout'));
       }, REQUEST_TIMEOUT_MS);
 
-      this._pending.set(id, { peerId, resolve, reject, timer });
+      this._pending.set(id, { nodeId, resolve, reject, timer });
 
       try {
-        this._mesh.send(peerId, { k: 'req', id, type, body });
+        this._mesh.send(meshId, { k: 'req', id, type, body });
       } catch (err) {
         clearTimeout(timer);
         this._pending.delete(id);
@@ -202,13 +256,14 @@ export class WebRTCTransport extends Transport {
    * connected — production transports treat notification delivery as
    * best-effort and surface liveness via the heartbeat channel.
    */
-  async notify(peerId, type, body) {
+  async notify(nodeId, type, body) {
     if (!this._started) throw new Error('Transport.notify: not started');
-    if (!this._mesh.isConnected(peerId)) return;
+    const meshId = this._meshIdByNodeId.get(nodeId);
+    if (!meshId || !this._mesh.isConnected(meshId)) return;
     try {
-      this._mesh.send(peerId, { k: 'ntf', type, body });
+      this._mesh.send(meshId, { k: 'ntf', type, body });
     } catch (err) {
-      this._log('notify-send-failed', { peerId, type, err: err.message });
+      this._log('notify-send-failed', { nodeId: nodeId.toString(16), type, err: err.message });
     }
   }
 
@@ -239,49 +294,55 @@ export class WebRTCTransport extends Transport {
     };
   }
 
-  getLatency(peerId) {
-    return this._mesh.getLatency(peerId);
+  getLatency(nodeId) {
+    const meshId = this._meshIdByNodeId.get(nodeId);
+    return meshId ? this._mesh.getLatency(meshId) : -1;
   }
 
   // ─── Internal: route incoming frames ───────────────────────────────
 
-  async _onMessage(fromPeerId, msg) {
+  async _onMessage(fromMeshId, msg) {
     if (!msg || typeof msg !== 'object') return;
 
+    // Frames addressed to the transport layer arrive here keyed by
+    // the sender's meshId.  We translate to nodeId for the handler
+    // dispatch.  If a frame arrives from an unbound mesh peer (e.g.
+    // hello/hello-ack BEFORE bindPeer is called), let it through
+    // with nodeId=null so the orchestrator can intercept and bind.
+    const fromNodeId = this._nodeIdByMeshId.get(fromMeshId) ?? null;
+
     if (msg.k === 'req') {
-      await this._handleRequest(fromPeerId, msg);
+      await this._handleRequest(fromMeshId, fromNodeId, msg);
     } else if (msg.k === 'res') {
       this._handleResponse(msg);
     } else if (msg.k === 'ntf') {
-      this._handleNotification(fromPeerId, msg);
+      this._handleNotification(fromMeshId, fromNodeId, msg);
     } else {
-      // Unknown frame kind — drop silently.  A future spec rev may
-      // add new envelope kinds; current code ignores them rather than
-      // emitting noise that legacy peers can't make sense of.
+      // Unknown frame kind — drop silently.
     }
   }
 
-  async _handleRequest(fromPeerId, msg) {
+  async _handleRequest(fromMeshId, fromNodeId, msg) {
     const handler = this._reqHandlers.get(msg.type);
     if (!handler) {
-      this._reply(fromPeerId, msg.id, false, { error: `no handler for '${msg.type}'` });
+      this._reply(fromMeshId, msg.id, false, { error: `no handler for '${msg.type}'` });
       return;
     }
     try {
-      const result = await handler(fromPeerId, msg.body);
-      this._reply(fromPeerId, msg.id, true, result);
+      const result = await handler(fromNodeId, msg.body);
+      this._reply(fromMeshId, msg.id, true, result);
     } catch (err) {
-      this._reply(fromPeerId, msg.id, false, { error: err.message ?? String(err) });
+      this._reply(fromMeshId, msg.id, false, { error: err.message ?? String(err) });
     }
   }
 
-  _reply(peerId, id, ok, body) {
+  _reply(meshId, id, ok, body) {
     try {
-      this._mesh.send(peerId, { k: 'res', id, ok, body });
+      this._mesh.send(meshId, { k: 'res', id, ok, body });
     } catch (err) {
       // Peer died mid-handle.  The originator's request will time out
       // on its own; we can't do anything useful here.
-      this._log('reply-send-failed', { peerId, id, err: err.message });
+      this._log('reply-send-failed', { meshId, id, err: err.message });
     }
   }
 
@@ -304,30 +365,37 @@ export class WebRTCTransport extends Transport {
     }
   }
 
-  _handleNotification(fromPeerId, msg) {
+  _handleNotification(fromMeshId, fromNodeId, msg) {
     const handler = this._ntfHandlers.get(msg.type);
     if (!handler) return;   // unknown notification type — silent drop
     try {
-      handler(fromPeerId, msg.body);
+      // For pre-bind notifications (hello, hello-ack), fromNodeId is
+      // null; handler receives fromMeshId as a string in that slot so
+      // the orchestrator can bind on receipt.
+      handler(fromNodeId ?? fromMeshId, msg.body);
     } catch (err) {
       this._log('ntf-handler-threw', { type: msg.type, err: err.message });
     }
   }
 
-  _onPeerLost(peerId) {
-    // Fan out to peer-died subscribers.
+  _onPeerLost(meshId) {
+    const nodeId = this._nodeIdByMeshId.get(meshId);
+    // Fan out to peer-died subscribers (translate to nodeId if bound).
+    const reportedId = nodeId ?? meshId;
     for (const h of this._peerDiedHandlers) {
-      try { h(peerId); }
+      try { h(reportedId); }
       catch (err) {
-        this._log('peer-died-handler-threw', { peerId, err: err.message });
+        this._log('peer-died-handler-threw', { reportedId, err: err.message });
       }
     }
     // Reject every pending request to this peer.
     for (const [id, p] of this._pending.entries()) {
-      if (p.peerId !== peerId) continue;
+      if (p.nodeId !== nodeId) continue;
       clearTimeout(p.timer);
       this._pending.delete(id);
       p.reject(new Error('peer-died'));
     }
+    // Unbind the dead peer last so further sends fail fast.
+    this.unbindPeer(meshId);
   }
 }

@@ -411,3 +411,101 @@ footer a {
   text-decoration: none;
 }
 footer a:hover { text-decoration: underline; }
+
+/* ── Region picker (Phase 3) ────────────────────────────────────── */
+
+.region-picker {
+  background: var(--bg-sub);
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  padding: 14px 18px;
+  margin: 0 0 16px;
+}
+.region-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.region-select {
+  flex: 1 1 auto;
+  min-width: 220px;
+  padding: 6px 10px;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-size: 14px;
+}
+.region-save {
+  padding: 6px 14px;
+  background: var(--accent);
+  color: var(--bg);
+  border: 0;
+  border-radius: 4px;
+  cursor: pointer;
+  font-weight: 600;
+}
+.region-save:hover { filter: brightness(1.1); }
+.region-help {
+  margin: 8px 0 0;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+/* ── DHT lookup harness (Phase 3) ───────────────────────────────── */
+
+.lookup {
+  margin: 0 0 16px;
+}
+.lookup h2 {
+  margin: 0 0 10px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.lookup-row {
+  display: flex;
+  gap: 8px;
+}
+.lookup-input {
+  flex: 1 1 auto;
+  padding: 6px 10px;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-family: var(--mono);
+  font-size: 13px;
+}
+.lookup-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.lookup-go {
+  padding: 6px 14px;
+  background: var(--accent);
+  color: var(--bg);
+  border: 0;
+  border-radius: 4px;
+  cursor: pointer;
+  font-weight: 600;
+}
+.lookup-go:disabled {
+  background: var(--border);
+  cursor: not-allowed;
+}
+.lookup-result {
+  margin: 8px 0 0;
+  padding: 8px 10px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text-dim);
+  white-space: pre-wrap;
+  min-height: 1.4em;
+}

@@ -23,13 +23,37 @@
   <main>
     <header>
       <h1>Axona Peer</h1>
-      <p class="subtitle">Phase 2 · WebRTC mesh</p>
+      <p class="subtitle">Phase 3 · WebRTC mesh + Axona protocol</p>
     </header>
+
+    <!-- Region picker shown on first visit when geolocation is denied
+         or unavailable.  Persists into localStorage; subsequent
+         visits load the stored identity and skip this. -->
+    <section id="region-picker" class="region-picker" hidden>
+      <div class="region-row">
+        <label class="me-label" for="region-select">pick a region</label>
+        <select id="region-select" class="region-select"></select>
+        <button id="region-save" class="region-save" type="button">save</button>
+      </div>
+      <p class="region-help">
+        Sets the 8-bit S2 geographic prefix of your node ID.  The
+        bottom 56 bits are random and persisted locally, so returning
+        visits use the same identity.
+      </p>
+    </section>
 
     <section class="me">
       <div class="me-row">
-        <span class="me-label">my id</span>
+        <span class="me-label">connection id</span>
         <span id="my-id" class="me-value">—</span>
+      </div>
+      <div class="me-row">
+        <span class="me-label">axona node id</span>
+        <span id="axona-id" class="me-value mono">—</span>
+      </div>
+      <div class="me-row">
+        <span class="me-label">region</span>
+        <span id="axona-region" class="me-value">—</span>
       </div>
       <div class="me-row">
         <span class="me-label">bridge</span>
@@ -40,9 +64,27 @@
         <span id="mesh-count" class="me-value">0 of 0</span>
       </div>
       <div class="me-row">
+        <span class="me-label">synaptome</span>
+        <span id="synaptome-size" class="me-value">0</span>
+      </div>
+      <div class="me-row">
         <span class="me-label">version</span>
         <span id="version" class="me-value mono">—</span>
       </div>
+    </section>
+
+    <!-- DHT lookup harness.  Type a target node-id (hex) and press
+         lookup; the result lands in the result row. -->
+    <section class="lookup">
+      <h2>DHT lookup</h2>
+      <div class="lookup-row">
+        <input id="lookup-target" type="text"
+               class="lookup-input"
+               placeholder="target node id (hex, 16 chars)"
+               spellcheck="false" autocomplete="off">
+        <button id="lookup-go" class="lookup-go" type="button" disabled>lookup</button>
+      </div>
+      <pre id="lookup-result" class="lookup-result"></pre>
     </section>
 
     <section class="peers">

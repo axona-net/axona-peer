@@ -20,13 +20,19 @@
 
 import { MeshManager } from './mesh.js';
 import { renderQR }    from './qr.js';
+import { AxonaNode }   from './axona_node.js';
+import {
+  REGIONS,
+  getCurrentIdentity,
+  deriveIdentity,
+} from './identity.js';
 
 // Peer build number.  Bump the middle digit on every code change so
 // you can confirm a redeployed page actually loaded (esp. on iOS,
 // where the bfcache can serve a stale module set for ages).  The
 // bridge version arrives separately in its `welcome` message; the
 // "version" row in the me panel shows both side by side.
-const PEER_VERSION = '0.6.0';
+const PEER_VERSION = '0.7.0';
 
 const BRIDGE_PING_INTERVAL_MS = 1000;
 const BRIDGE_STALE_PONG_MS    = 3000;
@@ -50,6 +56,17 @@ const $qrOverlay   = document.getElementById('qr-overlay');
 const $qrOverlayImg = document.getElementById('qr-overlay-image');
 const $qrOverlayUrl = document.getElementById('qr-overlay-url');
 const $qrOverlayClose = document.getElementById('qr-overlay-close');
+
+// Phase 3 elements (region picker + axona id + lookup harness)
+const $regionPicker   = document.getElementById('region-picker');
+const $regionSelect   = document.getElementById('region-select');
+const $regionSave     = document.getElementById('region-save');
+const $axonaId        = document.getElementById('axona-id');
+const $axonaRegion    = document.getElementById('axona-region');
+const $synaptomeSize  = document.getElementById('synaptome-size');
+const $lookupTarget   = document.getElementById('lookup-target');
+const $lookupGo       = document.getElementById('lookup-go');
+const $lookupResult   = document.getElementById('lookup-result');
 
 // ── Bridge URL resolution ────────────────────────────────────────────
 function getBridgeUrl() {
@@ -661,12 +678,106 @@ $logClear.addEventListener('click', () => { $logList.innerHTML = ''; });
 
 window.addEventListener('beforeunload', () => {
   mesh.dispose();
+  if (axonaNode) try { axonaNode.stop(); } catch {}
   if (bridge.ws && bridge.ws.readyState === WebSocket.OPEN) {
     try { bridge.ws.close(1000, 'page unload'); } catch {}
   }
+});
+
+// ── Axona protocol layer (Phase 3) ──────────────────────────────────
+//
+// On boot: if a persisted identity exists, instantiate AxonaNode
+// immediately.  Otherwise show the region picker and wait for the
+// user to choose; on save, derive an identity and instantiate.
+
+let axonaNode = null;
+
+function populateRegionDropdown() {
+  for (const r of REGIONS) {
+    const opt = document.createElement('option');
+    opt.value = r.id;
+    opt.textContent = r.label;
+    $regionSelect.appendChild(opt);
+  }
+}
+
+function showRegionPicker() {
+  populateRegionDropdown();
+  $regionPicker.hidden = false;
+  $regionSave.addEventListener('click', async () => {
+    const choice = REGIONS.find(r => r.id === $regionSelect.value) ?? REGIONS[0];
+    $regionPicker.hidden = true;
+    await bootAxonaNode({ region: choice });
+  }, { once: true });
+}
+
+function fmtNodeId(id) {
+  if (typeof id !== 'bigint') return '—';
+  return id.toString(16).padStart(16, '0');
+}
+
+async function bootAxonaNode(opts = {}) {
+  const identity = await deriveIdentity(opts);
+  $axonaId.textContent     = fmtNodeId(identity.id);
+  $axonaRegion.textContent = identity.region?.label
+    ?? identity.region?.id
+    ?? identity.region?.source
+    ?? '—';
+
+  axonaNode = new AxonaNode({
+    identity,
+    log: (event, detail) => appendLog(`axona:${event}`, detail),
+  });
+  await axonaNode.start(mesh);
+  appendLog('axona:ready', { nodeId: fmtNodeId(identity.id) });
+  $lookupGo.disabled = false;
+
+  // Refresh synaptome counter on any mesh change (cheap proxy).
+  const updateSynaptomeBadge = () => {
+    if (!axonaNode) return;
+    $synaptomeSize.textContent = String(axonaNode.getSynaptome().length);
+  };
+  mesh.onChange(updateSynaptomeBadge);
+  setInterval(updateSynaptomeBadge, 1000);
+}
+
+// ── Lookup UI ────────────────────────────────────────────────────────
+$lookupGo.addEventListener('click', async () => {
+  if (!axonaNode) return;
+  const raw = $lookupTarget.value.trim().replace(/^0x/i, '');
+  if (!/^[0-9a-fA-F]{1,16}$/.test(raw)) {
+    $lookupResult.textContent = 'target must be 1-16 hex chars';
+    return;
+  }
+  const target = BigInt('0x' + raw);
+  $lookupResult.textContent = `looking up ${target.toString(16)}…`;
+  $lookupGo.disabled = true;
+  try {
+    const result = await axonaNode.lookup(target);
+    $lookupResult.textContent = JSON.stringify({
+      found:  result?.found,
+      hops:   result?.hops,
+      time:   result?.time,
+      path:   (result?.path ?? []).map(id => id.toString(16).padStart(16, '0')),
+    }, null, 2);
+  } catch (err) {
+    $lookupResult.textContent = 'error: ' + err.message;
+  }
+  $lookupGo.disabled = false;
 });
 
 // ── Go ───────────────────────────────────────────────────────────────
 appendLog('boot', `bridge=${bridgeUrl}`);
 render();
 connectBridge();
+
+// Boot the Axona layer: existing identity → use it; else show picker.
+(() => {
+  const existing = getCurrentIdentity();
+  if (existing) {
+    bootAxonaNode().catch(err =>
+      appendLog('axona:boot-failed', { err: err.message }, 'error'));
+  } else {
+    showRegionPicker();
+  }
+})();

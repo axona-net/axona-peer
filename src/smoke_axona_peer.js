@@ -80,10 +80,14 @@ async function main() {
   console.log('AxonaPeer browser-integration smoke');
 
   // ── Build two linked fake-meshes ─────────────────────────────────
-  const A_ID = 0xAAAAn;
+  // v0.6.0 — Axona uses 64-bit BigInt nodeIds; the mesh layer uses
+  // string meshIds (the bridge's connId).  bindPeer registers the
+  // mapping; in production it happens after the hello/hello-ack
+  // handshake completes.
+  const A_ID = 0xAAAAn;  // Axona nodeId  (top bits are S2 prefix)
   const B_ID = 0xBBBBn;
-  const meshA = new FakeMesh(A_ID);
-  const meshB = new FakeMesh(B_ID);
+  const meshA = new FakeMesh('A');  // mesh-layer id
+  const meshB = new FakeMesh('B');
   meshA.linkTo(meshB);
 
   // ── Construct two AxonaPeers ──────────────────────────────────────
@@ -92,6 +96,11 @@ async function main() {
 
   await A.transport.start(A_ID);
   await B.transport.start(B_ID);
+
+  // Bind A_ID ↔ 'B' on A's transport (and vice versa) so A.transport
+  // can route to mesh peer 'B' when AxonaPeer asks to send to B_ID.
+  A.transport.bindPeer(B_ID, 'B');
+  B.transport.bindPeer(A_ID, 'A');
 
   // ── Wire NH-1 transport handlers on each peer ─────────────────────
   //
