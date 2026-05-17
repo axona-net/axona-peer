@@ -26,13 +26,16 @@ import {
   getCurrentIdentity,
   deriveIdentity,
 } from './identity.js';
+// Shared codec: same BigInt + Set conventions as mesh.js and the
+// bridge's server.js — keeps every channel on one wire format.
+import { encode, decode } from './wire.js';
 
 // Peer build number.  Bump the middle digit on every code change so
 // you can confirm a redeployed page actually loaded (esp. on iOS,
 // where the bfcache can serve a stale module set for ages).  The
 // bridge version arrives separately in its `welcome` message; the
 // "version" row in the me panel shows both side by side.
-const PEER_VERSION = '0.8.0';
+const PEER_VERSION = '0.9.0';
 
 const BRIDGE_PING_INTERVAL_MS = 1000;
 const BRIDGE_STALE_PONG_MS    = 3000;
@@ -152,7 +155,7 @@ const mesh = new MeshManager({
       return;
     }
     try {
-      bridge.ws.send(JSON.stringify({
+      bridge.ws.send(encode({
         type: 'signal', to: toPeerId, payload,
       }));
     } catch (err) {
@@ -467,7 +470,7 @@ function onBridgeOpen() {
 
 function onBridgeMessage(ev) {
   let msg;
-  try { msg = JSON.parse(ev.data); }
+  try { msg = decode(ev.data); }
   catch { appendLog('bridge:bad-json', null, 'error'); return; }
 
   switch (msg.type) {
@@ -518,6 +521,19 @@ function onBridgeMessage(ev) {
       break;
     }
 
+    case 'axona':
+      // Axona protocol frame (hello / hello-ack / req / res / ntf).
+      // Hand off to the AxonaNode's BridgeTransport.  Frames can arrive
+      // before bootAxonaNode() completes (the bridge's `hello` lands
+      // right after `welcome`); in that case the node-init path will
+      // pull the buffered frame out of `pendingAxonaFrames` below.
+      if (axonaNode) {
+        axonaNode.handleBridgeAxonaFrame(msg.payload);
+      } else {
+        pendingAxonaFrames.push(msg.payload);
+      }
+      break;
+
     default:
       // Unknown messages from a future bridge revision — just log.
       appendLog('bridge:unknown', msg.type);
@@ -530,6 +546,14 @@ function onBridgeClose(ev) {
   bridge.ws = null;
   bridge.myConnId = null;
   bridge.version  = null;
+  // Tell the AxonaNode the bridge channel is gone so its BridgeTransport
+  // unbinds the bridge peer + rejects any in-flight requests.  When the
+  // WebSocket reconnects, the new welcome → hello flow will re-admit
+  // the bridge as a fresh synapse via `bridge-handshake`.
+  if (axonaNode) {
+    try { axonaNode.handleBridgeClosed(); }
+    catch (err) { appendLog('axona:bridge-close-handler', err.message, 'error'); }
+  }
   // Drop the cached TURN credential.  When we reconnect, the bridge
   // hands us a fresh one in welcome — minted right then with a full
   // 2h TTL.  Holding the old one risks racing the expiry boundary on
@@ -562,7 +586,7 @@ function startBridgePingLoop() {
   bridge.pingTimer = setInterval(() => {
     if (!bridge.ws || bridge.ws.readyState !== WebSocket.OPEN) return;
     try {
-      bridge.ws.send(JSON.stringify({ type: 'ping', t: Date.now() }));
+      bridge.ws.send(encode({ type: 'ping', t: Date.now() }));
       bridge.pings++;
     } catch (err) {
       appendLog('bridge:ping-send-failed', err.message, 'error');
@@ -692,6 +716,34 @@ window.addEventListener('beforeunload', () => {
 
 let axonaNode = null;
 
+// Axona frames that arrive on the bridge WebSocket BEFORE the
+// AxonaNode is instantiated (e.g., the bridge's `hello` lands within
+// milliseconds of welcome, but bootAxonaNode is async because identity
+// derivation needs Web Crypto).  We buffer them here and drain into
+// the node as soon as it's ready, so the bridge-handshake completes on
+// the very first hello rather than waiting for a retry.
+const pendingAxonaFrames = [];
+
+// Bridge adapter shape consumed by AxonaNode → BridgeTransport.
+// Reads `bridge.ws` from the surrounding closure so the same adapter
+// keeps working across reconnects (we never replace the adapter, just
+// the underlying WebSocket).
+const bridgeAdapter = {
+  sendToBridge(msg) {
+    if (!bridge.ws || bridge.ws.readyState !== WebSocket.OPEN) return false;
+    try {
+      bridge.ws.send(encode(msg));
+      return true;
+    } catch (err) {
+      appendLog('axona:bridge-send-failed', err.message, 'error');
+      return false;
+    }
+  },
+  isBridgeOpen() {
+    return !!bridge.ws && bridge.ws.readyState === WebSocket.OPEN;
+  },
+};
+
 function populateRegionDropdown() {
   for (const r of REGIONS) {
     const opt = document.createElement('option');
@@ -728,7 +780,18 @@ async function bootAxonaNode(opts = {}) {
     identity,
     log: (event, detail) => appendLog(`axona:${event}`, detail),
   });
-  await axonaNode.start(mesh);
+  await axonaNode.start(mesh, bridgeAdapter);
+
+  // Drain any axona frames that arrived during the async boot.  The
+  // bridge sends `hello` right after `welcome`; identity derivation
+  // (post.js + Web Crypto) takes ~1 frame, so the hello almost always
+  // lands before this point in single-tab cold-loads.
+  while (pendingAxonaFrames.length) {
+    const payload = pendingAxonaFrames.shift();
+    try { axonaNode.handleBridgeAxonaFrame(payload); }
+    catch (err) { appendLog('axona:drain-failed', err.message, 'error'); }
+  }
+
   appendLog('axona:ready', { nodeId: fmtNodeId(identity.id) });
   $lookupGo.disabled = false;
 

@@ -31,22 +31,9 @@ const RTT_WINDOW       = 10;
 const DC_LABEL         = 'axona';
 const RETRY_AFTER_MS   = 5000;   // single retry after pc-failed (B10)
 
-// ── BigInt-aware JSON ────────────────────────────────────────────────
-// Mirrors the bridge's wire-encoding (axona-bridge/src/server.js).
-// BigInt values are emitted as "<digits>n"; the reviver inverts.
-// Sets are serialised as arrays; Axona protocol code that receives a
-// Set in a wire frame (e.g. ctx.queried) re-wraps as a Set if needed.
-function bigintReplacer(_key, value) {
-  if (typeof value === 'bigint') return value.toString() + 'n';
-  if (value instanceof Set)      return [...value];
-  return value;
-}
-function bigintReviver(_key, value) {
-  if (typeof value === 'string' && /^-?\d+n$/.test(value)) {
-    return BigInt(value.slice(0, -1));
-  }
-  return value;
-}
+// BigInt-aware JSON codec — shared with the bridge WebSocket caller
+// in client.js so every channel uses the same wire format.
+import { bigintReplacer, bigintReviver } from './wire.js';
 
 // ── ICE configuration ───────────────────────────────────────────────
 //
