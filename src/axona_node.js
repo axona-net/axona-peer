@@ -34,8 +34,12 @@ import {
   clz64,
 } from '../vendor/axona-protocol/src/index.js';
 
-import { BrowserEngine }   from './browser_engine.js';
-import { WebRTCTransport } from './transport.js';
+import { BrowserEngine }      from './browser_engine.js';
+import { WebRTCTransport }    from './transport.js';
+import { BridgeTransport,
+         BRIDGE_CONN_ID_EXPORT as BRIDGE_CONN_ID }
+                              from './bridge_transport.js';
+import { CompositeTransport } from './composite_transport.js';
 import { deriveIdentity, getCurrentIdentity } from './identity.js';
 
 // ── ID encoding helpers ──────────────────────────────────────────────
@@ -60,11 +64,15 @@ export class AxonaNode {
     this._mesh = null;
     this._engine = null;
     this._node = null;
-    this._transport = null;
+    this._transport = null;       // CompositeTransport
+    this._meshTransport = null;   // WebRTCTransport sub
+    this._bridgeTransport = null; // BridgeTransport sub (when configured)
     this._peer = null;
     this._meshUnsubs = [];
     this._helloByMeshId = new Map();  // meshId → 'pending'|'complete'
-    this._meshOpenedAt = new Map();   // meshId → timestamp (for hello-trigger debounce)
+    this._meshOpenedAt = new Map();
+    this._bridgeHelloState = 'idle'; // 'idle'|'pending'|'complete'
+    this._bridgeAdapter = null;       // {sendToBridge, isBridgeOpen}
   }
 
   get peer()      { return this._peer; }
@@ -75,16 +83,26 @@ export class AxonaNode {
 
   /**
    * Bring the Axona protocol layer up.  Requires a MeshManager from
-   * mesh.js (the same one that drives the UI's WebRTC table).
+   * mesh.js.  Optionally accepts a `bridgeAdapter` for talking to
+   * the embedded peer in axona-bridge over the existing WebSocket:
+   *
+   *     { sendToBridge: (msg) => void,   // serialize + send
+   *       isBridgeOpen: () => boolean }
+   *
+   * If supplied, BridgeTransport is added alongside WebRTCTransport
+   * in a CompositeTransport, and the bridge is admitted to the
+   * synaptome via hello-ack just like any other peer.
    *
    * @param {import('./mesh.js').MeshManager} mesh
+   * @param {Object} [bridgeAdapter]
    */
-  async start(mesh) {
+  async start(mesh, bridgeAdapter) {
     if (!mesh) throw new Error('AxonaNode.start: mesh is required');
     if (!this._identity) {
       this._identity = await deriveIdentity({});
     }
     this._mesh = mesh;
+    this._bridgeAdapter = bridgeAdapter ?? null;
 
     this._engine = new BrowserEngine({ k: 20 });
 
@@ -98,11 +116,29 @@ export class AxonaNode {
     this._node.temperature = this._engine.T_INIT;
     this._engine.setTheNode(this._node);
 
-    this._transport = new WebRTCTransport({
+    // ── Compose mesh + bridge transports under a single Transport ───
+    this._transport = new CompositeTransport({
+      localNodeId: this._identity.id,
+      log: this._log,
+    });
+
+    this._meshTransport = new WebRTCTransport({
       mesh,
       localNodeId: this._identity.id,
       log: this._log,
     });
+    this._transport.addSubtransport(this._meshTransport);
+
+    if (this._bridgeAdapter) {
+      this._bridgeTransport = new BridgeTransport({
+        localNodeId:  this._identity.id,
+        sendToBridge: this._bridgeAdapter.sendToBridge,
+        isBridgeOpen: this._bridgeAdapter.isBridgeOpen,
+        log: this._log,
+      });
+      this._transport.addSubtransport(this._bridgeTransport);
+    }
+
     this._node.transport = this._transport;
     await this._transport.start(this._identity.id);
 
@@ -119,8 +155,28 @@ export class AxonaNode {
     this._log('axona-node-started', {
       nodeId: idToHex(this._identity.id),
       region: this._identity.region?.label ?? this._identity.region?.id,
+      hasBridgeTransport: !!this._bridgeTransport,
     });
     return this;
+  }
+
+  // ── Public hooks for client.js bridge wiring ───────────────────────
+
+  /**
+   * Route an `{type:'axona', payload:...}` message from the bridge
+   * WebSocket into the BridgeTransport.  Caller passes the inner
+   * payload object.  No-op if BridgeTransport isn't configured.
+   */
+  handleBridgeAxonaFrame(payload) {
+    if (!this._bridgeTransport) return;
+    this._bridgeTransport.handleIncoming(payload);
+  }
+
+  /** Caller signals the bridge WebSocket has closed. */
+  handleBridgeClosed() {
+    if (!this._bridgeTransport) return;
+    this._bridgeTransport.handleConnClosed();
+    this._bridgeHelloState = 'idle';
   }
 
   async stop() {
@@ -161,15 +217,24 @@ export class AxonaNode {
       if (typeof fromMeshIdOrNodeId !== 'string') return;   // already bound
       const peerNodeId = hexToId(body.nodeId);
       this._completeHandshake(fromMeshIdOrNodeId, peerNodeId);
-      // Reply with our hello-ack.
-      try {
-        this._mesh.send(fromMeshIdOrNodeId, {
+      // Reply with our hello-ack.  The reply path differs by
+      // sub-transport kind: a mesh peer is reached via mesh.send,
+      // the bridge via the bridge adapter's sendToBridge.
+      const helloAck = {
+        type: 'axona',  // bridge: wrapped envelope
+        payload: {
           k: 'ntf', type: 'hello-ack',
-          body: {
-            proto: 'axona/3',
-            nodeId: idToHex(this._identity.id),
-          },
-        });
+          body: { proto: 'axona/3', nodeId: idToHex(this._identity.id) },
+        },
+      };
+      try {
+        if (fromMeshIdOrNodeId === BRIDGE_CONN_ID) {
+          this._bridgeAdapter.sendToBridge(helloAck);
+        } else {
+          // Mesh: the data-channel carries the inner frame
+          // directly (MeshManager.send wraps in JSON).
+          this._mesh.send(fromMeshIdOrNodeId, helloAck.payload);
+        }
       } catch (err) {
         this._log('hello-ack-send-failed', { err: err.message });
       }
@@ -237,7 +302,11 @@ export class AxonaNode {
         hops:        payload.hops,
         path:        payload.path,
         trace:       payload.trace,
-        queried:     payload.queried,
+        queried:     payload.queried instanceof Set
+                       ? payload.queried
+                       : Array.isArray(payload.queried)
+                           ? new Set(payload.queried)
+                           : new Set(),
         totalTimeMs: payload.totalTimeMs,
       });
     });
@@ -312,17 +381,30 @@ export class AxonaNode {
     this._meshOpenedAt.delete(meshId);
   }
 
-  async _completeHandshake(meshId, peerNodeId) {
-    if (this._helloByMeshId.get(meshId) === 'complete') return;
-    this._helloByMeshId.set(meshId, 'complete');
-    this._transport.bindPeer(peerNodeId, meshId);
+  async _completeHandshake(channelId, peerNodeId) {
+    // channelId is the BridgeTransport sentinel 'bridge' for the
+    // bridge peer, or a string meshId from MeshManager for a mesh
+    // peer.  Route bindPeer + dedup keys accordingly.
+    const isBridge = (channelId === BRIDGE_CONN_ID);
 
-    // Admit this peer to our synaptome as a Synapse.  In production,
-    // bootstrap is a stratified-fill from the bridge; for the MVP
-    // we treat every successfully-handshook peer as a candidate.
+    if (isBridge) {
+      if (this._bridgeHelloState === 'complete') return;
+      this._bridgeHelloState = 'complete';
+      this._bridgeTransport.bindPeer(peerNodeId, BRIDGE_CONN_ID);
+    } else {
+      if (this._helloByMeshId.get(channelId) === 'complete') return;
+      this._helloByMeshId.set(channelId, 'complete');
+      this._meshTransport.bindPeer(peerNodeId, channelId);
+    }
+
+    // Admit this peer to our synaptome as a Synapse.  Production
+    // bootstrap will replace this with a stratified-fill from the
+    // bridge; for now, every successfully-handshook peer is admitted.
     if (!this._node.synaptome.has(peerNodeId)) {
       const stratum = clz64(this._node.id ^ peerNodeId);
-      const latency = this._mesh.getLatency(meshId);
+      const latency = isBridge
+        ? this._bridgeTransport.getLatency(peerNodeId)
+        : this._mesh.getLatency(channelId);
       const syn = new Synapse({
         peerId: peerNodeId,
         latencyMs: latency > 0 ? latency : 200,
@@ -330,15 +412,16 @@ export class AxonaNode {
       });
       syn.weight   = 0.5;
       syn.inertia  = 0;
-      syn._addedBy = 'handshake';
+      syn._addedBy = isBridge ? 'bridge-handshake' : 'handshake';
       try { await this._peer._addByVitality(syn); } catch (err) {
         this._log('admit-failed', { peerNodeId: idToHex(peerNodeId), err: err.message });
       }
     }
 
     this._log('handshake-complete', {
-      meshId,
-      peerNodeId: idToHex(peerNodeId),
+      via:           isBridge ? 'bridge' : 'mesh',
+      channelId,
+      peerNodeId:    idToHex(peerNodeId),
       synaptomeSize: this._node.synaptome.size,
     });
   }

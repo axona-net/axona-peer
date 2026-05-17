@@ -31,6 +31,23 @@ const RTT_WINDOW       = 10;
 const DC_LABEL         = 'axona';
 const RETRY_AFTER_MS   = 5000;   // single retry after pc-failed (B10)
 
+// ── BigInt-aware JSON ────────────────────────────────────────────────
+// Mirrors the bridge's wire-encoding (axona-bridge/src/server.js).
+// BigInt values are emitted as "<digits>n"; the reviver inverts.
+// Sets are serialised as arrays; Axona protocol code that receives a
+// Set in a wire frame (e.g. ctx.queried) re-wraps as a Set if needed.
+function bigintReplacer(_key, value) {
+  if (typeof value === 'bigint') return value.toString() + 'n';
+  if (value instanceof Set)      return [...value];
+  return value;
+}
+function bigintReviver(_key, value) {
+  if (typeof value === 'string' && /^-?\d+n$/.test(value)) {
+    return BigInt(value.slice(0, -1));
+  }
+  return value;
+}
+
 // ── ICE configuration ───────────────────────────────────────────────
 //
 // STUN servers let each peer discover its public-facing (post-NAT)
@@ -183,7 +200,11 @@ export class MeshManager {
     if (!state || state.dc?.readyState !== 'open') {
       throw new Error(`mesh.send: peer ${peerId} not open`);
     }
-    state.dc.send(JSON.stringify(payload));
+    // BigInt-aware replacer: the Axona wire protocol carries BigInt
+    // node IDs through req/res/ntf bodies; native JSON.stringify
+    // throws on BigInts.  Serialise as "<digits>n" suffixed strings;
+    // the receiver's dc.onmessage parses with the inverse reviver.
+    state.dc.send(JSON.stringify(payload, bigintReplacer));
   }
 
   /**
@@ -587,7 +608,7 @@ export class MeshManager {
 
     dc.onmessage = (ev) => {
       let msg;
-      try { msg = JSON.parse(ev.data); }
+      try { msg = JSON.parse(ev.data, bigintReviver); }
       catch { this._log('dc-bad-json', { peerId: state.peerId }); return; }
 
       if (msg.type === 'ping') {

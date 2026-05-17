@@ -155,6 +155,7 @@ export class NeuronNode extends DHTNode {
         stratum:  s.stratum,
         inertia:  s.inertia ?? 0,
         useCount: s.useCount ?? 0,
+        addedBy:  s._addedBy ?? null,
       });
     }
     return snapshot;
