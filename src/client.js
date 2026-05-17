@@ -36,7 +36,7 @@ import { deriveTopicKey, topicKeyToHex } from './pubsub_topic.js';
 // where the bfcache can serve a stale module set for ages).  The
 // bridge version arrives separately in its `welcome` message; the
 // "version" row in the me panel shows both side by side.
-const PEER_VERSION = '0.13.1';
+const PEER_VERSION = '0.13.2';
 
 const BRIDGE_PING_INTERVAL_MS = 1000;
 const BRIDGE_STALE_PONG_MS    = 3000;
@@ -950,6 +950,25 @@ async function bootAxonaNode(opts = {}) {
 const SUBSCRIPTIONS_LS_KEY = 'axona-peer:subscriptions:v1';
 const MAX_MESSAGES_PER_SUB = 50;
 
+// Pub/Sub state persistence is intentionally OFF for now.  localStorage
+// is shared across all tabs on the same origin, so a tab restoring
+// subs / publish-forms from a sibling tab's state was creating
+// "dead" UI cards (visible but never actually registered on this
+// tab's AxonaNode).  Until we have proper per-tab persistence
+// (sessionStorage, or per-tab namespaced keys), every fresh load
+// starts with one empty publish card and no subscriptions.
+const PERSIST_PUBSUB_STATE = false;
+
+// One-shot cleanup: when persistence is OFF, wipe any keys left over
+// from earlier 0.11.0–0.13.1 builds so they don't sit around stale
+// in localStorage.  Cheap; happens once per page load.
+if (!PERSIST_PUBSUB_STATE) {
+  try {
+    localStorage.removeItem(SUBSCRIPTIONS_LS_KEY);
+    localStorage.removeItem('axona-peer:publishForms:v1');
+  } catch {}
+}
+
 /** @type {Array<{regionId:string, eventName:string, key:bigint, messages:Array}>} */
 let subscriptions = [];
 
@@ -969,6 +988,7 @@ function populateSubRegionDropdown(homeRegionId) {
 }
 
 function loadPersistedSubscriptions() {
+  if (!PERSIST_PUBSUB_STATE) return [];
   try {
     const raw = localStorage.getItem(SUBSCRIPTIONS_LS_KEY);
     if (!raw) return [];
@@ -980,6 +1000,7 @@ function loadPersistedSubscriptions() {
 }
 
 function persistSubscriptions() {
+  if (!PERSIST_PUBSUB_STATE) return;
   // Store only the durable bits (regionId + eventName).  Keys are
   // derived; inboxes are session-scoped.
   const serial = subscriptions.map(s => ({
@@ -1106,6 +1127,7 @@ const PUBLISH_FORMS_LS_KEY = 'axona-peer:publishForms:v1';
 let publishForms = [];
 
 function loadPersistedPublishForms() {
+  if (!PERSIST_PUBSUB_STATE) return [];
   try {
     const raw = localStorage.getItem(PUBLISH_FORMS_LS_KEY);
     if (!raw) return [];
@@ -1121,6 +1143,7 @@ function loadPersistedPublishForms() {
 }
 
 function persistPublishForms() {
+  if (!PERSIST_PUBSUB_STATE) return;
   try {
     localStorage.setItem(PUBLISH_FORMS_LS_KEY,
       JSON.stringify(publishForms));

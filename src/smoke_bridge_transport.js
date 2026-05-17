@@ -57,6 +57,9 @@ function startBridge() {
       BRIDGE_LAT: '51.5',  BRIDGE_LNG: '-0.1',
       BRIDGE_REGION_LABEL: 'London',
       LOG_LEVEL: 'info',
+      // Pin the gate to the version the smoke client sends; keeps
+      // smokes independent of whatever the production default is.
+      MIN_PEER_VERSION: '0.12.0',
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });

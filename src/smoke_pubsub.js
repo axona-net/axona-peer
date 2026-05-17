@@ -60,6 +60,7 @@ function startBridge() {
       BRIDGE_LAT: '51.5', BRIDGE_LNG: '-0.1',
       BRIDGE_REGION_LABEL: 'London',
       LOG_LEVEL: 'info',
+      MIN_PEER_VERSION: '0.12.0',
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
