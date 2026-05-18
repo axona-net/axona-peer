@@ -83,32 +83,46 @@ export function mountAxonalPubsub({ axon, peer, log }) {
     }
   });
 
+  // Accept either a bigint or a 16-char hex string for topic keys.
+  // The debug surface (window.axona.topicKey) returns hex for readable
+  // cross-tab comparison; user code calling pubsubPublish directly
+  // with that hex shouldn't fail with a cryptic TypeError.
+  function asBigInt(k, label) {
+    if (typeof k === 'bigint') return k;
+    if (typeof k === 'string') {
+      const stripped = k.startsWith('0x') ? k.slice(2) : k;
+      if (/^[0-9a-fA-F]{1,16}$/.test(stripped)) return BigInt('0x' + stripped);
+    }
+    throw new TypeError(`${label} must be bigint or 16-char hex string`);
+  }
+
   return {
     subscribe(topicKey, handler) {
-      if (typeof topicKey !== 'bigint') throw new TypeError('topicKey must be bigint');
+      const key = asBigInt(topicKey, 'topicKey');
       if (typeof handler !== 'function') throw new TypeError('handler must be a function');
-      handlers.set(topicKey, handler);
-      trace('pubsub:axonal-sub', { topic: idToHex(topicKey) });
-      axon.pubsubSubscribe(topicKey);
+      handlers.set(key, handler);
+      trace('pubsub:axonal-sub', { topic: idToHex(key) });
+      axon.pubsubSubscribe(key);
     },
 
     unsubscribe(topicKey) {
-      if (typeof topicKey !== 'bigint') return;
-      handlers.delete(topicKey);
-      trace('pubsub:axonal-unsub', { topic: idToHex(topicKey) });
-      axon.pubsubUnsubscribe(topicKey);
+      let key;
+      try { key = asBigInt(topicKey, 'topicKey'); } catch { return; }
+      handlers.delete(key);
+      trace('pubsub:axonal-unsub', { topic: idToHex(key) });
+      axon.pubsubUnsubscribe(key);
     },
 
     publish(topicKey, msg) {
-      if (typeof topicKey !== 'bigint') throw new TypeError('topicKey must be bigint');
+      const key = asBigInt(topicKey, 'topicKey');
       if (typeof msg !== 'string')      throw new TypeError('msg must be a string');
       // Embed our own nodeId as the publisher so receivers can show
       // who sent the message even though AxonManager's wire payload
       // is opaque from its POV.
       const json = JSON.stringify({ msg, publisher: idToHex(peer.getNodeId()) });
-      const publishId = axon.pubsubPublish(topicKey, json);
+      const publishId = axon.pubsubPublish(key, json);
       trace('pubsub:axonal-tx', {
-        topic: idToHex(topicKey),
+        topic: idToHex(key),
         publishId,
         msgLen: msg.length,
       });
