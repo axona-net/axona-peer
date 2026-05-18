@@ -36,7 +36,7 @@ import { deriveTopicKey, topicKeyToHex } from './pubsub_topic.js';
 // where the bfcache can serve a stale module set for ages).  The
 // bridge version arrives separately in its `welcome` message; the
 // "version" row in the me panel shows both side by side.
-const PEER_VERSION = '0.14.0';
+const PEER_VERSION = '0.14.1';
 
 const BRIDGE_PING_INTERVAL_MS = 1000;
 const BRIDGE_STALE_PONG_MS    = 3000;
@@ -863,18 +863,25 @@ async function bootAxonaNode(opts = {}) {
   // introspect live state without rebuilding — `window.axona.synaptome()`,
   // `window.axona.subs()`, etc.  All read-only — no setters that could
   // accidentally tamper with running state.
+  const hex = (id) => typeof id === 'bigint'
+    ? id.toString(16).padStart(16, '0')
+    : String(id);
+
   window.axona = {
     /** Raw node reference — for poking around when needed. */
     node:        axonaNode,
     /** Identity object (nodeId + region + geoBits). */
     identity,
     /** Snapshot of every Synapse currently in our routing table. */
-    synaptome:   () => axonaNode.getSynaptome(),
+    synaptome:   () => axonaNode.getSynaptome().map(s => ({
+                   ...s,
+                   peerId: hex(s.peerId),
+                 })),
     /** Active subscriptions (UI-side state) with their topic keys + msg counts. */
     subs:        () => subscriptions.map(s => ({
                    regionId: s.regionId,
                    eventName: s.eventName,
-                   key: s.key.toString(16).padStart(16, '0'),
+                   key: hex(s.key),
                    messageCount: s.messages.length,
                  })),
     /** Configured publish cards. */
@@ -887,10 +894,61 @@ async function bootAxonaNode(opts = {}) {
                    url:      bridge.url,
                    wsReady:  bridge.ws?.readyState,
                  }),
-    /** Mesh peers with their connection states. */
+    /** Mesh peers with their connection states (the ones reachable via WebRTC). */
     mesh:        () => mesh.getPeers(),
-    /** Pubsub LRU snapshot (which publishIds we've already seen). */
-    pubsubDebug: () => axonaNode._pubsub?._debug?.() ?? null,
+    /** Which peer nodeIds is the underlying transport bound to right now?
+     *  This is the set of peers we can reach via sendDirect.  Useful when
+     *  an axon supposedly has a subscriber in role.children but
+     *  transport.notify silently drops because the binding doesn't exist. */
+    boundPeers:  () => {
+      const t = axonaNode._transport;
+      const out = [];
+      // CompositeTransport: walk each sub-transport's connId↔nodeId maps.
+      for (const sub of (t?._subs ?? [])) {
+        if (sub._meshIdByNodeId) {
+          for (const [nodeId] of sub._meshIdByNodeId) out.push({ via: 'mesh', nodeId: hex(nodeId) });
+        }
+        if (sub._bridgeNodeId) out.push({ via: 'bridge', nodeId: hex(sub._bridgeNodeId) });
+      }
+      return out;
+    },
+    /** Resolve a (regionId, eventName) to a topic key for diagnostics. */
+    topicKey: async (regionId, eventName) => {
+      const { deriveTopicKey } = await import('./pubsub_topic.js');
+      const { REGIONS } = await import('./identity.js');
+      const region = REGIONS.find(r => r.id === regionId);
+      if (!region) throw new Error('unknown region: ' + regionId);
+      return hex(await deriveTopicKey(region, eventName));
+    },
+    /** Run findKClosest for a topic.  Reveals WHICH K peers this node
+     *  thinks are the topic's axon set — the most important diagnostic
+     *  when subscribes and publishes seem to land on different roots. */
+    findKClosest: async (topicHex, K = 5) => {
+      const t = typeof topicHex === 'string' ? BigInt('0x' + topicHex.replace(/^0x/, '')) : topicHex;
+      const ids = await axonaNode._peer.findKClosest(t, K);
+      return ids.map(hex);
+    },
+    /** Topics we're an axon role-holder for, with our children (subscribers).
+     *  If we expected to be an axon and this is empty, our subscribe didn't
+     *  propagate.  If a subscriber we expected to deliver to ISN'T listed
+     *  here, they never subscribed at us. */
+    axonRoles:   () => {
+      const axon = axonaNode._axon;
+      if (!axon?.axonRoles) return [];
+      return [...axon.axonRoles.entries()].map(([topicId, role]) => ({
+        topic:    hex(topicId),
+        isRoot:   role.isRoot,
+        children: [...role.children.keys()].map(hex),
+        peerRoots: role.peerRoots ? [...role.peerRoots].map(hex) : [],
+      }));
+    },
+    /** Topics we're subscribed to (from AxonManager's POV, not just the
+     *  UI's `subs()`).  Should match — if it doesn't, we have a sync bug. */
+    mySubscriptions: () => {
+      const axon = axonaNode._axon;
+      if (!axon?.mySubscriptions) return [];
+      return [...axon.mySubscriptions.keys()].map(hex);
+    },
   };
 
   // Drain any axona frames that arrived during the async boot.  The
