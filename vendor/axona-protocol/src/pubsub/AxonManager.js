@@ -1133,9 +1133,46 @@ export class AxonManager {
    * between 1 and 100 sendDirect calls per re-subscribe.
    */
   async _maybeSendReplay(topicId, role, subscriberId, lastSeenTs) {
-    if (!subscriberId || subscriberId === this.nodeId) return;
+    if (!subscriberId) return;
     const cache = role.replayCache;
     if (!cache || cache.length === 0) return;
+
+    // axona-net patch (peer 0.17.0):
+    // Self-replay.  Two compounding issues had to be fixed for a node
+    // that publishes (or receives publish-k) and ONLY THEN subscribes
+    // to its own topic:
+    //
+    //   1. Upstream returned early on subscriberId === this.nodeId,
+    //      assuming "you already have the messages."  But with lazy-
+    //      axon promotion, a node may hold a role + cache without
+    //      ever having delivered those messages to a local handler —
+    //      they arrived as publish-k frames when no subscription was
+    //      registered.
+    //   2. _onPublishDirect calls _recordReceived(topicId, publishId,
+    //      publishTs) which advances _lastSeenTsByTopic to the latest
+    //      cached message.  When the node later self-subscribes,
+    //      pubsubSubscribe reads that lastSeenTs and passes it in,
+    //      and the `cache.filter(m => m.publishTs > lastSeenTs)`
+    //      below excludes every cached message (they're not newer
+    //      than what "I already saw" on the network).
+    //
+    // For self-target, ignore lastSeenTs and replay the full cache
+    // straight into the delivery callback.  This makes the
+    // application's view ("messages delivered to my handler") match
+    // its semantic ("messages received since I started caring about
+    // this topic").
+    if (subscriberId === this.nodeId) {
+      if (!this._deliveryCallback) return;
+      for (const m of cache) {
+        try {
+          this._deliveryCallback(topicId, m.json, m.publishId, m.publishTs);
+        } catch (err) {
+          console.error('AxonManager self-replay deliveryCallback threw:', err);
+        }
+      }
+      return;
+    }
+
     const missed = (lastSeenTs != null && lastSeenTs > 0)
       ? cache.filter(m => m.publishTs > lastSeenTs)
       : cache.slice();
