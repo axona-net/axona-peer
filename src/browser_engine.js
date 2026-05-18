@@ -183,22 +183,27 @@ export class BrowserEngine {
     }
 
     // The dht adapter the AxonManager talks to.  AxonaPeer exposes
-    // every primitive; we add the one missing alias (getSelfId vs
-    // getNodeId) and forward everything else.
+    // every primitive; we add the missing alias (getSelfId vs
+    // getNodeId), intercept self-targets, and add a routed fallback
+    // to sendDirect.
     //
-    // sendDirect: AxonManager's K-closest mode sends 'pubsub:publish-k'
-    // to ALL K roots, including self when self is among them — but
-    // AxonaPeer.sendDirect does `transport.notify(self, ...)` which
-    // CompositeTransport silently drops (self isn't in any sub-
-    // transport's binding map).  Result: a publisher that's also an
-    // axon for its own topic never delivers to that axon-role's
-    // children locally.  Intercept self-targeted sendDirect and
-    // dispatch synchronously into the locally-registered direct
-    // handler instead.  This matches the simulator's
-    // SimulatedNetwork.sendDirect, which has a global view and
-    // delivers self-targets in-process.
+    // sendDirect cases:
+    //   self        → local dispatch (skip the wire entirely; matches
+    //                 SimulatedNetwork's in-process semantics)
+    //   directly    → peer.sendDirect (1-hop transport.notify)
+    //     bound
+    //   else        → peer.routeMessage with a '__tunneled_direct__'
+    //                 envelope.  The receiver's routed handler (below)
+    //                 unwraps and dispatches into its direct-handler
+    //                 table.  This lets pubsub reach K-closest axons
+    //                 the local transport can't directly notify (the
+    //                 common case in our sparse-mesh deployment, where
+    //                 only the bridge is a universal neighbour).  The
+    //                 bridge ends up being a routing hop, not a
+    //                 protocol-privileged relay.
     const self = peer.getNodeId();
     const engine = this;
+
     const dht = {
       getSelfId:       () => peer.getNodeId(),
       findKClosest:    (...args) => peer.findKClosest(...args),
@@ -216,11 +221,51 @@ export class BrowserEngine {
             return false;
           }
         }
-        return peer.sendDirect(peerId, type, payload);
+        // Probe: is the target directly reachable on any sub-transport?
+        // CompositeTransport.isConnected returns true iff some sub-
+        // transport currently owns + has an open channel to peerId.
+        if (node.transport?.isConnected?.(peerId)) {
+          return peer.sendDirect(peerId, type, payload);
+        }
+        // Not bound — fall back to routed delivery via the DHT.
+        // Fire-and-forget; the routed walk will time out on its own if
+        // it can't reach the target.  Return true optimistically so
+        // AxonManager's child-dead-detection doesn't false-positive.
+        peer.routeMessage(peerId, '__tunneled_direct__', {
+          targetId:  peerId.toString(16).padStart(16, '0'),
+          innerType: type,
+          innerPayload: payload,
+        }).catch(err => console.error('BrowserEngine routed sendDirect failed:', err));
+        return true;
       },
       onRoutedMessage: (type, h) => peer.onRoutedMessage(type, h),
       onDirectMessage: (type, h) => peer.onDirectMessage(type, h),
     };
+
+    // Register the tunneled-direct routed handler ONCE per node.  This
+    // is what receives at the target end of the routed-fallback path
+    // above: it checks meta.targetId, unwraps the envelope, and
+    // dispatches into the local direct handler table.
+    peer.onRoutedMessage('__tunneled_direct__', async (payload, meta) => {
+      const targetBig = typeof meta.targetId === 'bigint'
+        ? meta.targetId
+        : (typeof meta.targetId === 'string'
+            ? BigInt('0x' + meta.targetId.replace(/^0x/, ''))
+            : null);
+      if (targetBig == null) return 'forward';
+      if (targetBig !== self) return 'forward';  // not for us — keep routing
+      const handler = engine._directHandlers.get(node)?.get(payload.innerType);
+      if (!handler) return 'consumed';  // unknown type; drop here, don't forward
+      try {
+        await handler(payload.innerPayload, {
+          fromId: meta.fromId,
+          type:   payload.innerType,
+        });
+      } catch (err) {
+        console.error('BrowserEngine tunneled-direct dispatch threw:', err);
+      }
+      return 'consumed';
+    });
 
     const axon = new AxonManager({ dht });
     this._axonByNode.set(node, axon);
