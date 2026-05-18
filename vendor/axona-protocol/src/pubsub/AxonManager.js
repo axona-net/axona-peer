@@ -1181,23 +1181,32 @@ export class AxonManager {
   async _onPublishDirect(payload, meta) {
     const { topicId, json, publishId, publishTs, postHash, publisher } = payload;
     if (this._alreadySeenPublish(publishId)) return;
-    const role = this.axonRoles.get(topicId);
+    let role = this.axonRoles.get(topicId);
     if (!role) {
-      // The publisher's findKClosest picked us but we don't hold this
-      // topic. Fall back to a routed publish so the greedy walk toward
-      // hash(topic) reaches a node that does. Dedup prevents loops.
-      //
-      // Known limitation: under heavy churn (25%+ in this sim's
-      // sparsely-connected 50-edge routing), the publisher's and
-      // subscribers' K-closest sets can diverge so much that even a
-      // routed walk lands on role-holders that cover only a fraction
-      // of the subscriber set. Full Kademlia-style iterative lookup
-      // would converge more reliably; we have the primitives for that
-      // in NX-6 but haven't wired them in as the K-closest fallback
-      // path. Flagged as follow-up work in Phase 3 notes.
-      await this.dht.routeMessage(topicId, 'pubsub:publish',
-        { topicId, json, publishId, publishTs, postHash, publisher });
-      return;
+      // axona-net patch (peer 0.15.0):
+      // Lazy-axon promotion.  We're one of the K-closest to this topic
+      // (the publisher's findKClosest landed here) but no subscriber
+      // has registered with us yet — under the upstream protocol we'd
+      // drop the message via a routed-walk that would land on another
+      // empty-role node and give up.  Instead, promote ourselves to a
+      // (childless) root role and add the message to the replay cache.
+      // When a subscriber arrives later, _maybeSendReplay serves the
+      // cache.  Empty-role rootGraceMs sweep GCs us if no children
+      // ever arrive (60s default) so this stays bounded.
+      const now = this._now();
+      role = {
+        parentId:       null,
+        isRoot:         true,
+        isInRootSet:    true,
+        peerRoots:      new Set(),
+        children:       new Map(),
+        parentLastSent: 0,
+        roleCreatedAt:  now,
+        emptiedAt:      now,    // immediately "empty" — rootGraceMs sweep applies
+        lowWaterSince:  0,
+        replayCache:    [],
+      };
+      this.axonRoles.set(topicId, role);
     }
 
     this._addToReplayCache(role, { json, publishId, publishTs, postHash, publisher });
