@@ -24,6 +24,7 @@ import { dirname, resolve } from 'node:path';
 import { WebSocket } from 'ws';
 
 const store = new Map();
+globalThis.sessionStorage = (() => { const m = new Map(); return { getItem(k){return m.has(k)?m.get(k):null;}, setItem(k,v){m.set(k,String(v));}, removeItem(k){m.delete(k);} }; })();
 globalThis.localStorage = {
   getItem(k)    { return store.has(k) ? store.get(k) : null; },
   setItem(k, v) { store.set(k, String(v)); },

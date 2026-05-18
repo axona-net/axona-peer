@@ -25,6 +25,7 @@ import { WebSocket } from 'ws';
 
 // localStorage stub (identity.js reads it sync).
 const store = new Map();
+globalThis.sessionStorage = (() => { const m = new Map(); return { getItem(k){return m.has(k)?m.get(k):null;}, setItem(k,v){m.set(k,String(v));}, removeItem(k){m.delete(k);} }; })();
 globalThis.localStorage = {
   getItem(k)    { return store.has(k) ? store.get(k) : null; },
   setItem(k, v) { store.set(k, String(v)); },

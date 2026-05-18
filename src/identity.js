@@ -40,6 +40,37 @@ import { randomU64 } from '../vendor/axona-protocol/src/utils/geo.js';
 const STORAGE_KEY = 'axona.identity.v1';
 const GEO_BITS    = 8;
 
+// Identity store.  We use sessionStorage (per-tab) by default instead
+// of localStorage (per-origin) so multiple tabs of the same browser
+// can be distinct Axona nodes — critical for pubsub testing, where
+// shared identity collapses N tabs into 1 logical node and the bridge's
+// WSTransport binds only the most-recently-handshook tab.
+//
+// Tradeoff: a returning visitor who closes & reopens the tab gets a
+// fresh identity.  That's the right call during the "testing era"; we
+// can move back to localStorage (or offer the user a checkbox) when we
+// have a proper returning-user UX story.
+//
+// `IDENTITY_STORE_KIND === 'local'` (override via the URL query string
+// `?identityStore=local`) reverts to the old behaviour for users who
+// want returning-visitor persistence.
+function identityStore() {
+  if (typeof sessionStorage === 'undefined') return null;
+  if (typeof location === 'undefined')       return sessionStorage;
+  const qs = new URLSearchParams(location.search);
+  return qs.get('identityStore') === 'local' && typeof localStorage !== 'undefined'
+    ? localStorage
+    : sessionStorage;
+}
+
+// One-shot cleanup: tabs upgrading from 0.14.0 → 0.14.2 have a stale
+// localStorage identity that the old code was reading.  Wipe it so the
+// new per-tab sessionStorage path actually creates a fresh identity
+// instead of falling back to the shared-across-tabs localStorage one.
+if (typeof localStorage !== 'undefined') {
+  try { localStorage.removeItem(STORAGE_KEY); } catch {}
+}
+
 /**
  * Hand-curated region list for the geolocation fallback.  Fifteen
  * canonical lat/lng points spread across populated continents.  The
@@ -83,9 +114,10 @@ export const REGIONS = Object.freeze([
  * "do we need to prompt the user?" check at startup.
  */
 export function getCurrentIdentity() {
-  if (typeof localStorage === 'undefined') return null;
+  const store = identityStore();
+  if (!store) return null;
   let raw;
-  try { raw = localStorage.getItem(STORAGE_KEY); }
+  try { raw = store.getItem(STORAGE_KEY); }
   catch { return null; }
   if (!raw) return null;
   try {
@@ -156,10 +188,17 @@ export async function rotateIdentity(opts = {}) {
   return deriveIdentity({ ...opts, rotate: true });
 }
 
-/** Clear stored identity.  Subsequent `deriveIdentity()` starts fresh. */
+/** Clear stored identity.  Subsequent `deriveIdentity()` starts fresh.
+ *  Wipes both stores so the cleanup is unambiguous (e.g. callers
+ *  toggling between session + local). */
 export function forgetIdentity() {
-  if (typeof localStorage === 'undefined') return;
-  try { localStorage.removeItem(STORAGE_KEY); } catch { /* quota or disabled */ }
+  for (const store of [
+    typeof sessionStorage !== 'undefined' ? sessionStorage : null,
+    typeof localStorage   !== 'undefined' ? localStorage   : null,
+  ]) {
+    if (!store) continue;
+    try { store.removeItem(STORAGE_KEY); } catch { /* quota or disabled */ }
+  }
 }
 
 // ── Internal ────────────────────────────────────────────────────────
@@ -203,6 +242,8 @@ function persist(identity) {
     region:    identity.region,
     createdAt: identity.createdAt,
   });
-  try { localStorage.setItem(STORAGE_KEY, serialized); }
+  const store = identityStore();
+  if (!store) return;
+  try { store.setItem(STORAGE_KEY, serialized); }
   catch { /* quota exceeded or storage disabled — silent fail */ }
 }
