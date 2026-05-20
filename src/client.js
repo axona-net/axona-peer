@@ -46,7 +46,7 @@ import { encode, decode } from './wire.js';
 // where the bfcache can serve a stale module set for ages).  The
 // bridge version arrives separately in its `welcome` message; the
 // "version" row in the me panel shows both side by side.
-const PEER_VERSION = '1.1.0';
+const PEER_VERSION = '1.1.1';
 
 const BRIDGE_PING_INTERVAL_MS = 1000;
 const BRIDGE_STALE_PONG_MS    = 3000;
@@ -1482,8 +1482,11 @@ $subEvent.addEventListener('keydown', (ev) => {
 $lookupGo.addEventListener('click', async () => {
   if (!axonaNode) return;
   const raw = $lookupTarget.value.trim().replace(/^0x/i, '');
-  if (!/^[0-9a-fA-F]{1,16}$/.test(raw)) {
-    $lookupResult.textContent = 'target must be 1-16 hex chars';
+  // v1.1: 264-bit node IDs are 66 hex chars; allow any prefix from
+  // 1 char (handy for "find anything close to this S2 cell") up to
+  // a full 66-char ID.
+  if (!/^[0-9a-fA-F]{1,66}$/.test(raw)) {
+    $lookupResult.textContent = 'target must be 1-66 hex chars';
     return;
   }
   const target = BigInt('0x' + raw);
