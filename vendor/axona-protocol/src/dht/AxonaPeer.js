@@ -322,6 +322,117 @@ export class AxonaPeer extends DHT {
     transport.onNotification('hop_cache',      hopCacheHandler);
     transport.onNotification('lateral_spread', hopCacheHandler);
 
+    // ── Phase 7 handlers ────────────────────────────────────────────
+
+    // ── local_probe — 2-hop neighbourhood for anneal / dead-replace ─
+    // Source asks "what peers do you know?" so it can pick one for
+    // its own annealing exploration or as a replacement candidate
+    // when a synapse goes dead.  Reply: the synaptome peerIds,
+    // excluding the requestor itself (otherwise they'd see themselves
+    // as a candidate — useless).
+    transport.onRequest('local_probe', async (fromId, _payload) => {
+      const fromBig = (typeof fromId === 'bigint')
+        ? fromId
+        : BigInt('0x' + fromId);
+      const peerIds = [];
+      for (const syn of node.synaptome.values()) {
+        if (syn.peerId !== fromBig) peerIds.push(syn.peerId);
+      }
+      return peerIds;
+    });
+
+    // ── find_closest_set — top-K closest peers from local synaptome
+    // Used by AxonManager's findKClosest (pub/sub) and by iterative
+    // discovery.  Insertion-sorted scan; cheap because synaptome is
+    // bounded by MAX_SYNAPTOME.  Caller merges results across rounds.
+    transport.onRequest('find_closest_set', async (_fromId, payload) => {
+      const targetBig = (typeof payload.target === 'bigint')
+        ? payload.target
+        : BigInt('0x' + String(payload.target));
+      const K = payload.K ?? domain._k;
+      const top = [];
+      for (const syn of node.synaptome.values()) {
+        const d = syn.peerId ^ targetBig;
+        if (top.length < K) {
+          let i = 0;
+          while (i < top.length && top[i].d < d) i++;
+          top.splice(i, 0, { peerId: syn.peerId, d });
+        } else if (d < top[K - 1].d) {
+          let i = 0;
+          while (i < top.length && top[i].d < d) i++;
+          top.splice(i, 0, { peerId: syn.peerId, d });
+          top.pop();
+        }
+      }
+      return top.map(t => t.peerId);
+    });
+
+    // ── route_msg — recursive routed-message forwarder ──────────────
+    // Receiver runs greedy 1-hop scan over its own synaptome (closer
+    // than self?), falls back to 2-hop terminal check, dispatches the
+    // local routed handler for `type` (if any).  Returns 'consumed' /
+    // 'terminal' / 'exhausted', or forwards to nextHop via another
+    // route_msg request and bubbles the downstream reply unchanged.
+    transport.onRequest('route_msg', async (fromId, msg) => {
+      const { type, payload, targetId, hops, originId } = msg;
+      const targetBig = (typeof targetId === 'bigint')
+        ? targetId
+        : BigInt('0x' + String(targetId));
+
+      // Greedy 1-hop forward
+      let nextHopId = null;
+      let bestDist  = node.id ^ targetBig;
+      for (const syn of node.synaptome.values()) {
+        const d = syn.peerId ^ targetBig;
+        if (d < bestDist) { bestDist = d; nextHopId = syn.peerId; }
+      }
+
+      let isTerminal = nextHopId === null;
+      if (isTerminal) {
+        const closer = await this._findCloserInTwoHops(targetBig);
+        if (closer !== null && closer !== node.id) {
+          nextHopId  = closer;
+          isTerminal = false;
+        }
+      }
+
+      const meId = node.id;
+      const result = await this._deliverRouted(type, payload, {
+        fromId,
+        targetId: targetBig,
+        hopCount: hops,
+        isTerminal,
+      });
+
+      if (result === 'consumed') {
+        return { consumed: true, atNode: meId, hops };
+      }
+      if (isTerminal) {
+        return { consumed: false, atNode: meId, hops, terminal: true };
+      }
+      if (hops + 1 >= domain.MAX_HOPS) {
+        return { consumed: false, atNode: meId, hops, exhausted: true };
+      }
+
+      // Same lazy channel-open as _lookupStep — route_msg can hop
+      // through cache synapses installed mid-walk.
+      if (typeof node.transport.isConnected === 'function'
+          && !node.transport.isConnected(nextHopId)
+          && typeof node.transport.openConnection === 'function') {
+        try { await node.transport.openConnection(nextHopId); }
+        catch { /* fall through */ }
+      }
+
+      try {
+        const downstream = await node.transport.send(nextHopId, 'route_msg', {
+          type, payload, targetId: targetBig, hops: hops + 1, originId,
+        });
+        return downstream;
+      } catch {
+        return { consumed: false, atNode: meId, hops, exhausted: true };
+      }
+    });
+
     this._routingHandlersInstalled = true;
   }
 
@@ -2417,6 +2528,20 @@ export class AxonaPeer extends DHT {
     if (Math.random() < node.temperature * domain.ANNEAL_RATE_SCALE) {
       this._tryAnneal().catch(err =>
         console.error(`AxonaPeer: anneal failed at ${node.id.toString(16)}:`, err));
+    }
+
+    // Lazy channel-open: synapses added by hop_cache / lateral_spread /
+    // triadic_introduce point at peers we may not have opened a
+    // channel to during bootstrap.  In a real WebRTC deployment the
+    // first-use path triggers connection setup; here we do the same
+    // on simTransport.  If open fails (peer gone / admission denied)
+    // the subsequent send() throws and the lookup terminates with
+    // found=false, same as before.
+    if (typeof node.transport.isConnected === 'function'
+        && !node.transport.isConnected(nextId)
+        && typeof node.transport.openConnection === 'function') {
+      try { await node.transport.openConnection(nextId); }
+      catch { /* fall through — send() will fail and we return false */ }
     }
 
     try {
