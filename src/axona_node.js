@@ -56,7 +56,10 @@ import { BridgeTransport,
                               from './bridge_transport.js';
 import { CompositeTransport } from './composite_transport.js';
 import { deriveIdentity, getCurrentIdentity } from './identity.js';
-import { mountAxonalPubsub }   from './pubsub_axonal.js';
+// pubsub_axonal.js (legacy { msg, publisher } wrapper around the
+// kernel's AxonManager) was retired in I3.  Consumers now use the
+// kernel's unified pub/sub via this AxonaNode's .pub/.sub/.pull/
+// .metrics delegators — same wire as peer.pub/sub etc.
 
 // ── ID encoding helpers ──────────────────────────────────────────────
 
@@ -160,9 +163,9 @@ export class AxonaNode {
 
     this._registerNH1Handlers();
 
-    // I3: pass identity to AxonaPeer so the kernel's unified pub/sub
-    // API (peer.pub) can build signed envelopes.  The legacy
-    // pubsubPublish path doesn't read this; only peer.pub does.
+    // I3: pass identity to AxonaPeer so peer.pub can build signed
+    // envelopes (legacy pubsubPublish wrapper was retired; the unified
+    // peer.pub / peer.sub is the only pub/sub path now).
     this._peer = new AxonaPeer({
       engine:   this._engine,
       node:     this._node,
@@ -170,18 +173,11 @@ export class AxonaNode {
     });
     await this._peer.start();
 
-    // Real DHT-based pub/sub via the protocol's AxonManager.  Engine
-    // needs the peer back-ref to construct the dht adapter.  Mount
-    // AFTER peer.start() so AxonaPeer's onDirectMessage / findKClosest
-    // wiring is alive when AxonManager registers its 'pubsub:deliver'
-    // listener.
+    // Register the peer with the engine so axonFor(node) can build
+    // the AxonManager dht adapter on demand.  AxonManager wakes up
+    // when peer.sub / peer.pub call _requireAxonManager → engine
+    // .axonManagerFor → axonFor → constructs once + caches.
     this._engine.setPeerForNode(this._node, this._peer);
-    this._axon = this._engine.axonFor(this._node);
-    this._pubsub = mountAxonalPubsub({
-      axon: this._axon,
-      peer: this._peer,
-      log:  this._log,
-    });
 
     // Register the wire-level 'route_msg' request handler so multi-hop
     // routed DHT messages (used by AxonManager's fallback paths +
@@ -240,18 +236,33 @@ export class AxonaNode {
   // ── DHT operations passed through to AxonaPeer ─────────────────────
   async lookup(targetKey) { return this._peer?.lookup(targetKey); }
 
-  // ── Application-layer pub/sub ──────────────────────────────────────
-  pubsubSubscribe(topicKey, handler) {
-    if (!this._pubsub) throw new Error('AxonaNode: not started');
-    return this._pubsub.subscribe(topicKey, handler);
+  // ── Application-layer pub/sub (kernel's unified API) ───────────────
+  //
+  // Delegators for the v1.0 surface.  Callers pass a topic string
+  // (the application chooses the hashing model via opts.publisher;
+  // see deriveTopicId — null = public mode, undefined = self-keyed,
+  // hex = explicit publisher).
+  //
+  //   const sub   = await node.sub(topic, envelope => …, { publisher: null });
+  //   const msgId = await node.pub(topic, message,        { publisher: null });
+  //   const env   = await node.pull(msgId, { topic, publisher });
+  //   const m     = await node.metrics(topic, { publisher });
+  //   await sub.stop();
+  async sub(topic, handler, opts = {}) {
+    if (!this._peer) throw new Error('AxonaNode: not started');
+    return this._peer.sub(topic, handler, opts);
   }
-  pubsubUnsubscribe(topicKey) {
-    if (!this._pubsub) return;
-    return this._pubsub.unsubscribe(topicKey);
+  async pub(topic, message, opts = {}) {
+    if (!this._peer) throw new Error('AxonaNode: not started');
+    return this._peer.pub(topic, message, opts);
   }
-  pubsubPublish(topicKey, msg) {
-    if (!this._pubsub) throw new Error('AxonaNode: not started');
-    return this._pubsub.publish(topicKey, msg);
+  async pull(msgId, opts = {}) {
+    if (!this._peer) throw new Error('AxonaNode: not started');
+    return this._peer.pull(msgId, opts);
+  }
+  async metrics(topic, opts = {}) {
+    if (!this._peer) throw new Error('AxonaNode: not started');
+    return this._peer.metrics(topic, opts);
   }
 
   // ─────────────────────────────────────────────────────────────────

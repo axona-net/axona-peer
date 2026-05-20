@@ -29,7 +29,12 @@ import {
 // Shared codec: same BigInt + Set conventions as mesh.js and the
 // bridge's server.js — keeps every channel on one wire format.
 import { encode, decode } from './wire.js';
-import { deriveTopicKey, topicKeyToHex } from './pubsub_topic.js';
+// I3: pub/sub now uses the kernel's unified API via axonaNode.pub /
+// axonaNode.sub.  Topics are public-mode strings (anyone-can-publish,
+// anyone-can-subscribe) shaped as `${regionId}/${eventName}` so the
+// (region, event) addressing UX is preserved without forcing a
+// publisher-keyed model.  The application chooses the hashing mode
+// per call; `{ publisher: null }` selects the simple-name hash.
 
 // Peer build number.  Bump the middle digit on every code change so
 // you can confirm a redeployed page actually loaded (esp. on iOS,
@@ -912,13 +917,13 @@ async function bootAxonaNode(opts = {}) {
       }
       return out;
     },
-    /** Resolve a (regionId, eventName) to a topic key for diagnostics. */
+    /** Resolve a (regionId, eventName) to its 264-bit hex topic ID
+     *  (public-mode: '00' + sha256(`${regionId}/${eventName}`)). */
     topicKey: async (regionId, eventName) => {
-      const { deriveTopicKey } = await import('./pubsub_topic.js');
-      const { REGIONS } = await import('./identity.js');
-      const region = REGIONS.find(r => r.id === regionId);
-      if (!region) throw new Error('unknown region: ' + regionId);
-      return hex(await deriveTopicKey(region, eventName));
+      const { deriveTopicId } = await import(
+        '../vendor/axona-protocol/src/pubsub/post.js'
+      );
+      return deriveTopicId(null, `${regionId}/${eventName}`);
     },
     /** Run findKClosest for a topic.  Reveals WHICH K peers this node
      *  thinks are the topic's axon set — the most important diagnostic
@@ -998,12 +1003,13 @@ async function bootAxonaNode(opts = {}) {
 // State shape — kept entirely in client.js memory + localStorage:
 //
 //   subscriptions: [
-//     { regionId, eventName, key: bigint, messages: [{publisher, msg, ts}, ...] }
+//     { regionId, eventName, topic, handle, messages: [{publisher, msg, ts, msgId}, ...] }
 //   ]
 //
-// `key` is reconstituted from (regionId, eventName) on every reload via
-// deriveTopicKey, so we don't have to persist BigInt-typed values.
-// `messages` is ephemeral — a fresh inbox on every reload.
+// `topic` is the public-mode topic string (`${regionId}/${eventName}`).
+// `handle` is the kernel Subscription returned by axonaNode.sub; it
+// exposes `.topicId` (66-char hex) for diagnostics and `.stop()` for
+// teardown.  `messages` is ephemeral — a fresh inbox on every reload.
 
 const SUBSCRIPTIONS_LS_KEY = 'axona-peer:subscriptions:v1';
 const MAX_MESSAGES_PER_SUB = 50;
@@ -1088,7 +1094,7 @@ function renderSubscriptions() {
       escapeHtml(sub.eventName);
     const key = document.createElement('span');
     key.className = 'pubsub-sub-key';
-    key.textContent = topicKeyToHex(sub.key);
+    key.textContent = sub.handle?.topicId ?? '—';
     const rm = document.createElement('button');
     rm.className = 'pubsub-sub-remove';
     rm.type = 'button';
@@ -1137,34 +1143,44 @@ function escapeHtml(s) {
 
 async function addSubscription(regionId, eventName) {
   if (!axonaNode) throw new Error('axona node not started yet');
-  const region = REGIONS.find(r => r.id === regionId);
-  if (!region) throw new Error('unknown region: ' + regionId);
-  const key = await deriveTopicKey(region, eventName);
+  if (!REGIONS.find(r => r.id === regionId)) {
+    throw new Error('unknown region: ' + regionId);
+  }
 
   // De-dup: same regionId + same eventName is already there.
   if (subscriptions.some(s => s.regionId === regionId && s.eventName === eventName)) {
     return;
   }
-  const sub = { regionId, eventName, key, messages: [] };
+  const topic = `${regionId}/${eventName}`;
+  const sub = { regionId, eventName, topic, handle: null, messages: [] };
   subscriptions.push(sub);
 
-  axonaNode.pubsubSubscribe(key, ({ publisher, msg, ts }) => {
-    sub.messages.push({ publisher, msg, ts });
+  // Public-mode subscribe so anyone publishing under
+  // `${regionId}/${eventName}` reaches us (preserves the (region,
+  // event) public-channel UX from the legacy pubsubSubscribe path).
+  // Envelope shape: { msgId, ts, topic, message, signerPubkey?, signature? }.
+  sub.handle = await axonaNode.sub(topic, (envelope) => {
+    sub.messages.push({
+      publisher: envelope.signerPubkey ?? null,
+      msg:       envelope.message,
+      ts:        envelope.ts,
+      msgId:     envelope.msgId,
+    });
     if (sub.messages.length > MAX_MESSAGES_PER_SUB) {
       sub.messages.shift();
     }
     renderSubscriptions();
-  });
+  }, { publisher: null });
 
   persistSubscriptions();
   renderSubscriptions();
-  appendLog('pubsub:subscribed', `${regionId}/${eventName} → ${topicKeyToHex(key)}`);
+  appendLog('pubsub:subscribed', `${regionId}/${eventName} → ${sub.handle.topicId}`);
 }
 
-function removeSubscription(idx) {
+async function removeSubscription(idx) {
   const sub = subscriptions[idx];
   if (!sub) return;
-  if (axonaNode) axonaNode.pubsubUnsubscribe(sub.key);
+  if (sub.handle) { try { await sub.handle.stop(); } catch { /* ignore */ } }
   subscriptions.splice(idx, 1);
   persistSubscriptions();
   renderSubscriptions();
@@ -1220,11 +1236,13 @@ function newPublishForm(homeRegionId, eventName = '') {
 
 async function recomputeKeyLabel(form, $keyEl) {
   if (!form.eventName) { $keyEl.textContent = '—'; return; }
-  const region = REGIONS.find(r => r.id === form.regionId);
-  if (!region) { $keyEl.textContent = '—'; return; }
+  if (!REGIONS.find(r => r.id === form.regionId)) { $keyEl.textContent = '—'; return; }
   try {
-    const key = await deriveTopicKey(region, form.eventName);
-    $keyEl.textContent = `topic key: ${topicKeyToHex(key)}`;
+    const { deriveTopicId } = await import(
+      '../vendor/axona-protocol/src/pubsub/post.js'
+    );
+    const topicId = await deriveTopicId(null, `${form.regionId}/${form.eventName}`);
+    $keyEl.textContent = `topic id: ${topicId}`;
   } catch { $keyEl.textContent = '—'; }
 }
 
@@ -1234,12 +1252,18 @@ async function publishFromForm(form, $messageEl) {
   const message   = $messageEl.value;
   if (!eventName) { appendLog('pubsub:publish-skip', 'event name required', 'error'); return; }
   if (!message)   { appendLog('pubsub:publish-skip', 'message required',    'error'); return; }
-  const region = REGIONS.find(r => r.id === form.regionId);
-  if (!region)   { appendLog('pubsub:publish-skip', 'unknown region', 'error'); return; }
+  if (!REGIONS.find(r => r.id === form.regionId)) {
+    appendLog('pubsub:publish-skip', 'unknown region', 'error'); return;
+  }
   try {
-    const key = await deriveTopicKey(region, eventName);
-    axonaNode.pubsubPublish(key, message);
-    appendLog('pubsub:published', `${form.regionId}/${eventName} → ${topicKeyToHex(key)}`);
+    const topic = `${form.regionId}/${eventName}`;
+    // Public-mode publish — `{publisher: null}` matches what
+    // addSubscription does so anyone with the same (region, event)
+    // string sees this message.  Signed by default (sign:true is
+    // the kernel's default); subscribers can verify signerPubkey
+    // per envelope.
+    const msgId = await axonaNode.pub(topic, message, { publisher: null });
+    appendLog('pubsub:published', `${form.regionId}/${eventName} → ${msgId}`);
     $messageEl.value = '';
   } catch (err) {
     appendLog('pubsub:publish-failed', err.message, 'error');
