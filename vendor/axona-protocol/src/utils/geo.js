@@ -91,8 +91,12 @@ export function randomU32() {
 
 // ── 264-bit ID math lives in hexid.js ────────────────────────────────
 // randomU256, clz264, toHex, fromHex, xorDistance, etc.
-// Re-exported here for callers that already import from geo.js.
-export {
+// We both IMPORT (for local use inside buildXorRoutingTable etc.) and
+// RE-EXPORT (so callers can keep importing from geo.js).  A bare
+// `export { ... } from` creates ONLY a re-export and does NOT bind
+// the names in this module — referencing them locally would throw
+// `ReferenceError: ID_BITS is not defined` at runtime.
+import {
   randomU256,
   clz264,
   toHex,
@@ -112,6 +116,26 @@ export {
   MAX_HASH,
   MAX_S2,
 } from './hexid.js';
+export {
+  randomU256,
+  clz264,
+  toHex,
+  fromHex,
+  isHexId,
+  xorDistance,
+  stratumOf,
+  assembleId,
+  extractS2Prefix,
+  extractHash,
+  s2PrefixOfHex,
+  ID_BITS,
+  HASH_BITS,
+  S2_BITS,
+  HEX_CHARS,
+  MAX_ID,
+  MAX_HASH,
+  MAX_S2,
+};
 
 /**
  * Collect up to k nodes from XOR-bucket b relative to selfId.

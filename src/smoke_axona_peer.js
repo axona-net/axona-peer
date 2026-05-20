@@ -191,15 +191,14 @@ async function main() {
   //    — give A a Synapse pointing at B with reasonable initial weight.
   const { Synapse } = await import('../vendor/axona-protocol/src/dht/Synapse.js');
   // clz64 was dropped from the kernel (it now ships clz264 for 264-bit
-  // hex IDs); inline a tiny 64-bit version for the legacy BigInt path.
+  // hex IDs); inline a fast 64-bit version (Math.clz32 chunks) for the
+  // legacy BigInt path.
   const clz64 = (x) => {
     if (x === 0n) return 64;
-    let n = 0;
-    for (let i = 63n; i >= 0n; i--) {
-      if ((x >> i) & 1n) break;
-      n++;
-    }
-    return n;
+    const hi = Number((x >> 32n) & 0xFFFFFFFFn);
+    if (hi !== 0) return Math.clz32(hi);
+    const lo = Number(x & 0xFFFFFFFFn);
+    return 32 + Math.clz32(lo);
   };
   const stratum = clz64(A_ID ^ B_ID);
   const synAB = new Synapse({ peerId: B_ID, latencyMs: 42, stratum });

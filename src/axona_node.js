@@ -40,13 +40,13 @@ import {
 // hex identities (and consumes Peer.web() directly).
 function clz64(x) {
   if (x === 0n) return 64;
-  let n = 0;
-  let v = x;
-  for (let i = 32; i >= 1; i >>= 1) {
-    if (v < (1n << BigInt(64 - i))) { n += i; }
-    else                            { v >>= BigInt(64 - i); break; }
-  }
-  return n;
+  // Split into 32-bit halves and delegate to Math.clz32 — single
+  // instruction CLZ vs the BigInt-shift loop the naive version uses.
+  // Matches the kernel's clz264 strategy (utils/hexid.js).
+  const hi = Number((x >> 32n) & 0xFFFFFFFFn);
+  if (hi !== 0) return Math.clz32(hi);
+  const lo = Number(x & 0xFFFFFFFFn);
+  return 32 + Math.clz32(lo);
 }
 
 import { BrowserEngine }      from './browser_engine.js';
