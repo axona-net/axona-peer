@@ -128,7 +128,7 @@ async function main() {
   const ws = await new Promise((resolve, reject) => {
     const sock = new WebSocket(BRIDGE_URL);
     sock.on('open', () => {
-      try { sock.send(JSON.stringify({ type: 'client-hello', version: '0.14.0' })); }
+      try { sock.send(JSON.stringify({ type: 'client-hello', version: '1.0.0' })); }
       catch (err) { reject(err); return; }
       resolve(sock);
     });
