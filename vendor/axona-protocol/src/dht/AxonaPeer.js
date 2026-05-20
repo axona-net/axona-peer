@@ -106,6 +106,16 @@ export class AxonaPeer extends DHT {
     this._routedHandlers = new Map();
     /** @type {Map<string, Function>} direct-message type → handler */
     this._directHandlers = new Map();
+
+    // ─── Per-peer lookup stats (Phase 5b — own them) ──────────────
+    // Before Phase 5b these lived as engine._nodeStats — one entry per
+    // node, keyed by the NeuronNode.  Read sites (peer.getMetrics) and
+    // write sites (peer's _bumpLookupStats at the end of lookup()) all
+    // resolve to THIS peer's own entry — nothing cross-peer.  Moving
+    // it onto the peer matches where the data conceptually belongs
+    // and gets us one step closer to peer.lookup() running without an
+    // engine.
+    this._stats = { attempted: 0, succeeded: 0, sumHops: 0, sumLatency: 0 };
   }
 
   // ─── Lifecycle ─────────────────────────────────────────────────────
@@ -657,7 +667,7 @@ export class AxonaPeer extends DHT {
     }
 
     const hops = result.path.length - 1;
-    engine._bumpLookupStats(node, result.found, hops, result.totalTimeMs);
+    this._bumpLookupStats(result.found, hops, result.totalTimeMs);
     engine._emit({
       type: 'lookup-completed', timestamp: Date.now(),
       sourceId: node.id, targetKey,
@@ -1343,16 +1353,40 @@ export class AxonaPeer extends DHT {
   }
 
   /**
-   * Phase 2: own the metrics object construction.  Per-node lookup
-   * counters still live in `engine._nodeStats` (a single Map keyed by
-   * NeuronNode); Phase 3 will move those onto the peer.  Until then
-   * we look up our entry there.
+   * Phase 5b: bump this peer's lookup-stat accumulators.  Called at the
+   * end of lookup() with the outcome.  Replaces the engine-side
+   * `_bumpLookupStats(node, ...)` Map write — same shape, but data
+   * lives on the peer where the read site (getMetrics) consumes it.
+   */
+  _bumpLookupStats(found, hops, latency) {
+    const s = this._stats;
+    s.attempted++;
+    if (found) {
+      s.succeeded++;
+      s.sumHops    += hops;
+      s.sumLatency += latency;
+    }
+  }
+
+  /**
+   * Phase 5b: reset stat accumulators.  Called by the engine's cycle
+   * snapshot (snapshotMetrics with reset=true) on each tick.
+   */
+  _resetStats() {
+    const s = this._stats;
+    s.attempted = 0; s.succeeded = 0; s.sumHops = 0; s.sumLatency = 0;
+  }
+
+  /**
+   * Phase 5b — lookup stats are now peer-owned in `this._stats`.  The
+   * engine's `_nodeStats` Map is vestigial (no kernel reader).
+   * `snapshotMetrics` on the engine resets via the peer's own
+   * `_resetStats()` instead of writing to the map.
    */
   getMetrics() {
     const node = this._node;
     if (!node) return null;
-    const stats = this._engine._nodeStats.get(node) ||
-      { attempted: 0, succeeded: 0, sumHops: 0, sumLatency: 0 };
+    const stats = this._stats;
     const cycleStats = {
       lookupsAttempted: stats.attempted,
       lookupsSucceeded: stats.succeeded,
