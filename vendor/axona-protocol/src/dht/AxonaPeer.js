@@ -62,22 +62,45 @@ export class AxonaPeer extends DHT {
    *        signed publishes (the default).  Apps that only call
    *        `peer.pub(topic, message, { sign: false })` can omit it.
    */
-  constructor({ engine, node, axonManager = null, identity = null, transport = null, persist = null }) {
+  constructor({ engine = null, domain = null, node, axonManager = null, identity = null, transport = null, persist = null }) {
     super();
-    if (!engine) throw new Error('AxonaPeer: engine is required');
-    if (!node)   throw new Error('AxonaPeer: node is required');
+    if (!node) throw new Error('AxonaPeer: node is required');
+
+    // Phase 5d (kernel cleanup): engine is optional now.  A peer can
+    // be constructed against:
+    //
+    //   · { engine }                  — legacy simulator path.  The
+    //                                   engine doubles as the domain
+    //                                   (it carries simEpoch, _emaHops,
+    //                                   the config constants, etc.).
+    //                                   `this._domain = engine`.
+    //
+    //   · { engine, domain }          — explicit dual handle.  Useful
+    //                                   for tests that want to swap
+    //                                   the domain without rebuilding
+    //                                   the engine.
+    //
+    //   · { domain }                  — standalone.  No engine; the
+    //                                   peer runs on Transport.sim
+    //                                   (or another transport) and
+    //                                   shares state with sibling
+    //                                   peers via this AxonaDomain.
+    //                                   Engine-specific calls
+    //                                   (legacy `subscribe`/`publish`
+    //                                   /`unsubscribe`, sponsor-
+    //                                   bootstrap fallback) throw if
+    //                                   reached in this mode.
+    //
+    //   · {}                          — invalid.  We need at least
+    //                                   one of engine or domain to
+    //                                   know where to read simEpoch
+    //                                   etc. from.
+    //
+    if (!engine && !domain) {
+      throw new Error('AxonaPeer: engine or domain is required');
+    }
     this._engine = engine;
-    /**
-     * Phase 5c (kernel cleanup): the peer reads its shared mesh
-     * state + config from a "domain" handle.  Today the domain IS
-     * the engine — dht-sim's AxonaEngine provides simEpoch, _emaHops,
-     * MAX_HOPS, ... directly on itself, so engine === domain and
-     * behaviour is unchanged.  Phase 5d gives the peer a way to
-     * accept a standalone AxonaDomain so it can run without an
-     * engine at all.  Phase 5e then ships the smoke that exercises
-     * that path through Transport.sim end-to-end.
-     */
-    this._domain = engine;
+    this._domain = domain ?? engine;
     this._node   = node;
     this._axonManager = axonManager;
     this._identity = identity;
