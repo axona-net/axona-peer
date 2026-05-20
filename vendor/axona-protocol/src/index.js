@@ -90,6 +90,7 @@ export {
 
 // ── Per-node DHT implementation (NH-1) ──────────────────────────────
 export { AxonaPeer }    from './dht/AxonaPeer.js';
+export { AxonaDomain }  from './dht/AxonaDomain.js';
 export { DHTNode, GEO_CELL_BITS } from './dht/DHTNode.js';
 export { NeuronNode }   from './dht/NeuronNode.js';
 export { Synapse }      from './dht/Synapse.js';

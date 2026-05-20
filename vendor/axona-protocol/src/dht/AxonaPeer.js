@@ -67,6 +67,17 @@ export class AxonaPeer extends DHT {
     if (!engine) throw new Error('AxonaPeer: engine is required');
     if (!node)   throw new Error('AxonaPeer: node is required');
     this._engine = engine;
+    /**
+     * Phase 5c (kernel cleanup): the peer reads its shared mesh
+     * state + config from a "domain" handle.  Today the domain IS
+     * the engine — dht-sim's AxonaEngine provides simEpoch, _emaHops,
+     * MAX_HOPS, ... directly on itself, so engine === domain and
+     * behaviour is unchanged.  Phase 5d gives the peer a way to
+     * accept a standalone AxonaDomain so it can run without an
+     * engine at all.  Phase 5e then ships the smoke that exercises
+     * that path through Transport.sim end-to-end.
+     */
+    this._domain = engine;
     this._node   = node;
     this._axonManager = axonManager;
     this._identity = identity;
@@ -144,12 +155,12 @@ export class AxonaPeer extends DHT {
     }
 
     // Engine emits events to a single global listener set today
-    // (engine._eventListeners).  We subscribe and filter to events
+    // (domain._eventListeners).  We subscribe and filter to events
     // about THIS node, then forward to our per-peer listeners.  This
     // lets the production peer subscribe via AxonaPeer.onEvent without
     // seeing other nodes' events (which it can't, since production
     // only has one node).
-    this._engineListenerUnsub = this._engine.onEvent((ev) => {
+    this._engineListenerUnsub = this._domain.onEvent((ev) => {
       // Most events carry a node identifier in one of several fields:
       //   nodeId, peerId, observerId, sourceId, …
       // The current set of event types and their id fields is
@@ -606,6 +617,7 @@ export class AxonaPeer extends DHT {
     // Engine-managed path: if the engine exposes addSynapse, use it
     // so its bookkeeping (stratum, decay, anneal pool) stays consistent.
     const engine = this._engine;
+    const domain = this._domain;
     if (engine && typeof engine.addSynapse === 'function') {
       try { engine.addSynapse(this._node, sponsor, { addedBy: 'bootstrap' }); return; }
       catch { /* fall through to direct insert */ }
@@ -636,12 +648,13 @@ export class AxonaPeer extends DHT {
   async lookup(targetKey) {
     const node   = this._node;
     const engine = this._engine;
+    const domain = this._domain;
     if (!node || !node.alive) return null;
 
-    engine.simEpoch++;
-    if (++engine.lookupsSinceDecay >= engine.DECAY_INTERVAL) {
-      engine._tickDecay();                            // FORGET: periodic
-      engine.lookupsSinceDecay = 0;
+    domain.simEpoch++;
+    if (++domain.lookupsSinceDecay >= domain.DECAY_INTERVAL) {
+      domain._tickDecay();                            // FORGET: periodic
+      domain.lookupsSinceDecay = 0;
     }
 
     const result = await this._lookupStep({
@@ -657,18 +670,18 @@ export class AxonaPeer extends DHT {
     // ── LEARN: LTP reinforcement on fast paths ─────────────────────
     if (result.found && result.trace.length > 0) {
       const hopCount = result.trace.length;
-      engine._emaHops = engine._emaHops === null
-        ? hopCount : 0.9 * engine._emaHops + 0.1 * hopCount;
-      engine._emaTime = engine._emaTime === null
-        ? result.totalTimeMs : 0.9 * engine._emaTime + 0.1 * result.totalTimeMs;
-      if (result.totalTimeMs <= engine._emaTime) {
+      domain._emaHops = domain._emaHops === null
+        ? hopCount : 0.9 * domain._emaHops + 0.1 * hopCount;
+      domain._emaTime = domain._emaTime === null
+        ? result.totalTimeMs : 0.9 * domain._emaTime + 0.1 * result.totalTimeMs;
+      if (result.totalTimeMs <= domain._emaTime) {
         this._reinforceWave(result.trace);
       }
     }
 
     const hops = result.path.length - 1;
     this._bumpLookupStats(result.found, hops, result.totalTimeMs);
-    engine._emit({
+    domain._emit({
       type: 'lookup-completed', timestamp: Date.now(),
       sourceId: node.id, targetKey,
       hops, time: result.totalTimeMs, found: result.found,
@@ -1241,6 +1254,7 @@ export class AxonaPeer extends DHT {
     // engine builds expose this differently; we probe in priority
     // order and cache the result.
     const engine = this._engine;
+    const domain = this._domain;
     let am = null;
     if (typeof engine?.axonManagerFor === 'function') {
       am = engine.axonManagerFor(this._node);
@@ -1399,10 +1413,10 @@ export class AxonaPeer extends DHT {
       byType:       node.msgsByType ? { ...node.msgsByType } : {},
     };
     return {
-      simEpoch:             this._engine.simEpoch,
+      simEpoch:             this._domain.simEpoch,
       synaptomeSize:        node.synaptome.size,
       incomingSynapsesSize: node.incomingSynapses.size,
-      temperature:          node.temperature ?? this._engine.T_INIT,
+      temperature:          node.temperature ?? this._domain.T_INIT,
       cycleStats,
       traffic,
     };
@@ -1422,11 +1436,11 @@ export class AxonaPeer extends DHT {
    */
   _vitality(syn) {
     let recency;
-    if (syn.inertia > this._engine.simEpoch) {
+    if (syn.inertia > this._domain.simEpoch) {
       recency = 1.0;
     } else {
-      const elapsed = this._engine.simEpoch - syn.inertia;
-      recency = Math.max(0.1, Math.exp(-elapsed / this._engine.RECENCY_HALF_LIFE));
+      const elapsed = this._domain.simEpoch - syn.inertia;
+      recency = Math.max(0.1, Math.exp(-elapsed / this._domain.RECENCY_HALF_LIFE));
     }
     return syn.weight * recency;
   }
@@ -1443,7 +1457,7 @@ export class AxonaPeer extends DHT {
       return { s, ap };
     }).sort((a, b) => b.ap - a.ap);
 
-    const probeSet = ranked.slice(0, this._engine.LOOKAHEAD_ALPHA).map(x => x.s);
+    const probeSet = ranked.slice(0, this._domain.LOOKAHEAD_ALPHA).map(x => x.s);
 
     // Short-circuit: any probe whose first-hop sits exactly on the
     // target wins outright (zero remaining XOR distance).
@@ -1653,13 +1667,14 @@ export class AxonaPeer extends DHT {
   async _addByVitality(newSyn) {
     const node   = this._node;
     const engine = this._engine;
-    const cap = node._maxSynaptome ?? engine.MAX_SYNAPTOME;
+    const domain = this._domain;
+    const cap = node._maxSynaptome ?? domain.MAX_SYNAPTOME;
 
     let victim = null;
     if (node.synaptome.size >= cap) {
       let minV = Infinity, minVAny = Infinity, victimAny = null;
       for (const s of node.synaptome.values()) {
-        if (s.inertia > engine.simEpoch) continue;
+        if (s.inertia > domain.simEpoch) continue;
         const v = this._vitality(s);
         if (v < minVAny) { minVAny = v; victimAny = s; }
         if (!s.bootstrap && v < minV) { minV = v; victim = s; }
@@ -1701,7 +1716,7 @@ export class AxonaPeer extends DHT {
     const node = this._node;
     const key   = `${originId}_${nextId}`;
     const count = (node.transitCache.get(key) ?? 0) + 1;
-    if (count >= this._engine.TRIADIC_THRESHOLD) {
+    if (count >= this._domain.TRIADIC_THRESHOLD) {
       node.transitCache.delete(key);
       node.transport.notify(originId, 'triadic_introduce', { peerId: nextId })
         .catch(err => console.error('AxonaPeer: triadic_introduce notify failed:', err));
@@ -1719,21 +1734,22 @@ export class AxonaPeer extends DHT {
   async _tryAnneal() {
     const node   = this._node;
     const engine = this._engine;
+    const domain = this._domain;
     if (!node.alive || node.synaptome.size === 0) return;
 
     let victim = null, weakW = Infinity;
     for (const s of node.synaptome.values()) {
-      if (s.inertia > engine.simEpoch) continue;
+      if (s.inertia > domain.simEpoch) continue;
       if (s.weight < weakW) { weakW = s.weight; victim = s; }
     }
     if (!victim) return;
 
-    const counts = new Array(engine.STRATA_GROUPS).fill(0);
+    const counts = new Array(domain.STRATA_GROUPS).fill(0);
     for (const s of node.synaptome.values()) {
-      counts[Math.min(engine.STRATA_GROUPS - 1, s.stratum >>> 2)]++;
+      counts[Math.min(domain.STRATA_GROUPS - 1, s.stratum >>> 2)]++;
     }
     let targetGroup = 0, minCount = Infinity;
-    for (let g = 0; g < engine.STRATA_GROUPS; g++) {
+    for (let g = 0; g < domain.STRATA_GROUPS; g++) {
       if (counts[g] < minCount) { minCount = counts[g]; targetGroup = g; }
     }
 
@@ -1755,7 +1771,7 @@ export class AxonaPeer extends DHT {
     syn.weight    = 0.1;
     syn._addedBy  = 'anneal';
     node.addSynapse(syn);
-    engine._emit({
+    domain._emit({
       type: 'anneal-fired', timestamp: Date.now(),
       observerId: node.id, evicted: victim.peerId, admitted: candidate.id,
     });
@@ -1768,12 +1784,13 @@ export class AxonaPeer extends DHT {
   async _evictAndReplace(deadSyn) {
     const node   = this._node;
     const engine = this._engine;
+    const domain = this._domain;
 
     node.synaptome.delete(deadSyn.peerId);
     node.connections?.delete(deadSyn.peerId);
     await node.transport.closeConnection(deadSyn.peerId);
 
-    const group = Math.min(engine.STRATA_GROUPS - 1, deadSyn.stratum >>> 2);
+    const group = Math.min(domain.STRATA_GROUPS - 1, deadSyn.stratum >>> 2);
     const candidate = await this._localCandidate(group * 4, group * 4 + 3);
     if (!candidate || node.synaptome.has(candidate.id)) return null;
 
@@ -1783,7 +1800,7 @@ export class AxonaPeer extends DHT {
     const weights = [];
     for (const s of node.synaptome.values()) weights.push(s.weight);
     weights.sort((a, b) => a - b);
-    const medW = weights.length > 0 ? weights[weights.length >> 1] : engine.VITALITY_FLOOR;
+    const medW = weights.length > 0 ? weights[weights.length >> 1] : domain.VITALITY_FLOOR;
 
     const measuredLat = node.transport.getLatency(candidate.id);
     const latMs   = (measuredLat >= 0) ? measuredLat : 200;
@@ -1803,6 +1820,7 @@ export class AxonaPeer extends DHT {
   async _localCandidate(lo, hi) {
     const node   = this._node;
     const engine = this._engine;
+    const domain = this._domain;
 
     const probeTargets = [...node.synaptome.values()].map(s => s.peerId);
     if (probeTargets.length === 0) return null;
@@ -1821,7 +1839,7 @@ export class AxonaPeer extends DHT {
         const stratum = clz264(node.id ^ id);
         if (stratum < lo || stratum > hi) continue;
         candidates.push(id);
-        if (candidates.length >= engine.ANNEAL_LOCAL_SAMPLE) break outer;
+        if (candidates.length >= domain.ANNEAL_LOCAL_SAMPLE) break outer;
       }
     }
     if (candidates.length === 0) return null;
@@ -1887,7 +1905,7 @@ export class AxonaPeer extends DHT {
         const settled = await Promise.allSettled(
           probes.map(peerId =>
             src.transport.send(peerId, 'find_closest_set',
-              { target: targetBig, K: this._engine._k })
+              { target: targetBig, K: this._domain._k })
           )
         );
         for (const r of settled) {
@@ -2114,6 +2132,7 @@ export class AxonaPeer extends DHT {
   async _lookupStep(ctx) {
     const node   = this._node;
     const engine = this._engine;
+    const domain = this._domain;
     if (!node || !node.alive) {
       return this._lookupResult(ctx, false);
     }
@@ -2123,7 +2142,7 @@ export class AxonaPeer extends DHT {
     if (currentDist === 0n) {
       return this._lookupResult(ctx, true);
     }
-    if (ctx.hops >= engine.MAX_HOPS) {
+    if (ctx.hops >= domain.MAX_HOPS) {
       return this._lookupResult(ctx, false);
     }
 
@@ -2143,7 +2162,7 @@ export class AxonaPeer extends DHT {
     }
 
     if (deadSynapses.length > 0) {
-      node.temperature = Math.max(node.temperature, engine.T_REHEAT);
+      node.temperature = Math.max(node.temperature, domain.T_REHEAT);
       for (const syn of deadSynapses) {
         const repl = await this._evictAndReplace(syn);
         if (repl && (repl.peerId ^ targetKey) < currentDist) candidates.push(repl);
@@ -2170,7 +2189,7 @@ export class AxonaPeer extends DHT {
     if (direct && !dead.has(targetKey)) nextSyn = direct;
 
     if (!nextSyn && node.id === sourceId
-        && Math.random() < engine.EPSILON) {
+        && Math.random() < domain.EPSILON) {
       nextSyn = candidates[Math.floor(Math.random() * candidates.length)];
     }
 
@@ -2183,12 +2202,12 @@ export class AxonaPeer extends DHT {
     if (node.incomingSynapses.has(nextId) && !node.synaptome.has(nextId)) {
       const inc = node.incomingSynapses.get(nextId);
       inc.useCount = (inc.useCount ?? 0) + 1;
-      if (inc.useCount >= engine.PROMOTE_THRESHOLD) {
+      if (inc.useCount >= domain.PROMOTE_THRESHOLD) {
         const syn = new Synapse({
           peerId: nextId, latencyMs: inc.latency, stratum: inc.stratum,
         });
         syn.weight   = 0.5;
-        syn.inertia  = engine.simEpoch;
+        syn.inertia  = domain.simEpoch;
         syn._addedBy = 'promote';
         if (await this._addByVitality(syn)) {
           node.incomingSynapses.delete(nextId);
@@ -2208,20 +2227,20 @@ export class AxonaPeer extends DHT {
         peerId: targetKey, latencyMs: 0, stratum,
       });
       syn.weight   = 0.5;
-      syn.inertia  = engine.simEpoch;
+      syn.inertia  = domain.simEpoch;
       syn._addedBy = 'hopCache';
       const added = await this._addByVitality(syn);
-      if (added && engine.EN_LATERAL_SPREAD) {
-        const nodeRegion = node.id >> BigInt(64 - engine.GEO_REGION_BITS);
+      if (added && domain.EN_LATERAL_SPREAD) {
+        const nodeRegion = node.id >> BigInt(64 - domain.GEO_REGION_BITS);
         const regional   = [];
         for (const s of node.synaptome.values()) {
           if (s.peerId === targetKey) continue;
-          if ((s.peerId >> BigInt(64 - engine.GEO_REGION_BITS)) === nodeRegion) {
+          if ((s.peerId >> BigInt(64 - domain.GEO_REGION_BITS)) === nodeRegion) {
             regional.push(s);
           }
         }
         regional.sort((a, b) => b.weight - a.weight);
-        for (let i = 0; i < Math.min(engine.LATERAL_K, regional.length); i++) {
+        for (let i = 0; i < Math.min(domain.LATERAL_K, regional.length); i++) {
           node.transport.notify(regional[i].peerId, 'lateral_spread',
                                 { target: targetKey, depth: 1 })
             .catch(err => console.error('AxonaPeer: lateral_spread notify failed:', err));
@@ -2231,8 +2250,8 @@ export class AxonaPeer extends DHT {
 
     if (node.id !== sourceId) this._recordTransit(sourceId, nextId);
 
-    node.temperature = Math.max(engine.T_MIN, node.temperature * engine.ANNEAL_COOLING);
-    if (Math.random() < node.temperature * engine.ANNEAL_RATE_SCALE) {
+    node.temperature = Math.max(domain.T_MIN, node.temperature * domain.ANNEAL_COOLING);
+    if (Math.random() < node.temperature * domain.ANNEAL_RATE_SCALE) {
       this._tryAnneal().catch(err =>
         console.error(`AxonaPeer: anneal failed at ${node.id.toString(16)}:`, err));
     }
