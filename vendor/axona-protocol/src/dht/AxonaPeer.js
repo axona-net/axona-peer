@@ -263,8 +263,29 @@ export class AxonaPeer extends DHT {
     if (this._routingHandlersInstalled) return;
 
     // ── lookup_step — chain forward ─────────────────────────────────
+    //
+    // The wire codec serialises Set → array (see transport/wire.js);
+    // the receiver is responsible for re-coercing payload.queried
+    // back to a Set before passing it through _lookupStep, which
+    // does ctx.queried.add(nextId) on every hop.  Without this
+    // coercion the second hop in any multi-hop walk throws
+    // "ctx.queried.add is not a function" and the lookup short-
+    // circuits to found=false.
     transport.onRequest('lookup_step', async (_fromId, payload) => {
-      return await this._lookupStep(payload);
+      const queried = payload?.queried instanceof Set
+        ? payload.queried
+        : Array.isArray(payload?.queried)
+            ? new Set(payload.queried)
+            : new Set();
+      return await this._lookupStep({
+        sourceId:    payload.sourceId,
+        targetKey:   payload.targetKey,
+        hops:        payload.hops,
+        path:        payload.path,
+        trace:       payload.trace,
+        queried,
+        totalTimeMs: payload.totalTimeMs,
+      });
     });
 
     // ── lookahead_probe — AP-best forward synapse to target ─────────
@@ -2124,12 +2145,19 @@ export class AxonaPeer extends DHT {
       probeTargets.map(peerId => node.transport.send(peerId, 'local_probe', null))
     );
 
+    // Dead-peer filter (#48): _localCandidate used to return any peer
+    // a probe-target advertised even if WE had just marked that peer
+    // dead.  The _evictAndReplace caller would then admit the same
+    // dead peer back into the synaptome via _addByVitality, undoing
+    // the eviction.  Filter dead ids at assembly time.
+    const dead = node._deadPeers || new Set();
     const candidates = [];
     outer:
     for (const r of settled) {
       if (r.status !== 'fulfilled' || !Array.isArray(r.value)) continue;
       for (const id of r.value) {
         if (id === node.id) continue;
+        if (dead.has(id)) continue;
         if (node.synaptome.has(id)) continue;
         const stratum = clz264(node.id ^ id);
         if (stratum < lo || stratum > hi) continue;
