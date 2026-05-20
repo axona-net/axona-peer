@@ -218,14 +218,20 @@ export async function deriveIdentity(opts = {}) {
   const region = await resolveRegion(regionOpts);
   const kernel = await kernelDeriveIdentity({ lat: region.lat, lng: region.lng });
 
-  // Top 64 bits of the kernel hex id = same S2 prefix (top 8 bits)
-  // + 56 bits of the pubkey-derived hash.  Deterministic from
-  // pubkey, preserves geographic routing locality.
-  const idLegacyBigInt = BigInt('0x' + kernel.id.slice(0, 16));
+  // v1.1: full-width 264-bit node ID.  Previously this took the top
+  // 64 bits of the kernel hex; peer addresses then lived in a 64-bit
+  // space while topic IDs were 264-bit, so K-closest XOR distance
+  // for pub/sub compared apples (peers) against oranges (topics) and
+  // accidentally only differed in the bottom 64 bits.  The new id is
+  // the full kernel nodeId — same 264-bit space topic IDs occupy,
+  // so XOR distance is meaningful (top 8 bits = S2 region prefix
+  // on both peer IDs and topic IDs, matching publisher-keyed topics
+  // to same-region peers as F1 intended).
+  const idBigInt = BigInt('0x' + kernel.id);
 
   const identity = {
-    // Legacy
-    id:         idLegacyBigInt,
+    // Legacy field name preserved; value is now 264-bit BigInt.
+    id:         idBigInt,
     geoBits:    GEO_BITS,
     region,
     createdAt:  kernel.createdAt ?? Date.now(),
@@ -300,7 +306,7 @@ async function resolveRegion(opts) {
 function persist(identity) {
   if (typeof localStorage === 'undefined') return;
   const serialized = JSON.stringify({
-    id:        identity.id.toString(16).padStart(16, '0'),
+    id:        identity.id.toString(16).padStart(66, '0'),
     geoBits:   identity.geoBits,
     region:    identity.region,
     createdAt: identity.createdAt,

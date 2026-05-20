@@ -63,7 +63,9 @@ import { deriveIdentity, getCurrentIdentity } from './identity.js';
 
 // ── ID encoding helpers ──────────────────────────────────────────────
 
-function idToHex(id) { return id.toString(16).padStart(16, '0'); }
+// v1.1: 264-bit node IDs — 66 hex chars (8-bit S2 prefix + 256-bit
+// keyed hash).  Same width as topic IDs so XOR distance is meaningful.
+function idToHex(id) { return id.toString(16).padStart(66, '0'); }
 function hexToId(hex) { return BigInt('0x' + hex); }
 
 // ── Public class ─────────────────────────────────────────────────────

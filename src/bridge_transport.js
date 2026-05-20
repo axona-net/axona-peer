@@ -164,7 +164,7 @@ export class BridgeTransport extends Transport {
     if (!this.ownsPeer(nodeId) && nodeId !== BRIDGE_CONN_ID) {
       this._log('bridge-notify-not-bridge-peer', {
         nodeId: typeof nodeId === 'bigint'
-          ? nodeId.toString(16).padStart(16, '0') : String(nodeId),
+          ? nodeId.toString(16).padStart(66, '0') : String(nodeId),
         type,
       });
       return;

@@ -26,6 +26,11 @@ import {
   getCurrentIdentity,
   deriveIdentity,
 } from './identity.js';
+// v1.1: region-keyed topics use a synthetic publisher whose top 8
+// bits match the chosen region's S2 cell, so deriveTopicId emits a
+// topic ID with that S2 prefix and us-east peers (S2='df') become
+// naturally XOR-closest to us-east topics.
+import { geoCellId }   from '../vendor/axona-protocol/src/utils/s2.js';
 // Shared codec: same BigInt + Set conventions as mesh.js and the
 // bridge's server.js — keeps every channel on one wire format.
 import { encode, decode } from './wire.js';
@@ -41,7 +46,7 @@ import { encode, decode } from './wire.js';
 // where the bfcache can serve a stale module set for ages).  The
 // bridge version arrives separately in its `welcome` message; the
 // "version" row in the me panel shows both side by side.
-const PEER_VERSION = '1.0.4';
+const PEER_VERSION = '1.1.0';
 
 const BRIDGE_PING_INTERVAL_MS = 1000;
 const BRIDGE_STALE_PONG_MS    = 3000;
@@ -847,7 +852,10 @@ function showRegionPicker() {
 
 function fmtNodeId(id) {
   if (typeof id !== 'bigint') return '—';
-  return id.toString(16).padStart(16, '0');
+  // v1.1: 264-bit (66-char hex) IDs.  Display in full so users can
+  // verify the S2 prefix and pubkey-derived hash match what their
+  // tools expect; the mono class keeps it inline.
+  return id.toString(16).padStart(66, '0');
 }
 
 async function bootAxonaNode(opts = {}) {
@@ -869,7 +877,7 @@ async function bootAxonaNode(opts = {}) {
   // `window.axona.subs()`, etc.  All read-only — no setters that could
   // accidentally tamper with running state.
   const hex = (id) => typeof id === 'bigint'
-    ? id.toString(16).padStart(16, '0')
+    ? id.toString(16).padStart(66, '0')
     : String(id);
 
   window.axona = {
@@ -923,7 +931,10 @@ async function bootAxonaNode(opts = {}) {
       const { deriveTopicId } = await import(
         '../vendor/axona-protocol/src/pubsub/post.js'
       );
-      return deriveTopicId(null, `${regionId}/${eventName}`);
+      // v1.1: region-keyed — same synth publisher addSubscription /
+      // publishFromForm use, so DevTools shows the topic ID that's
+      // actually routed.
+      return deriveTopicId(regionSynthPublisher(regionId), `${regionId}/${eventName}`);
     },
     /** Run findKClosest for a topic.  Reveals WHICH K peers this node
      *  thinks are the topic's axon set — the most important diagnostic
@@ -1141,6 +1152,25 @@ function escapeHtml(s) {
   }[c]));
 }
 
+/**
+ * Build a 66-char synthetic publisher ID for `regionId` so the
+ * topic ID derives with the region's 8-bit S2 prefix.  All peers
+ * pick the same synth ID for the same region (geoCellId is
+ * deterministic from lat/lng), so publisher + subscriber produce
+ * identical topicIds and land on the same K-closest axon set.
+ *
+ * Shape: `<2 hex chars: regional S2 prefix> + <64 zero hex chars>`.
+ * Not a real peer's nodeId — it never signs anything; the envelope
+ * is signed by the calling peer's actual identity.privateKey, and
+ * `opts.publisher` here only controls deriveTopicId's prefix.
+ */
+function regionSynthPublisher(regionId) {
+  const region = REGIONS.find(r => r.id === regionId);
+  if (!region) return null;
+  const s2 = geoCellId(region.lat, region.lng, 8);
+  return s2.toString(16).padStart(2, '0') + '0'.repeat(64);
+}
+
 async function addSubscription(regionId, eventName) {
   if (!axonaNode) throw new Error('axona node not started yet');
   if (!REGIONS.find(r => r.id === regionId)) {
@@ -1155,10 +1185,12 @@ async function addSubscription(regionId, eventName) {
   const sub = { regionId, eventName, topic, handle: null, messages: [] };
   subscriptions.push(sub);
 
-  // Public-mode subscribe so anyone publishing under
-  // `${regionId}/${eventName}` reaches us (preserves the (region,
-  // event) public-channel UX from the legacy pubsubSubscribe path).
-  // Envelope shape: { msgId, ts, topic, message, signerPubkey?, signature? }.
+  // v1.1: region-keyed topic.  We pass a synthetic publisher ID
+  // whose top 8 bits = the region's S2 cell, so the derived
+  // topic ID has the region's S2 prefix and us-east peers (S2
+  // prefix matches) become the natural axon set.  Previously
+  // {publisher: null} produced a `00`-prefix global-bucket topic,
+  // which broke F1's geographic locality entirely.
   //
   // since: 'all' replays everything in the axon's pubsub cache for
   // this topic before live-tailing.  Matches the demo UX expectation
@@ -1166,6 +1198,7 @@ async function addSubscription(regionId, eventName) {
   // message — without this the new subscriber starts at a live tail
   // and never sees publishes that happened before its sub envelope
   // reached the K-closest axon.
+  const publisher = regionSynthPublisher(regionId);
   sub.handle = await axonaNode.sub(topic, (envelope) => {
     sub.messages.push({
       publisher: envelope.signerPubkey ?? null,
@@ -1177,7 +1210,7 @@ async function addSubscription(regionId, eventName) {
       sub.messages.shift();
     }
     renderSubscriptions();
-  }, { publisher: null, since: 'all' });
+  }, { publisher, since: 'all' });
 
   persistSubscriptions();
   renderSubscriptions();
@@ -1248,7 +1281,10 @@ async function recomputeKeyLabel(form, $keyEl) {
     const { deriveTopicId } = await import(
       '../vendor/axona-protocol/src/pubsub/post.js'
     );
-    const topicId = await deriveTopicId(null, `${form.regionId}/${form.eventName}`);
+    const topicId = await deriveTopicId(
+      regionSynthPublisher(form.regionId),
+      `${form.regionId}/${form.eventName}`,
+    );
     $keyEl.textContent = `topic id: ${topicId}`;
   } catch { $keyEl.textContent = '—'; }
 }
@@ -1275,12 +1311,15 @@ async function publishFromForm(form, $messageEl) {
   }
   const topic = `${form.regionId}/${eventName}`;
   try {
-    // Public-mode publish — `{publisher: null}` matches what
-    // addSubscription does so anyone with the same (region, event)
-    // string sees this message.  Signed by default (sign:true is
-    // the kernel's default); subscribers can verify signerPubkey
-    // per envelope.
-    const msgId = await axonaNode.pub(topic, message, { publisher: null });
+    // v1.1: region-keyed publish — `opts.publisher` is a synthetic
+    // ID whose top 8 bits carry the region's S2 prefix, matching
+    // what addSubscription does so the derived topic ID lands in
+    // the region's address space (us-east peers ↔ us-east topics).
+    // Signed by default (sign:true is the kernel default); the
+    // envelope's signerPubkey is the real publisher's pubkey —
+    // the synthetic ID only steers deriveTopicId's S2 prefix.
+    const publisher = regionSynthPublisher(form.regionId);
+    const msgId = await axonaNode.pub(topic, message, { publisher });
     console.log('[axona] published', { topic, msgId });
     appendLog('pubsub:published', `${form.regionId}/${eventName} → ${msgId}`);
     $messageEl.value = '';
@@ -1456,7 +1495,7 @@ $lookupGo.addEventListener('click', async () => {
       found:  result?.found,
       hops:   result?.hops,
       time:   result?.time,
-      path:   (result?.path ?? []).map(id => id.toString(16).padStart(16, '0')),
+      path:   (result?.path ?? []).map(id => id.toString(16).padStart(66, '0')),
     }, null, 2);
   } catch (err) {
     $lookupResult.textContent = 'error: ' + err.message;

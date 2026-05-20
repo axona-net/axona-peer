@@ -36,21 +36,22 @@ async function testFreshIdentity() {
   const ident = await deriveIdentity({ region });
 
   check('id is a BigInt',                typeof ident.id === 'bigint');
-  check('id is 64-bit (< 2^64)',          ident.id < (1n << 64n));
+  check('id is 264-bit (< 2^264)',        ident.id < (1n << 264n));
   check('geoBits === 8',                  ident.geoBits === 8);
   check('region matches input',           ident.region.id === 'us-east');
   check('region.source = user-selected',  ident.region.source === 'user-selected');
   check('createdAt is a recent timestamp', ident.createdAt > Date.now() - 1000);
 
   // Top 8 bits should encode the S2 cell for the picked lat/lng.
-  // We don't recompute geoCellId here, but we can verify the top
-  // bits are stable: deriving twice for the same region gives the
-  // same top-8-bits (different bottom bits if rotated).
+  // With v1.1's 264-bit IDs the top-8-bits live at bit positions
+  // 256..263 (>> 256n).  Bottom 256 bits derive from sha256(pubkey)
+  // so they differ between fresh keypairs while the S2 prefix stays
+  // pinned to the region.
   const ident2 = await rotateIdentity({ region });
   check('rotated id has same top 8 bits',
-    (ident.id >> 56n) === (ident2.id >> 56n));
-  check('rotated id has different bottom 56 bits',
-    (ident.id & ((1n << 56n) - 1n)) !== (ident2.id & ((1n << 56n) - 1n)));
+    (ident.id >> 256n) === (ident2.id >> 256n));
+  check('rotated id has different bottom 256 bits',
+    (ident.id & ((1n << 256n) - 1n)) !== (ident2.id & ((1n << 256n) - 1n)));
 }
 
 async function testPersistence() {
@@ -68,12 +69,15 @@ async function testPersistence() {
   check('persisted region matches created',         loaded.region.id === 'asia-east');
   check('persisted geoBits matches',                loaded.geoBits === created.geoBits);
 
-  // deriveIdentity called again returns the same id (does not
-  // generate fresh).  This is the "known node fast path" the user
-  // asked for.
+  // v1.0.2: deriveIdentity ALWAYS re-derives the kernel identity now
+  // (Web Crypto CryptoKey can't be persisted, so we can't restore the
+  // signing key from sessionStorage; we re-generate a fresh keypair
+  // each call).  The persisted region is honoured so the S2 prefix
+  // is stable across reloads — the bottom 256 bits change because
+  // they're derived from sha256(pubkey).
   const reDerived = await deriveIdentity({ region });
-  check('deriveIdentity returns persisted id (fast path)',
-    reDerived.id === created.id);
+  check('deriveIdentity preserves S2 prefix on persisted region',
+    (reDerived.id >> 256n) === (created.id >> 256n));
 }
 
 async function testRotation() {

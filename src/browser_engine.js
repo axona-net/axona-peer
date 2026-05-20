@@ -266,7 +266,7 @@ export class BrowserEngine {
           const h = peer._directHandlers?.get(type);
           if (!h) return false;
           try {
-            await h(payload, { fromId: self.toString(16).padStart(16, '0'), type });
+            await h(payload, { fromId: self.toString(16).padStart(66, '0'), type });
             return true;
           } catch (err) {
             console.error('BrowserEngine self-sendDirect handler threw:', err);
@@ -284,7 +284,7 @@ export class BrowserEngine {
         // it can't reach the target.  Return true optimistically so
         // AxonManager's child-dead-detection doesn't false-positive.
         peer.routeMessage(peerId, '__tunneled_direct__', {
-          targetId:  peerId.toString(16).padStart(16, '0'),
+          targetId:  peerId.toString(16).padStart(66, '0'),
           innerType: type,
           innerPayload: payload,
         }).catch(err => console.error('BrowserEngine routed sendDirect failed:', err));

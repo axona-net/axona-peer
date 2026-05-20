@@ -133,7 +133,7 @@ export class CompositeTransport extends Transport {
       // this when fan-out targets can't be reached.
       this._log('notify-no-route', {
         nodeId: typeof nodeId === 'bigint'
-          ? nodeId.toString(16).padStart(16, '0')
+          ? nodeId.toString(16).padStart(66, '0')
           : String(nodeId),
         type,
       });
