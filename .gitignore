@@ -1,3 +1,6 @@
 .DS_Store
 *.log
 node_modules/
+
+# Local Claude Preview launch config (per-machine dev server settings)
+.claude/

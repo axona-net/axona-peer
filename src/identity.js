@@ -190,15 +190,32 @@ export async function deriveIdentity(opts = {}) {
   // Persistence note: today this regenerates a fresh keypair on
   // every call (kernel's CryptoKey isn't directly serialisable to
   // sessionStorage; need dumpIdentity / loadIdentity to round-trip
-  // through PKCS#8).  Persisted (legacy 64-bit id, region) is
-  // ignored — we re-derive both.  Long-term: switch persistence
-  // to the kernel's dumpIdentity/loadIdentity envelope.
-  if (!opts.rotate) {
+  // through PKCS#8).  The persisted entry's `region` is honoured
+  // so the user keeps the same S2 prefix (and so the same
+  // routing-table neighborhood) across reloads, but the 64-bit
+  // `id` and keypair are always re-derived because the persisted
+  // legacy shape lacks the kernel fields (privateKey + pubkeyHex)
+  // that peer.pub needs to sign envelopes.
+  //
+  // Previously this returned the persisted legacy identity as-is
+  // when one existed — that left AxonaPeer with no privateKey, so
+  // peer.pub failed with PUBLISH_SIGN_FAILED on every publish
+  // attempt.  The early-return is intentionally gone: we now
+  // ALWAYS re-derive the kernel identity, falling back to the
+  // persisted region (if any) so the S2 prefix is stable.
+  // Long-term: switch persistence to the kernel's
+  // dumpIdentity/loadIdentity PKCS#8 envelope and restore truly
+  // stable IDs.
+  let regionOpts = opts;
+  if (!opts.rotate && !opts.region) {
     const existing = getCurrentIdentity();
-    if (existing && !opts.upgrade) return existing;
+    if (existing?.region && Number.isFinite(existing.region.lat)
+                          && Number.isFinite(existing.region.lng)) {
+      regionOpts = { ...opts, region: existing.region };
+    }
   }
 
-  const region = await resolveRegion(opts);
+  const region = await resolveRegion(regionOpts);
   const kernel = await kernelDeriveIdentity({ lat: region.lat, lng: region.lng });
 
   // Top 64 bits of the kernel hex id = same S2 prefix (top 8 bits)
