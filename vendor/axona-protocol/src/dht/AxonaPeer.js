@@ -141,6 +141,10 @@ export class AxonaPeer extends DHT {
     /** @type {Map<string, Function>} direct-message type → handler */
     this._directHandlers = new Map();
 
+    // ─── Routing-handler install flag (Phase 5e follow-up) ───────
+    /** True once start() has called transport.onRequest('lookup_step') etc. */
+    this._routingHandlersInstalled = false;
+
     // ─── Per-peer lookup stats (Phase 5b — own them) ──────────────
     // Before Phase 5b these lived as engine._nodeStats — one entry per
     // node, keyed by the NeuronNode.  Read sites (peer.getMetrics) and
@@ -201,7 +205,45 @@ export class AxonaPeer extends DHT {
       }
     });
 
+    // Phase 5e follow-up: wire the receiver-side routing handlers
+    // when a transport is available.  Standalone peers (constructed
+    // with just { domain, node, transport }) need this so the
+    // kernel's _lookupStep recursion through transport.send finds
+    // a registered handler on each forwarder.
+    //
+    // In the simulator path the engine wires these via
+    // _registerNH1Handlers BEFORE we get here.  Re-registering is
+    // safe — transport handler maps overwrite by `type`, and the
+    // handler we install delegates to the same peer._lookupStep
+    // method the engine's wrapper would call.  Skipped entirely
+    // when no transport is attached (the legacy engine-driven path
+    // in dht-sim sets node.transport from network.makeTransport
+    // before constructing the peer, so the receive path is wired
+    // either way).
+    if (this._node?.transport && typeof this._node.transport.onRequest === 'function') {
+      this._installRoutingHandlers();
+    }
+
     this._started = true;
+  }
+
+  /**
+   * Install transport-side handlers for routed messages the peer
+   * understands.  Today: just 'lookup_step' (the per-hop routing
+   * tick).  Future handlers (reinforce / triadic_introduce /
+   * lateral_spread / hop_cache / route_msg / lookahead_probe /
+   * local_probe / find_closest_set) can be added here as their
+   * peer-side bodies migrate out of the engine.
+   */
+  _installRoutingHandlers() {
+    const transport = this._node.transport;
+    if (this._routingHandlersInstalled) return;
+
+    transport.onRequest('lookup_step', async (_fromId, payload) => {
+      return await this._lookupStep(payload);
+    });
+
+    this._routingHandlersInstalled = true;
   }
 
   async stop() {
