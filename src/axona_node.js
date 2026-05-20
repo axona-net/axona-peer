@@ -160,7 +160,14 @@ export class AxonaNode {
 
     this._registerNH1Handlers();
 
-    this._peer = new AxonaPeer({ engine: this._engine, node: this._node });
+    // I3: pass identity to AxonaPeer so the kernel's unified pub/sub
+    // API (peer.pub) can build signed envelopes.  The legacy
+    // pubsubPublish path doesn't read this; only peer.pub does.
+    this._peer = new AxonaPeer({
+      engine:   this._engine,
+      node:     this._node,
+      identity: this._identity,
+    });
     await this._peer.start();
 
     // Real DHT-based pub/sub via the protocol's AxonManager.  Engine

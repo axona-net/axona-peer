@@ -15,7 +15,8 @@
     "smoke:replay":    "node src/smoke_pubsub_replay.js",
     "smoke:self-replay": "node src/smoke_pubsub_self_replay.js",
     "smoke:gate":      "node src/smoke_version_gate.js",
-    "smoke:kernel":    "node src/smoke_kernel_path.js"
+    "smoke:kernel":    "node src/smoke_kernel_path.js",
+    "smoke:kernel-pubsub": "node src/smoke_kernel_pubsub.js"
   },
   "engines": { "node": ">=20.0.0" },
   "devDependencies": {

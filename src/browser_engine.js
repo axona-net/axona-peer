@@ -169,6 +169,20 @@ export class BrowserEngine {
     this._peerByNode.set(node, peer);
   }
 
+  /**
+   * I3 (unified-API consumer): alias `axonManagerFor` → `axonFor`
+   * so the kernel's `AxonaPeer._requireAxonManager` resolution
+   * chain finds our per-node AxonManager.  Lets consumers use
+   * `peer.pub`, `peer.sub`, `peer.pull`, `peer.metrics` directly
+   * without the SDK having to pre-stash an axonManager handle.
+   * Without this alias the kernel falls through to checking
+   * `engine._axonManagers` (a Map keyed by hex node id) which
+   * BrowserEngine doesn't expose; throws PUBLISH_INVALID_TOPIC.
+   */
+  axonManagerFor(node) {
+    return this.axonFor(node);
+  }
+
   axonFor(node) {
     if (!node) throw new Error('axonFor: node required');
     const cached = this._axonByNode.get(node);
