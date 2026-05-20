@@ -41,7 +41,7 @@ import { encode, decode } from './wire.js';
 // where the bfcache can serve a stale module set for ages).  The
 // bridge version arrives separately in its `welcome` message; the
 // "version" row in the me panel shows both side by side.
-const PEER_VERSION = '1.0.0';
+const PEER_VERSION = '1.0.1';
 
 const BRIDGE_PING_INTERVAL_MS = 1000;
 const BRIDGE_STALE_PONG_MS    = 3000;
@@ -1247,26 +1247,39 @@ async function recomputeKeyLabel(form, $keyEl) {
 }
 
 async function publishFromForm(form, $messageEl) {
-  if (!axonaNode) return;
+  console.log('[axona] publishFromForm fired', { form, value: $messageEl?.value });
+  if (!axonaNode) { console.warn('[axona] publish aborted: axonaNode not ready'); return; }
   const eventName = form.eventName.trim();
   const message   = $messageEl.value;
-  if (!eventName) { appendLog('pubsub:publish-skip', 'event name required', 'error'); return; }
-  if (!message)   { appendLog('pubsub:publish-skip', 'message required',    'error'); return; }
-  if (!REGIONS.find(r => r.id === form.regionId)) {
-    appendLog('pubsub:publish-skip', 'unknown region', 'error'); return;
+  if (!eventName) {
+    console.warn('[axona] publish skipped: event name required');
+    appendLog('pubsub:publish-skip', 'event name required', 'error');
+    return;
   }
+  if (!message) {
+    console.warn('[axona] publish skipped: message body empty');
+    appendLog('pubsub:publish-skip', 'message required', 'error');
+    return;
+  }
+  if (!REGIONS.find(r => r.id === form.regionId)) {
+    console.warn('[axona] publish skipped: unknown region', form.regionId);
+    appendLog('pubsub:publish-skip', 'unknown region', 'error');
+    return;
+  }
+  const topic = `${form.regionId}/${eventName}`;
   try {
-    const topic = `${form.regionId}/${eventName}`;
     // Public-mode publish — `{publisher: null}` matches what
     // addSubscription does so anyone with the same (region, event)
     // string sees this message.  Signed by default (sign:true is
     // the kernel's default); subscribers can verify signerPubkey
     // per envelope.
     const msgId = await axonaNode.pub(topic, message, { publisher: null });
+    console.log('[axona] published', { topic, msgId });
     appendLog('pubsub:published', `${form.regionId}/${eventName} → ${msgId}`);
     $messageEl.value = '';
   } catch (err) {
-    appendLog('pubsub:publish-failed', err.message, 'error');
+    console.error('[axona] publish failed', { topic, message, err });
+    appendLog('pubsub:publish-failed', err.message ?? String(err), 'error');
   }
 }
 
