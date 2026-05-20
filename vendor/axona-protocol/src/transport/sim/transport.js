@@ -127,10 +127,24 @@ export class SimTransport extends Transport {
       'SimTransport.start: localNodeId or constructor identity required');
   }
 
+  /**
+   * Normalise a public peerId argument.  start() converts BigInt
+   * IDs to 264-bit hex; the rest of the public surface
+   * (openConnection / send / notify / isConnected / getLatency /
+   * closeConnection) should do the same so callers can use BigInt
+   * IDs end-to-end (matches the AxonaPeer routing layer, which
+   * keeps Synapse.peerId as BigInt for XOR math).
+   */
+  _normPeerId(peerId) {
+    if (typeof peerId === 'bigint') return toHex(peerId);
+    return peerId;
+  }
+
   // ─── Channel pool ──────────────────────────────────────────────────
 
   async openConnection(peerId) {
     this._assertStarted();
+    peerId = this._normPeerId(peerId);
     const target = this._network._lookup(peerId);
     if (!target) return false;
     if (peerId === this._localId) return false;
@@ -155,11 +169,12 @@ export class SimTransport extends Transport {
 
   async closeConnection(peerId) {
     if (!this._started) return;
+    peerId = this._normPeerId(peerId);
     await this._closeChannel(peerId, /* notify */ true);
   }
 
   isConnected(peerId) {
-    return this._openTo.has(peerId);
+    return this._openTo.has(this._normPeerId(peerId));
   }
 
   async _closeChannel(peerId, notify) {
@@ -185,6 +200,7 @@ export class SimTransport extends Transport {
 
   async send(peerId, type, payload) {
     this._assertStarted();
+    peerId = this._normPeerId(peerId);
     if (!this._openTo.has(peerId)) {
       throw new TransportError(ErrorCodes.TRANSPORT_CHANNEL_CLOSED,
         `SimTransport.send: no open channel to ${peerId}`,
@@ -226,6 +242,7 @@ export class SimTransport extends Transport {
 
   async notify(peerId, type, payload) {
     this._assertStarted();
+    peerId = this._normPeerId(peerId);
     if (!this._openTo.has(peerId)) {
       throw new TransportError(ErrorCodes.TRANSPORT_CHANNEL_CLOSED,
         `SimTransport.notify: no open channel to ${peerId}`,
@@ -272,7 +289,7 @@ export class SimTransport extends Transport {
   }
 
   getLatency(peerId) {
-    return this._latency.get(peerId) ?? -1;
+    return this._latency.get(this._normPeerId(peerId)) ?? -1;
   }
 
   // ─── Heartbeat ─────────────────────────────────────────────────────

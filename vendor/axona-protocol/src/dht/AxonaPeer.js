@@ -1721,10 +1721,16 @@ export class AxonaPeer extends DHT {
     return true;
   }
 
-  /** LTP reinforcement wave along a successful lookup trace. */
+  /** LTP reinforcement wave along a successful lookup trace.  The
+   *  first trace entry's `fromId` is this peer itself (we're the
+   *  lookup source); skip the self-notify — transport.notify doesn't
+   *  support self-loops, and any local LTP for our own synapse is
+   *  handled inline by _lookupStep without going through the wire. */
   _reinforceWave(trace) {
+    const selfId = this._node.id;
     for (let i = trace.length - 1; i >= 0; i--) {
       const { fromId, synapse } = trace[i];
+      if (fromId === selfId) continue;
       this._node.transport.notify(fromId, 'reinforce', { synapsePeerId: synapse.peerId })
         .catch(err => console.error('AxonaPeer: reinforce notify failed:', err));
     }
