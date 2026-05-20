@@ -113,6 +113,16 @@ async function main() {
     process.exit(2);
   }
 
+  // ── Derive identity FIRST (kernel-backed deriveIdentity is async
+  //    via Web Crypto and can yield to the event loop; the bridge's
+  //    initial 'hello' notification arrives ms after admission, so
+  //    we want the message listener attached + node ready before
+  //    those frames land).
+  store.clear();
+  const identity = await deriveIdentity({
+    region: REGIONS.find(r => r.id === 'us-east'),
+  });
+
   // ── Open a WebSocket to the bridge + send client-hello so the
   //    bridge admits us past its version gate.
   const ws = await new Promise((resolve, reject) => {
@@ -123,12 +133,6 @@ async function main() {
       resolve(sock);
     });
     sock.on('error', reject);
-  });
-
-  // ── Construct an AxonaNode with a BridgeTransport adapter ────────
-  store.clear();
-  const identity = await deriveIdentity({
-    region: REGIONS.find(r => r.id === 'us-east'),
   });
 
   const mesh = new StubMesh();

@@ -133,6 +133,10 @@ class FakeMesh {
 async function buildBrowser(name, region, meshId) {
   store.clear();
   forgetIdentity();
+  // I3 / #46: derive identity FIRST.  Kernel deriveIdentity is async
+  // via Web Crypto; bridge sends hello ms after admit.  Identity-
+  // before-WS avoids missing the initial hello frame.
+  const identity = await deriveIdentity({ region: REGIONS.find(r => r.id === region) });
   const ws = await new Promise((resolve, reject) => {
     const s = new WebSocket(BRIDGE_URL);
     s.on('open', () => {
@@ -142,7 +146,6 @@ async function buildBrowser(name, region, meshId) {
     });
     s.on('error', reject);
   });
-  const identity = await deriveIdentity({ region: REGIONS.find(r => r.id === region) });
   const mesh = new FakeMesh(meshId);
   const bridgeAdapter = {
     sendToBridge(msg) {

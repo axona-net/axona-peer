@@ -101,6 +101,10 @@ class StubMesh {
 async function buildBrowser(name, region) {
   store.clear();
   forgetIdentity();
+  // I3 / #46: derive identity before WS (async Web Crypto could
+  // otherwise let the bridge's initial hello arrive before the
+  // message listener is attached).
+  const identity = await deriveIdentity({ region: REGIONS.find(r => r.id === region) });
   const ws = await new Promise((resolve, reject) => {
     const s = new WebSocket(BRIDGE_URL);
     s.on('open', () => {
@@ -110,7 +114,6 @@ async function buildBrowser(name, region) {
     });
     s.on('error', reject);
   });
-  const identity = await deriveIdentity({ region: REGIONS.find(r => r.id === region) });
   const mesh = new StubMesh();
   const bridgeAdapter = {
     sendToBridge(msg) {

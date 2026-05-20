@@ -160,6 +160,14 @@ async function buildBrowser(name, region, meshId) {
   store.clear();
   forgetIdentity();
 
+  // I3 / #46: derive identity FIRST.  Kernel deriveIdentity is async
+  // via Web Crypto and yields to the event loop; bridge admits +
+  // sends hello ms after WS open, so we want the identity ready
+  // and the message listener attached before those frames land.
+  const identity = await deriveIdentity({
+    region: REGIONS.find(r => r.id === region),
+  });
+
   const ws = await new Promise((resolve, reject) => {
     const sock = new WebSocket(BRIDGE_URL);
     sock.on('open', () => {
@@ -168,10 +176,6 @@ async function buildBrowser(name, region, meshId) {
       resolve(sock);
     });
     sock.on('error', reject);
-  });
-
-  const identity = await deriveIdentity({
-    region: REGIONS.find(r => r.id === region),
   });
 
   const mesh = new FakeMesh(meshId);

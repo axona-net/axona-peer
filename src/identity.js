@@ -34,20 +34,9 @@
 // Where Identity = { id: bigint, geoBits: number, region: {...} }
 // =====================================================================
 
-import { geoCellId } from '../vendor/axona-protocol/src/utils/s2.js';
-import { randomU32 } from '../vendor/axona-protocol/src/utils/geo.js';
-
-// Local 64-bit random helper.  @axona/protocol v1.0 dropped randomU64
-// in favour of the 264-bit primitives in utils/hexid.js; we keep this
-// shim alive only for the legacy BigInt-id path inside axona-peer.
-// When axona-peer migrates to the kernel's 264-bit hex identities,
-// identity.js will switch to deriveIdentity() from the kernel and this
-// shim disappears.
-function randomU64() {
-  const hi = BigInt(randomU32());
-  const lo = BigInt(randomU32());
-  return (hi << 32n) | lo;
-}
+import { geoCellId }              from '../vendor/axona-protocol/src/utils/s2.js';
+import { deriveIdentity as kernelDeriveIdentity }
+                                  from '../vendor/axona-protocol/src/identity/index.js';
 
 const STORAGE_KEY = 'axona.identity.v1';
 const GEO_BITS    = 8;
@@ -135,6 +124,15 @@ export function getCurrentIdentity() {
   try {
     const stored = JSON.parse(raw);
     if (typeof stored.id !== 'string') return null;
+    // I3 / #46 note: sessionStorage carries only the LEGACY fields
+    // (id BigInt as hex, region, geoBits, createdAt).  The kernel
+    // fields (privateKey + pubkeyHex) are not persistable directly
+    // (Web Crypto CryptoKey isn't JSON-serialisable) and need to
+    // round-trip through dumpIdentity/loadIdentity PKCS#8 envelopes.
+    // Until kernel-format persistence lands, getCurrentIdentity
+    // returns the legacy shape only — consumers that need the
+    // kernel fields (peer.pub signed publishes) must trigger a
+    // re-derive via deriveIdentity({ upgrade: true }) or rotate.
     return {
       id:        BigInt('0x' + stored.id),
       geoBits:   stored.geoBits ?? GEO_BITS,
@@ -167,22 +165,58 @@ export function getCurrentIdentity() {
  * @returns {Promise<Identity>}
  */
 export async function deriveIdentity(opts = {}) {
+  // I3 / #46: wrap kernel deriveIdentity for Ed25519 keys + 264-bit
+  // hex nodeId.  Returned shape is a HYBRID:
+  //
+  //   · legacy fields (preserved for existing consumers)
+  //       id        — 64-bit BigInt (top 64 bits of kernel hex id,
+  //                   preserves S2 prefix in top 8 bits, bottom 56
+  //                   bits deterministic from pubkey)
+  //       geoBits   — 8
+  //       region    — { id, label, lat, lng, source }
+  //       createdAt — ms
+  //
+  //   · kernel fields (new — unlock signed-publish + 264-bit routing)
+  //       idHex      — 66-char hex (kernel's full 264-bit nodeId)
+  //       pubkey     — Uint8Array
+  //       privateKey — Web Crypto Ed25519 CryptoKey
+  //       pubkeyHex  — 64-char hex
+  //
+  // Bridge handshake + Synapse / NeuronNode / mesh.js still operate
+  // on the legacy 64-bit `id`; peer.pub / peer.sub use the kernel
+  // identity directly (privateKey + pubkeyHex for signing, idHex
+  // for topic-id derivation in publisher-keyed mode).
+  //
+  // Persistence note: today this regenerates a fresh keypair on
+  // every call (kernel's CryptoKey isn't directly serialisable to
+  // sessionStorage; need dumpIdentity / loadIdentity to round-trip
+  // through PKCS#8).  Persisted (legacy 64-bit id, region) is
+  // ignored — we re-derive both.  Long-term: switch persistence
+  // to the kernel's dumpIdentity/loadIdentity envelope.
   if (!opts.rotate) {
     const existing = getCurrentIdentity();
-    if (existing) return existing;
+    if (existing && !opts.upgrade) return existing;
   }
 
   const region = await resolveRegion(opts);
-  const prefix = geoCellId(region.lat, region.lng, GEO_BITS);
-  const shift  = 64n - BigInt(GEO_BITS);
-  const bottom = randomU64() & ((1n << shift) - 1n);
-  const id     = (BigInt(prefix) << shift) | bottom;
+  const kernel = await kernelDeriveIdentity({ lat: region.lat, lng: region.lng });
+
+  // Top 64 bits of the kernel hex id = same S2 prefix (top 8 bits)
+  // + 56 bits of the pubkey-derived hash.  Deterministic from
+  // pubkey, preserves geographic routing locality.
+  const idLegacyBigInt = BigInt('0x' + kernel.id.slice(0, 16));
 
   const identity = {
-    id,
-    geoBits:   GEO_BITS,
+    // Legacy
+    id:         idLegacyBigInt,
+    geoBits:    GEO_BITS,
     region,
-    createdAt: Date.now(),
+    createdAt:  kernel.createdAt ?? Date.now(),
+    // Kernel
+    idHex:      kernel.id,
+    pubkey:     kernel.pubkey,
+    privateKey: kernel.privateKey,
+    pubkeyHex:  kernel.pubkeyHex,
   };
 
   persist(identity);

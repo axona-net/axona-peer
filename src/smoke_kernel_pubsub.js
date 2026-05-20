@@ -103,13 +103,10 @@ async function main() {
   check('peer.sub returned a Subscription with a topicId',
     sub && typeof sub.topicId === 'string' && sub.topicId.length === 66);
 
-  // ── peer.pub (unsigned — legacy identity lacks Ed25519 keys) ────
-  // axona-peer's identity.js currently returns 64-bit BigInt
-  // identities without privateKey / pubkeyHex.  The kernel's
-  // signed-publish path needs those fields; until I4/I5 migrate
-  // axona-peer to the kernel's deriveIdentity() (which produces a
-  // 264-bit Ed25519 identity), this smoke uses { sign: false }.
-  const msgId = await peer.pub(topic, payload, { sign: false });
+  // ── peer.pub (signed — #46 wired Ed25519 into identity.js) ──────
+  // identity.js now wraps the kernel's deriveIdentity, so the peer
+  // has privateKey + pubkeyHex available.  Default sign:true.
+  const msgId = await peer.pub(topic, payload);
   check('peer.pub returned a 64-char hex msgId',
     typeof msgId === 'string' && msgId.length === 64);
 
@@ -123,12 +120,14 @@ async function main() {
   check('envelope.message matches publish payload',  received[0]?.message?.hello === 'unified API');
   check('envelope.message.n round-trips',            received[0]?.message?.n === 42);
   check('envelope.msgId matches publish return',     received[0]?.msgId === msgId);
-  // Unsigned publish — no signerPubkey / signature fields.
+  check('envelope.signerPubkey matches identity',
+    received[0]?.signerPubkey === A._identity.pubkeyHex);
+  check('envelope has ed25519 signature',
+    received[0]?.signature?.startsWith?.('ed25519:'));
 
   // ── peer.pull ────────────────────────────────────────────────────
-  // Legacy identity.id is a BigInt; AxonaPeer._nodeIdHex pads to 16
-  // chars.  For pull, pass the same hex form the peer would have
-  // used to derive the topic id.
+  // Pull needs the publisher's hex node id; with #46 the kernel
+  // identity is available on A._identity.idHex.
   const publisher = peer._nodeIdHex();
   const pulled    = await peer.pull(msgId, { topic, publisher });
   check('peer.pull returned the envelope',           pulled?.msgId === msgId);
@@ -167,7 +166,7 @@ async function main() {
     pubSub.topicId.slice(0, 2) === '00');
 
   const pubMsgId = await peer.pub('chat-room', { kind: 'hi' },
-    { publisher: null, sign: false });
+    { publisher: null });   // signed by default; public-topic but verifiable provenance
   check('peer.pub(public) returns a 64-char msgId',  pubMsgId?.length === 64);
 
   await new Promise(r => setTimeout(r, 20));
