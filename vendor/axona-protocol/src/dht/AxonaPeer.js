@@ -229,21 +229,113 @@ export class AxonaPeer extends DHT {
 
   /**
    * Install transport-side handlers for routed messages the peer
-   * understands.  Today: just 'lookup_step' (the per-hop routing
-   * tick).  Future handlers (reinforce / triadic_introduce /
-   * lateral_spread / hop_cache / route_msg / lookahead_probe /
-   * local_probe / find_closest_set) can be added here as their
-   * peer-side bodies migrate out of the engine.
+   * understands.  Phase 6 wires the LEARN/FORGET handlers so a
+   * group of peers driving lookups through Transport.sim converge
+   * to NH-1-quality success rate without an engine.
+   *
+   * Wired today:
+   *   · lookup_step       — the per-hop routing tick
+   *   · lookahead_probe   — answers "what's your AP-best forward
+   *                          synapse to target X?"
+   *   · reinforce         — LTP weight bump on a used synapse
+   *   · triadic_introduce — install a new synapse based on a
+   *                          transit-observer's recommendation
+   *   · hop_cache /
+   *     lateral_spread    — install a direct hop-cache synapse
+   *                          to a peer that just completed a
+   *                          successful lookup through us
+   *
+   * Not yet wired (low-impact for cold lookup success, queued):
+   *   · local_probe       — needed by _tryAnneal (anneal not run
+   *                          in the kernel-driven loop yet)
+   *   · route_msg         — needed by peer.routeMessage()
+   *   · find_closest_set  — needed by AxonManager K-closest queries
+   *
+   * Bodies are 1:1 mirrors of dht-sim/.../AxonaEngine.js's
+   * _registerNH1Handlers — the engine version uses
+   * `_addByVitality(node, syn)` (2 args); the peer version uses
+   * `this._addByVitality(syn)` (1 arg — node is self).
    */
   _installRoutingHandlers() {
-    const transport = this._node.transport;
+    const node      = this._node;
+    const transport = node.transport;
+    const domain    = this._domain;
     if (this._routingHandlersInstalled) return;
 
+    // ── lookup_step — chain forward ─────────────────────────────────
     transport.onRequest('lookup_step', async (_fromId, payload) => {
       return await this._lookupStep(payload);
     });
 
+    // ── lookahead_probe — AP-best forward synapse to target ─────────
+    transport.onRequest('lookahead_probe', async (_fromId, payload) => {
+      const target   = payload.target;
+      const fromDist = payload.fromDist;
+      const fwd = [];
+      for (const syn of node.synaptome.values()) {
+        if ((syn.peerId ^ target) < fromDist) fwd.push(syn);
+      }
+      if (fwd.length === 0) {
+        return { peerId: node.id, latency: 0, terminal: true };
+      }
+      const best = node.bestByAP(fwd, target, 0);
+      return { peerId: best.peerId, latency: best.latency, terminal: false };
+    });
+
+    // ── reinforce — LTP weight bump on a used synapse ───────────────
+    transport.onNotification('reinforce', (_fromId, payload) => {
+      const syn = node.synaptome.get(payload.synapsePeerId);
+      if (!syn) return;
+      // INERTIA_DURATION lives on the engine in the simulator path;
+      // the kernel uses simEpoch alone (Synapse.reinforce reads
+      // currentEpoch + inertiaDuration to set syn.inertia).  Pass
+      // a small inertia window so the synapse becomes immediately
+      // eligible for vitality-based eviction protection.
+      syn.reinforce(domain.simEpoch, domain.INERTIA_DURATION ?? 8);
+      syn.useCount = (syn.useCount ?? 0) + 1;
+    });
+
+    // ── triadic_introduce — observer-driven new synapse ─────────────
+    transport.onNotification('triadic_introduce', async (_fromId, payload) => {
+      if (node.synaptome.has(payload.peerId)) return;
+      const stratum = this._clz(node.id ^ payload.peerId);
+      const syn = new Synapse({ peerId: payload.peerId, latencyMs: 0, stratum });
+      syn.weight   = 0.5;
+      syn.inertia  = domain.simEpoch;
+      syn._addedBy = 'triadic';
+      await this._addByVitality(syn);
+    });
+
+    // ── hop_cache + lateral_spread — install direct cache synapse ──
+    const hopCacheHandler = async (_fromId, payload) => {
+      const targetId = payload.target;
+      const depth    = payload.depth ?? 0;
+      if (node.synaptome.has(targetId)) return;
+      if (targetId === node.id) return;
+      const stratum = this._clz(node.id ^ targetId);
+      const syn = new Synapse({ peerId: targetId, latencyMs: 0, stratum });
+      syn.weight   = 0.5;
+      syn.inertia  = domain.simEpoch;
+      syn._addedBy = depth === 0 ? 'hopCache' : 'lateralSpread';
+      await this._addByVitality(syn);
+    };
+    transport.onNotification('hop_cache',      hopCacheHandler);
+    transport.onNotification('lateral_spread', hopCacheHandler);
+
     this._routingHandlersInstalled = true;
+  }
+
+  /** clz over node.id ^ targetId — picks the right width based on
+   *  whether we're on the legacy 64-bit BigInt id path or the
+   *  264-bit hex id path.  Bootstrap synapses created in handlers
+   *  above need stratum=clz(...), and a clz64-vs-clz264 mismatch
+   *  here would put new synapses in the wrong bucket. */
+  _clz(xor) {
+    if (xor === 0n) return 64;
+    const hi = Number((xor >> 32n) & 0xFFFFFFFFn);
+    if (hi !== 0) return Math.clz32(hi);
+    const lo = Number(xor & 0xFFFFFFFFn);
+    return 32 + Math.clz32(lo);
   }
 
   async stop() {
