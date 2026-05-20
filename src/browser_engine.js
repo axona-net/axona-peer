@@ -220,7 +220,44 @@ export class BrowserEngine {
 
     const dht = {
       getSelfId:       () => peer.getNodeId(),
-      findKClosest:    (...args) => peer.findKClosest(...args),
+      // findKClosest (pubsub-flavoured):
+      // AxonaPeer.findKClosest walks the network via find_closest_set
+      // RPCs and returns peer IDs aggregated from every queried peer's
+      // routing tables — which in a long-lived test mesh frequently
+      // includes GHOST IDs (peers from prior tab sessions still cached
+      // in others' synaptomes).  Sending publish-k / subscribe-k to a
+      // ghost falls back to routed delivery via __tunneled_direct__;
+      // the walk terminates at the live peer closest to the ghost,
+      // which has no role for the topic, so no axon ever caches the
+      // message and cross-peer pub/sub silently drops every frame.
+      //
+      // Compute K-closest from peers we KNOW are reachable here:
+      //   1. self (we can always deliver to ourselves)
+      //   2. directly-bound peers (CompositeTransport.isConnected)
+      //   3. learned synaptome peers (outgoing + incoming)
+      // No network probe — the result is small but guaranteed reachable.
+      // Same code on publisher + subscriber lands on the same axon set
+      // for a given topicId, so replay+live-tail both find an overlap.
+      findKClosest:    async (targetId, K = 5) => {
+        const targetBig = typeof targetId === 'bigint'
+          ? targetId
+          : BigInt('0x' + String(targetId));
+        const dist = new Map();
+        const selfId = peer.getNodeId();
+        if (typeof selfId === 'bigint') dist.set(selfId, selfId ^ targetBig);
+        for (const syn of node.synaptome?.values?.() ?? []) {
+          const pid = syn.peerId;
+          if (typeof pid === 'bigint' && !dist.has(pid)) dist.set(pid, pid ^ targetBig);
+        }
+        for (const syn of node.incomingSynapses?.values?.() ?? []) {
+          const pid = syn.peerId;
+          if (typeof pid === 'bigint' && !dist.has(pid)) dist.set(pid, pid ^ targetBig);
+        }
+        return [...dist.entries()]
+          .sort((a, b) => a[1] < b[1] ? -1 : 1)
+          .slice(0, K)
+          .map(([pid]) => pid);
+      },
       routeMessage:    (...args) => peer.routeMessage(...args),
       sendDirect:      async (peerId, type, payload) => {
         if (peerId === self) {
