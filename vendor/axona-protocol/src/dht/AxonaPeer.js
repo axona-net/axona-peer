@@ -2541,7 +2541,18 @@ export class AxonaPeer extends DHT {
     ctx.queried.add(nextId);
     ctx.path.push(nextId);
     ctx.trace.push({ fromId: node.id, synapse: nextSyn });
-    ctx.totalTimeMs += nextSyn.latency;
+    // v1.1.2: prefer the transport's live RTT measurement over the
+    // synapse's stamped latency.  syn.latency is set once at handshake
+    // admission (often before the WebRTC ping buffer is populated) and
+    // is never refreshed; on browser peers it's almost always the
+    // 200-ms fallback.  Query getLatency now so `lookup().time` reflects
+    // current network conditions.  Fall back to the stored value when
+    // the transport reports -1 (no measurement yet) or doesn't
+    // implement getLatency.
+    const liveLatency = (typeof node.transport?.getLatency === 'function')
+      ? node.transport.getLatency(nextId)
+      : -1;
+    ctx.totalTimeMs += (liveLatency > 0 ? liveLatency : nextSyn.latency);
     ctx.hops += 1;
 
     if (node.id !== targetKey && !node.synaptome.has(targetKey)) {
