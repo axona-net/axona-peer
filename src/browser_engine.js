@@ -210,8 +210,9 @@ export class BrowserEngine {
       routeMessage:    (...args) => peer.routeMessage(...args),
       sendDirect:      async (peerId, type, payload) => {
         if (peerId === self) {
-          const table = engine._directHandlers.get(node);
-          const h = table?.get(type);
+          // Phase 5a (kernel cleanup): direct-handler table lives on
+          // the peer now, not on the engine.
+          const h = peer._directHandlers?.get(type);
           if (!h) return false;
           try {
             await h(payload, { fromId: self.toString(16).padStart(16, '0'), type });
@@ -254,7 +255,9 @@ export class BrowserEngine {
             : null);
       if (targetBig == null) return 'forward';
       if (targetBig !== self) return 'forward';  // not for us — keep routing
-      const handler = engine._directHandlers.get(node)?.get(payload.innerType);
+      // Phase 5a (kernel cleanup): direct-handler table lives on the
+      // peer now, not on the engine.
+      const handler = peer._directHandlers?.get(payload.innerType);
       if (!handler) return 'consumed';  // unknown type; drop here, don't forward
       try {
         await handler(payload.innerPayload, {

@@ -94,6 +94,18 @@ export class AxonaPeer extends DHT {
     this._directMessageHandler = null;
     /** True once we've installed the transport-side req/ntf handlers. */
     this._directHandlersInstalled = false;
+
+    // ─── Wire-handler tables (Phase 5a — own them) ────────────────
+    // Before Phase 5a these lived as engine-keyed-by-node Maps in
+    // `engine._routedHandlers` / `engine._directHandlers`.  They never
+    // had any cross-peer relevance — every read site looked up the
+    // entry for THIS peer's own node.  Owning them on the peer
+    // shrinks the engine API surface and is a step toward letting
+    // peers run without an engine at all (see Phase 5 plan).
+    /** @type {Map<string, Function>} routed-message type → handler */
+    this._routedHandlers = new Map();
+    /** @type {Map<string, Function>} direct-message type → handler */
+    this._directHandlers = new Map();
   }
 
   // ─── Lifecycle ─────────────────────────────────────────────────────
@@ -1914,8 +1926,7 @@ export class AxonaPeer extends DHT {
    */
   async _deliverRouted(type, payload, meta) {
     const node = this._node;
-    const handlers = this._engine._routedHandlers.get(node);
-    const handler = handlers?.get(type);
+    const handler = this._routedHandlers.get(type);
     if (!handler) return 'forward';
     try {
       const result = await handler(payload, meta);
@@ -2026,10 +2037,7 @@ export class AxonaPeer extends DHT {
    * engine version still works because engine delegates here.
    */
   onRoutedMessage(type, handler) {
-    const node = this._node;
-    let table = this._engine._routedHandlers.get(node);
-    if (!table) { table = new Map(); this._engine._routedHandlers.set(node, table); }
-    table.set(type, handler);
+    this._routedHandlers.set(type, handler);
   }
 
   /**
@@ -2038,12 +2046,10 @@ export class AxonaPeer extends DHT {
    */
   onDirectMessage(type, handler) {
     const node = this._node;
-    let table = this._engine._directHandlers.get(node);
-    if (!table) { table = new Map(); this._engine._directHandlers.set(node, table); }
     const wireType = `direct_${type}`;
-    if (!table.has(type)) {
+    if (!this._directHandlers.has(type)) {
       node.transport.onNotification(wireType, (fromId, payload) => {
-        const h = this._engine._directHandlers.get(node)?.get(type);
+        const h = this._directHandlers.get(type);
         if (!h) return;
         const fromHex = (typeof fromId === 'bigint') ? nodeIdToHex(fromId) : fromId;
         try {
@@ -2053,7 +2059,7 @@ export class AxonaPeer extends DHT {
         }
       });
     }
-    table.set(type, handler);
+    this._directHandlers.set(type, handler);
   }
 
   // ─── Routing tick — _lookupStep + _lookupResult (Phase 3g) ─────────
