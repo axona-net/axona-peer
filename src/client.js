@@ -41,7 +41,7 @@ import { encode, decode } from './wire.js';
 // where the bfcache can serve a stale module set for ages).  The
 // bridge version arrives separately in its `welcome` message; the
 // "version" row in the me panel shows both side by side.
-const PEER_VERSION = '1.0.2';
+const PEER_VERSION = '1.0.3';
 
 const BRIDGE_PING_INTERVAL_MS = 1000;
 const BRIDGE_STALE_PONG_MS    = 3000;
@@ -1159,6 +1159,13 @@ async function addSubscription(regionId, eventName) {
   // `${regionId}/${eventName}` reaches us (preserves the (region,
   // event) public-channel UX from the legacy pubsubSubscribe path).
   // Envelope shape: { msgId, ts, topic, message, signerPubkey?, signature? }.
+  //
+  // since: 'all' replays everything in the axon's pubsub cache for
+  // this topic before live-tailing.  Matches the demo UX expectation
+  // that "publish first, subscribe second" still delivers the past
+  // message — without this the new subscriber starts at a live tail
+  // and never sees publishes that happened before its sub envelope
+  // reached the K-closest axon.
   sub.handle = await axonaNode.sub(topic, (envelope) => {
     sub.messages.push({
       publisher: envelope.signerPubkey ?? null,
@@ -1170,7 +1177,7 @@ async function addSubscription(regionId, eventName) {
       sub.messages.shift();
     }
     renderSubscriptions();
-  }, { publisher: null });
+  }, { publisher: null, since: 'all' });
 
   persistSubscriptions();
   renderSubscriptions();
@@ -1252,8 +1259,8 @@ async function publishFromForm(form, $messageEl) {
   const eventName = form.eventName.trim();
   const message   = $messageEl.value;
   if (!eventName) {
-    console.warn('[axona] publish skipped: event name required');
-    appendLog('pubsub:publish-skip', 'event name required', 'error');
+    console.warn('[axona] publish skipped: topic required');
+    appendLog('pubsub:publish-skip', 'topic required', 'error');
     return;
   }
   if (!message) {
@@ -1327,7 +1334,7 @@ function buildPublishCard(form) {
   const $event = document.createElement('input');
   $event.type = 'text';
   $event.className = 'pubsub-input';
-  $event.placeholder = 'event name (e.g. News of the Day)';
+  $event.placeholder = 'topic (e.g. News of the Day)';
   $event.spellcheck = false;
   $event.autocomplete = 'off';
   $event.value = form.eventName;
