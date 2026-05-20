@@ -81,14 +81,50 @@ export async function sha256Hex(input) {
  *
  * Async (uses sha256Hex which uses Web Crypto).
  *
- * @param {string} publisherNodeId  66-char lowercase hex node ID.
- * @param {string} topicName        Application-chosen topic name.
- * @returns {Promise<string>}       66-char lowercase hex topic ID.
+ * Two modes, application's choice:
+ *
+ *   1. Publisher-keyed (default).  `publisherNodeId` is a 66-char hex
+ *      node ID.  Topic ID =
+ *
+ *          [publisher's 8-bit S2 prefix] || sha256(publisher + ':' + topicName)
+ *
+ *      Two publishers with the same topic_name produce DIFFERENT topic
+ *      IDs; names are scoped to publishers.  Signed envelopes give
+ *      verifiable provenance.  K-closest routing naturally lands at
+ *      the publisher's geographic neighborhood.
+ *
+ *   2. Public (`publisherNodeId === null` or `''`).  Anyone-can-
+ *      publish, anyone-can-subscribe.  Topic ID =
+ *
+ *          '00' || sha256(topicName)
+ *
+ *      8-bit S2 prefix is 0x00 — global bucket, no geographic anchor.
+ *      Signed envelopes still carry signerPubkey when sign=true, so a
+ *      public-topic subscriber can still verify who sent a particular
+ *      message — but the topic itself isn't scoped to a single
+ *      publisher.  Useful for chat rooms / news boards / well-known
+ *      protocol topics.
+ *
+ * Async (uses sha256Hex which uses Web Crypto).
+ *
+ * @param {string|null} publisherNodeId  66-char lowercase hex node ID,
+ *                                       OR null/'' for public mode.
+ * @param {string}      topicName        Application-chosen topic name.
+ * @returns {Promise<string>}            66-char lowercase hex topic ID.
  */
 export async function deriveTopicId(publisherNodeId, topicName) {
+  if (typeof topicName !== 'string' || topicName.length === 0) {
+    throw new TypeError('deriveTopicId: topicName must be a non-empty string');
+  }
+  // Public mode: 0x00 prefix + sha256(topicName).
+  if (publisherNodeId === null || publisherNodeId === undefined || publisherNodeId === '') {
+    const hash256 = await sha256Hex(topicName);
+    return '00' + hash256;
+  }
+  // Publisher-keyed mode (default).
   if (typeof publisherNodeId !== 'string' || publisherNodeId.length !== 66) {
     throw new RangeError(
-      `deriveTopicId: publisherNodeId must be a 66-char hex string, got length ${publisherNodeId?.length}`,
+      `deriveTopicId: publisherNodeId must be a 66-char hex string or null, got length ${publisherNodeId?.length}`,
     );
   }
   if (!/^[0-9a-fA-F]+$/.test(publisherNodeId)) {

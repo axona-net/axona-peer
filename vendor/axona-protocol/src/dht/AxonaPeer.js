@@ -1015,14 +1015,21 @@ export class AxonaPeer extends DHT {
    * @param {boolean} [opts.sign=true]
    * @returns {Promise<string>} msgId — sha256 of the canonical envelope.
    */
-  async pub(topic, message, { sign = true } = {}) {
+  async pub(topic, message, opts = {}) {
+    const { sign = true } = opts;
     if (typeof topic !== 'string' || topic.length === 0) {
       throw new PublishError(ErrorCodes.PUBLISH_INVALID_TOPIC,
         `peer.pub: topic must be a non-empty string, got ${typeof topic}`,
         { context: { topic } });
     }
     const am          = this._requireAxonManager('pub');
-    const publisherId = this._nodeIdHex();
+    // opts.publisher selects the topic-id derivation mode:
+    //   undefined (default)  → publisher-keyed, this peer's nodeId
+    //   null                 → public mode (anyone-can-publish, simple hash)
+    //   '66-char hex'        → publisher-keyed under a specified id
+    //                          (rare for pub — typically used for tests
+    //                          or for relaying as a known principal)
+    const publisherId = 'publisher' in opts ? opts.publisher : this._nodeIdHex();
     const topicId     = await deriveTopicId(publisherId, topic);
 
     if (sign && !this._identity) {
@@ -1091,7 +1098,15 @@ export class AxonaPeer extends DHT {
     }
 
     const am          = this._requireAxonManager('sub');
-    const publisherId = this._nodeIdHex();
+    // opts.publisher selects the topic-id derivation mode (same
+    // semantics as peer.pub):
+    //   undefined (default)  → publisher-keyed, this peer's nodeId
+    //                          (subscribe to your own published feed)
+    //   null                 → public mode (subscribe to a well-known
+    //                          public topic by name)
+    //   '66-char hex'        → publisher-keyed under that publisher
+    //                          (subscribe to someone else's feed)
+    const publisherId = 'publisher' in opts ? opts.publisher : this._nodeIdHex();
     const topicId     = await deriveTopicId(publisherId, topic);
 
     // Apply `since` mode by seeding AxonManager's per-topic lastSeenTs
@@ -1161,9 +1176,12 @@ export class AxonaPeer extends DHT {
         'peer.pull: { topic } is required',
         { context: { msgId } });
     }
-    if (!isHexId(publisher)) {
+    // publisher may be:
+    //   · null (public topic — sha256(topicName), no publisher prefix)
+    //   · 66-char hex node ID (publisher-keyed)
+    if (publisher !== null && !isHexId(publisher)) {
       throw new PullError(ErrorCodes.PULL_INVALID_MSGID,
-        'peer.pull: { publisher } must be a 66-char hex node ID',
+        'peer.pull: { publisher } must be a 66-char hex node ID or null',
         { context: { msgId, publisher } });
     }
     const am = this._requireAxonManager('pull');
@@ -1214,9 +1232,12 @@ export class AxonaPeer extends DHT {
         'peer.metrics: topic must be a non-empty string',
         { context: { topic } });
     }
-    if (!isHexId(publisher)) {
+    // publisher may be:
+    //   · null (public topic — sha256(topicName), no publisher prefix)
+    //   · 66-char hex node ID (publisher-keyed)
+    if (publisher !== null && !isHexId(publisher)) {
       throw new MetricsError(ErrorCodes.METRICS_AXONS_UNREACHABLE,
-        'peer.metrics: { publisher } must be a 66-char hex node ID',
+        'peer.metrics: { publisher } must be a 66-char hex node ID or null',
         { context: { topic, publisher } });
     }
     const am = this._requireAxonManager('metrics');

@@ -153,6 +153,30 @@ async function main() {
   await sub.stop();
   check('sub.stop completes without throwing',       true);
 
+  // ── Public-topic mode (#47) ─────────────────────────────────────
+  // Same peer subscribes + publishes with `publisher: null` so the
+  // topic ID is the simple sha256(topicName) — anyone-can-publish.
+  // Verifies the new opt-in mode is reachable through the same
+  // peer.pub / peer.sub surface.
+  console.log();
+  const pubReceived = [];
+  const pubSub = await peer.sub('chat-room', env => { pubReceived.push(env); },
+    { publisher: null });
+  check('peer.sub(public) returns a Subscription',   !!pubSub && typeof pubSub.topicId === 'string');
+  check('public sub topicId starts with "00" (global bucket)',
+    pubSub.topicId.slice(0, 2) === '00');
+
+  const pubMsgId = await peer.pub('chat-room', { kind: 'hi' },
+    { publisher: null, sign: false });
+  check('peer.pub(public) returns a 64-char msgId',  pubMsgId?.length === 64);
+
+  await new Promise(r => setTimeout(r, 20));
+  check('public-mode delivery: handler fired',        pubReceived.length === 1);
+  check('public-mode envelope carries the payload',   pubReceived[0]?.message?.kind === 'hi');
+  check('public-mode envelope msgId matches publish', pubReceived[0]?.msgId === pubMsgId);
+
+  await pubSub.stop();
+
   // ── Tear down ───────────────────────────────────────────────────
   await A.leave?.({ drain: false, notify: false });
 
