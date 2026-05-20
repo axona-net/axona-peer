@@ -31,8 +31,23 @@ import {
   AxonaPeer,
   NeuronNode,
   Synapse,
-  clz64,
 } from '../vendor/axona-protocol/src/index.js';
+
+// Local 64-bit stratum helper.  @axona/protocol v1.0 dropped clz64 in
+// favour of the 264-bit clz264 in utils/hexid.js; we keep this shim
+// alive only for the legacy BigInt-id path that axona-node still
+// drives.  Goes away when axona-node moves onto the kernel's 264-bit
+// hex identities (and consumes Peer.web() directly).
+function clz64(x) {
+  if (x === 0n) return 64;
+  let n = 0;
+  let v = x;
+  for (let i = 32; i >= 1; i >>= 1) {
+    if (v < (1n << BigInt(64 - i))) { n += i; }
+    else                            { v >>= BigInt(64 - i); break; }
+  }
+  return n;
+}
 
 import { BrowserEngine }      from './browser_engine.js';
 import { WebRTCTransport }    from './transport.js';

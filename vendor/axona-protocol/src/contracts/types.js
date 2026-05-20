@@ -6,21 +6,33 @@
 // contract documentation; runtime conformance is enforced by the
 // abstract base classes in Transport.js, DHT.js, and BootstrapService.js.
 //
-// All identifiers are 64-bit BigInts (the N-DHT keyspace).
+// All identifiers are 264-bit BigInts (the Axona keyspace):
+//   [8-bit S2 prefix] || [256-bit hash]
+// Encoded as 66-char lowercase hex at API boundaries.  Internal
+// XOR / distance math uses BigInt.
 // =====================================================================
 
 /**
- * 64-bit node identifier. The high `geoBits` (default 8) encode an S2
- * cell prefix; the remaining bits are derived from the node's public
- * key. See whitepaper Chapter 6 for construction details.
+ * 264-bit node identifier. The high 8 bits encode the node's S2
+ * geographic cell; the remaining 256 bits are the SHA-256 of the
+ * node's Ed25519 public key. See whitepaper Chapter 6 for
+ * construction details.
+ *
+ * Wire / API representation: 66-char lowercase hex string.
+ * Internal math: BigInt.
  *
  * @typedef {bigint} NodeId
  */
 
 /**
- * 64-bit publish/subscribe topic identifier. Same shape as NodeId:
- * high `geoBits` carry the publisher's S2 prefix, low bits hash the
- * topic name. See whitepaper Chapter 7.
+ * 264-bit publish/subscribe topic identifier. Anchored to the
+ * publisher's region:
+ *
+ *     TopicId = [publisher.nodeId top 8 bits (S2 prefix)]
+ *            || [SHA-256(publisher.nodeId || ':' || topicName)]
+ *
+ * Two publishers with the same topicName produce different TopicIds;
+ * topic names are scoped to publishers.
  *
  * @typedef {bigint} TopicId
  */

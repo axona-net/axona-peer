@@ -89,23 +89,29 @@ export function randomU32() {
   return crypto.getRandomValues(new Uint32Array(1))[0];
 }
 
-/**
- * Generate a cryptographically random 64-bit unsigned BigInt.
- */
-export function randomU64() {
-  const arr = crypto.getRandomValues(new Uint32Array(2));
-  return (BigInt(arr[0]) << 32n) | BigInt(arr[1]);
-}
-
-/**
- * Count leading zeros of a 64-bit BigInt (0n returns 64).
- */
-export function clz64(n) {
-  if (n === 0n) return 64;
-  const hi = Number(n >> 32n);
-  if (hi !== 0) return Math.clz32(hi);
-  return 32 + Math.clz32(Number(n & 0xFFFFFFFFn));
-}
+// ── 264-bit ID math lives in hexid.js ────────────────────────────────
+// randomU256, clz264, toHex, fromHex, xorDistance, etc.
+// Re-exported here for callers that already import from geo.js.
+export {
+  randomU256,
+  clz264,
+  toHex,
+  fromHex,
+  isHexId,
+  xorDistance,
+  stratumOf,
+  assembleId,
+  extractS2Prefix,
+  extractHash,
+  s2PrefixOfHex,
+  ID_BITS,
+  HASH_BITS,
+  S2_BITS,
+  HEX_CHARS,
+  MAX_ID,
+  MAX_HASH,
+  MAX_S2,
+} from './hexid.js';
 
 /**
  * Collect up to k nodes from XOR-bucket b relative to selfId.
@@ -113,9 +119,9 @@ export function clz64(n) {
  * buildXorRoutingTable so it can be called per-bucket during stratified
  * allocation.
  *
- * @param {BigInt}   selfId  Source node ID (64-bit BigInt).
+ * @param {BigInt}   selfId  Source node ID (264-bit BigInt).
  * @param {object[]} sorted  All nodes sorted ascending by .id.
- * @param {number}   b       Bucket index 0–63 (highest differing bit).
+ * @param {number}   b       Bucket index 0–263 (highest differing bit).
  * @param {number}   k       Max nodes to return.
  * @returns {object[]}       Up to k peers whose XOR distance puts them in bucket b.
  */
@@ -123,7 +129,7 @@ export function _collectBucket(selfId, sorted, b, k) {
   const bBig = BigInt(b);
   let rangeStart, rangeEnd;
 
-  if (b < 63) {
+  if (b < ID_BITS - 1) {
     const highBits    = selfId >> (bBig + 1n);
     const flippedBitB = ((selfId >> bBig) & 1n) ^ 1n;
     const peerPfx     = (highBits << 1n) | flippedBitB;
@@ -131,8 +137,8 @@ export function _collectBucket(selfId, sorted, b, k) {
     rangeEnd          = rangeStart | ((1n << bBig) - 1n);
   } else {
     // b = 63: MSB differs — peers live in the opposite half of the ID space.
-    rangeStart = (selfId >> 63n) === 0n ? (1n << 63n) : 0n;
-    rangeEnd   = (selfId >> 63n) === 0n ? 0xFFFFFFFFFFFFFFFFn : ((1n << 63n) - 1n);
+    rangeStart = (selfId >> 263n) === 0n ? (1n << 263n) : 0n;
+    rangeEnd   = (selfId >> 263n) === 0n ? MAX_ID : ((1n << 263n) - 1n);
   }
 
   // Binary search for the first index >= rangeStart.
@@ -164,7 +170,7 @@ export function _collectBucket(selfId, sorted, b, k) {
 }
 
 /**
- * O(n log n) XOR-bucket routing table builder for 64-bit BigInt node IDs.
+ * O(n log n) XOR-bucket routing table builder for 264-bit BigInt node IDs.
  *
  * WITHOUT a connection budget (maxTotal = Infinity):
  *   Sequential fill — up to k peers per bucket, b=0 through b=63.
@@ -202,10 +208,12 @@ export function _collectBucket(selfId, sorted, b, k) {
  */
 export function buildXorRoutingTable(selfId, sorted, k, maxTotal = Infinity) {
 
+  const TOP_BUCKET = ID_BITS - 1;
+
   // ── No budget cap: sequential fill (unchanged behaviour) ─────────────────
   if (!isFinite(maxTotal)) {
     const result = [];
-    for (let b = 0; b <= 63; b++) {
+    for (let b = 0; b <= TOP_BUCKET; b++) {
       result.push(..._collectBucket(selfId, sorted, b, k));
     }
     return result;
@@ -214,16 +222,16 @@ export function buildXorRoutingTable(selfId, sorted, k, maxTotal = Infinity) {
   // ── Budget-capped: stratified allocation for all protocols ────────────────
   // Step 1: collect up to k candidates per bucket (O(n) total via binary search).
   const buckets = [];
-  for (let b = 0; b <= 63; b++) {
+  for (let b = 0; b <= TOP_BUCKET; b++) {
     buckets.push(_collectBucket(selfId, sorted, b, k));
   }
 
-  const allotted = new Array(64).fill(0);
+  const allotted = new Array(ID_BITS).fill(0);
   let remaining = maxTotal;
 
   // Phase 1: 1 per non-empty bucket — guarantees at least one connection at
   // every XOR-distance level including the global high-b buckets.
-  for (let b = 0; b <= 63 && remaining > 0; b++) {
+  for (let b = 0; b <= TOP_BUCKET && remaining > 0; b++) {
     if (buckets[b].length > 0) {
       allotted[b] = 1;
       remaining--;
@@ -233,7 +241,7 @@ export function buildXorRoutingTable(selfId, sorted, k, maxTotal = Infinity) {
   // Phase 2: fill highest-b buckets first with remaining budget.
   // Prioritises global-reach diversity (large XOR distance) over local
   // redundancy (small XOR distance).
-  for (let b = 63; b >= 0 && remaining > 0; b--) {
+  for (let b = TOP_BUCKET; b >= 0 && remaining > 0; b--) {
     const canAdd = Math.min(buckets[b].length - allotted[b], k - allotted[b], remaining);
     if (canAdd > 0) {
       allotted[b] += canAdd;
@@ -241,9 +249,9 @@ export function buildXorRoutingTable(selfId, sorted, k, maxTotal = Infinity) {
     }
   }
 
-  // Step 3: assemble in bucket order (b=0 first, b=63 last).
+  // Step 3: assemble in bucket order (b=0 first, b=TOP_BUCKET last).
   const result = [];
-  for (let b = 0; b <= 63; b++) {
+  for (let b = 0; b <= TOP_BUCKET; b++) {
     for (let i = 0; i < allotted[b]; i++) result.push(buckets[b][i]);
   }
   return result;
@@ -254,11 +262,11 @@ export function buildXorRoutingTable(selfId, sorted, k, maxTotal = Infinity) {
  * These are nodes that share the same geographic prefix in their IDs
  * (same S2 cell for G-DHT), giving locally clustered connections.
  *
- * @param {BigInt}   selfId      64-bit unsigned BigInt node ID.
+ * @param {BigInt}   selfId      264-bit unsigned BigInt node ID.
  * @param {object[]} sorted      All nodes sorted ascending by .id.
  * @param {number}   k           Max peers per bucket.
  * @param {number}   numBuckets  Number of low-order XOR buckets to collect
- *                               (geo8 → 56, geo16 → 48).
+ *                               (geo8 → 256, geo16 → 248).
  * @returns {object[]}           Peers from buckets 0 through numBuckets-1.
  */
 export function buildIntraCellTable(selfId, sorted, k, numBuckets) {
@@ -278,16 +286,16 @@ export function buildIntraCellTable(selfId, sorted, k, numBuckets) {
  * With k=1 this guarantees exactly one peer per bucket (8 peers for geo8),
  * enough to ensure every target in the global key space is reachable.
  *
- * @param {BigInt}   selfId       64-bit unsigned BigInt node ID.
+ * @param {BigInt}   selfId       264-bit unsigned BigInt node ID.
  * @param {object[]} sorted       All nodes sorted ascending by .id.
  * @param {number}   k            Max peers per bucket.
- * @param {number}   startBucket  First inter-cell bucket index (64 - geoBits).
- *                                geo8 → 56, geo16 → 48.
- * @returns {object[]}            Peers from buckets startBucket through 63.
+ * @param {number}   startBucket  First inter-cell bucket index (ID_BITS - geoBits).
+ *                                geo8 → 256, geo16 → 248.
+ * @returns {object[]}            Peers from buckets startBucket through ID_BITS-1.
  */
 export function buildInterCellTable(selfId, sorted, k, startBucket) {
   const result = [];
-  for (let b = startBucket; b <= 63; b++) {
+  for (let b = startBucket; b < ID_BITS; b++) {
     result.push(..._collectBucket(selfId, sorted, b, k));
   }
   return result;

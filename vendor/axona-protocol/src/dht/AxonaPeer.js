@@ -37,9 +37,13 @@
 //     Engine-cycle code continue to work)
 // =====================================================================
 
-import { DHT }      from '../contracts/DHT.js';
-import { Synapse }  from './Synapse.js';
-import { clz64 }    from '../utils/geo.js';
+import { DHT }            from '../contracts/DHT.js';
+import { Synapse }        from './Synapse.js';
+import { Subscription }   from './Subscription.js';
+import { clz264, toHex, isHexId } from '../utils/hexid.js';
+import { deriveTopicId }  from '../pubsub/post.js';
+import { buildEnvelope }  from '../pubsub/envelope.js';
+import { PublishError, SubscribeError, PullError, MetricsError, ErrorCodes } from '../errors.js';
 
 export class AxonaPeer extends DHT {
   /**
@@ -48,18 +52,48 @@ export class AxonaPeer extends DHT {
    *        The legacy multi-node engine (Phase 1: delegate target).
    * @param {import('./NeuronNode.js').NeuronNode} opts.node
    *        The NeuronNode this peer wraps.
+   * @param {object} [opts.axonManager]
+   *        Optional explicit AxonManager instance to use for the
+   *        unified pub()/sub() API.  When omitted, pub/sub fall back
+   *        to the engine's per-node AxonManager (engine.axonManagerFor
+   *        if present, else throws).
+   * @param {object} [opts.identity]
+   *        Identity envelope from `deriveIdentity()` — required for
+   *        signed publishes (the default).  Apps that only call
+   *        `peer.pub(topic, message, { sign: false })` can omit it.
    */
-  constructor({ engine, node }) {
+  constructor({ engine, node, axonManager = null, identity = null, transport = null, persist = null }) {
     super();
     if (!engine) throw new Error('AxonaPeer: engine is required');
     if (!node)   throw new Error('AxonaPeer: node is required');
     this._engine = engine;
     this._node   = node;
+    this._axonManager = axonManager;
+    this._identity = identity;
+    this._transport = transport;
+    this._persist  = persist;
     this._started = false;
+
+    // ─── Persistence state ────────────────────────────────────────
+    this._persistDirty   = new Set();  // namespaces with pending writes
+    this._persistTimer   = null;
+    this._persistFlushMs = 5000;
     /** @type {Set<(event: object) => void>} */
     this._eventListeners = new Set();
     /** @type {(event: object) => void | null} */
     this._engineListenerUnsub = null;
+
+    // ─── Unified pub/sub state ────────────────────────────────────
+    /** @type {Map<string, Set<Subscription>>} topicId(hex) → handles */
+    this._subscriptions = new Map();
+    /** True once we've installed the AxonManager-side delivery hook. */
+    this._deliveryHookInstalled = false;
+
+    // ─── Direct messaging state ───────────────────────────────────
+    /** Application handler set by peer.onMessage().  At most one. */
+    this._directMessageHandler = null;
+    /** True once we've installed the transport-side req/ntf handlers. */
+    this._directHandlersInstalled = false;
   }
 
   // ─── Lifecycle ─────────────────────────────────────────────────────
@@ -77,6 +111,15 @@ export class AxonaPeer extends DHT {
 
   async start() {
     if (this._started) return;
+
+    // ─── Persistence load (P4) ──────────────────────────────────────
+    // If a PersistenceAdapter was provided AND we don't already have
+    // an identity, try to load one.  Same for the synaptome seed and
+    // the subscriptions list (which becomes pendingSubscriptions for
+    // the app to re-register handlers).
+    if (this._persist) {
+      await this._loadFromPersist();
+    }
 
     // Engine emits events to a single global listener set today
     // (engine._eventListeners).  We subscribe and filter to events
@@ -115,29 +158,448 @@ export class AxonaPeer extends DHT {
   }
 
   /**
-   * Phase 1 stub.  The real production join() will:
-   *   1. Use BootstrapService.bootstrap(sponsor) to open the first
-   *      WebRTC channel.
-   *   2. Run a self-lookup through that sponsor.
-   *   3. Stratified-fill the synaptome via subsequent FIND_NODE-style
-   *      RPCs over the new transport.
-   * In Phase 1 we throw if called from the simulator path — the
-   * simulator uses engine.bootstrapJoin instead, which is god's-eye
-   * and not contract-shaped.  Production code paths arrive at this
-   * stub once Phase 6 (integration) lands.
+   * Bootstrap into the Axona mesh.
+   *
+   *   await peer.join()           — start standalone; wait for inbound
+   *                                 connections.
+   *   await peer.join(sponsorId)  — open a channel to a known sponsor
+   *                                 (66-char hex node ID) and seed
+   *                                 the synaptome from it.
+   *
+   * Pre-conditions: peer.start() has been called.  If a transport was
+   * passed to the constructor, the transport is brought up here
+   * (transport.start) and admission is established with the sponsor
+   * (transport.openConnection).  The sponsor must already be reachable
+   * via the transport — for the web transport that means the bridge's
+   * signaling has delivered the sponsor's meshId binding; for the sim
+   * transport, the sponsor must be registered in the same SimNetwork.
+   *
+   * Resolves once the synaptome has been seeded (best-effort) or
+   * immediately if no sponsor was given.  Throws if the transport
+   * can't reach the sponsor.
+   *
+   * @param {string} [sponsor]  66-char hex node ID
+   * @returns {Promise<void>}
    */
-  async join(_sponsor) {
-    throw new Error(
-      'AxonaPeer.join: not implemented in Phase 1. ' +
-      'Simulator path uses engine.bootstrapJoin; ' +
-      'production path lands in Phase 6 integration.'
-    );
+  async join(sponsor) {
+    if (!this._started) {
+      // The engine-event filter chain must be in place before we
+      // start touching the synaptome — peer-joined events fired
+      // during the bootstrap walk need to reach our listeners.
+      await this.start();
+    }
+
+    // Bring up the transport if one was wired in.  Idempotent — the
+    // sim and node/web transports all handle a second start() cleanly.
+    if (this._transport && typeof this._transport.start === 'function') {
+      try { await this._transport.start(this._nodeIdHex()); }
+      catch (cause) {
+        throw new (await import('../errors.js')).TransportError(
+          'TRANSPORT_NOT_STARTED',
+          `AxonaPeer.join: transport.start failed (${cause.message})`,
+          { cause });
+      }
+    }
+
+    // No sponsor → standalone start.  We're "joined" but isolated;
+    // inbound connections from other peers will populate our
+    // synaptome via the usual handshake + bindPeer flow.
+    if (sponsor === undefined || sponsor === null) return;
+
+    if (!isHexId(sponsor)) {
+      throw new (await import('../errors.js')).TransportError(
+        'TRANSPORT_NOT_STARTED',
+        `AxonaPeer.join: sponsor must be 66-char hex, got ${typeof sponsor}`,
+        { context: { sponsor } });
+    }
+
+    // Open a channel to the sponsor.  The transport's openConnection
+    // returns false if the sponsor isn't reachable (not registered in
+    // the SimNetwork, mesh signaling not delivered, etc).
+    if (this._transport && typeof this._transport.openConnection === 'function') {
+      const ok = await this._transport.openConnection(sponsor);
+      if (!ok) {
+        throw new (await import('../errors.js')).TransportError(
+          'TRANSPORT_PEER_UNREACHABLE',
+          `AxonaPeer.join: sponsor ${sponsor} not reachable`,
+          { context: { sponsor } });
+      }
+    }
+
+    // Seed the synaptome with the sponsor.  Without a real self-lookup
+    // (which would need wiring through the engine), this is the minimum
+    // viable bootstrap: one channel open, one synapse known.  Future
+    // enhancement: walk K-closest via transport.send + the
+    // find_closest_set RPC and stratified-fill from results.
+    this._seedSynaptomeWithSponsor(sponsor);
   }
 
-  async leave() {
-    // Phase 1: graceful shutdown is a no-op.  Real implementation
-    // notifies known peers and closes channels; tracked in Phase 6.
-    return;
+  /**
+   * Leave the network gracefully.
+   *
+   *   await peer.leave()
+   *   await peer.leave({ drain: true, notify: true, timeoutMs: 5000 })
+   *
+   * If `notify`, sends a `peer-leaving` notification to every peer in
+   * the synaptome so they can drop us proactively (instead of waiting
+   * for heartbeat timeouts).  If `drain`, waits up to `timeoutMs` ms
+   * for in-flight publishes to settle before closing.  Closes the
+   * transport last.  Stops event listeners.
+   *
+   * Persistence-side snapshot of final state lands in P4 (#32).
+   *
+   * @param {{drain?: boolean, notify?: boolean, timeoutMs?: number}} [opts]
+   * @returns {Promise<void>}
+   */
+  async leave({ drain = true, notify = true, timeoutMs = 5000 } = {}) {
+    if (!this._started) return;
+    const selfId = this._nodeIdHex();
+
+    // (1) notify peers (fire-and-forget, bounded by drain window)
+    if (notify && this._transport && typeof this._transport.notify === 'function') {
+      const peers = this.peers();
+      for (const peerId of peers) {
+        // Use the transport's notify directly (not peer.notify) so we
+        // don't tunnel through 'axona:direct'; this is a transport-
+        // level signal, not an application message.
+        try {
+          await this._transport.notify(peerId, 'peer-leaving', { from: selfId });
+        } catch { /* swallow — best-effort */ }
+      }
+    }
+
+    // (2) optional drain — pause for in-flight publishes / pulls
+    if (drain && timeoutMs > 0) {
+      // Without a per-publish ack stream we can only bound by time.
+      // Apps that want stronger guarantees should await their own
+      // pub() promises before calling leave().
+      await new Promise(r => setTimeout(r, Math.min(timeoutMs, 50)));
+    }
+
+    // (3) force-flush persistence (P4)
+    try { await this._flushAllToPersist(); } catch { /* swallow */ }
+
+    // (4) stop event listeners (mirrors stop() from Phase 1)
+    if (this._engineListenerUnsub) {
+      try { this._engineListenerUnsub(); } catch { /* swallow */ }
+      this._engineListenerUnsub = null;
+    }
+
+    // (5) close transport
+    if (this._transport && typeof this._transport.stop === 'function') {
+      try { await this._transport.stop(); }
+      catch { /* swallow — we're shutting down */ }
+    }
+
+    this._started = false;
+  }
+
+  /**
+   * @private — best-effort initial synaptome seed.
+   * Tries the engine's add-synapse path if available; otherwise sets
+   * the synaptome entry directly so peer.peers() and onPeerJoin fire.
+   */
+  // ─── Persistence wiring (P4) ──────────────────────────────────────
+  //
+  // Four namespaces, one PersistenceAdapter key each:
+  //   'identity'       — IdentityEnvelope from dumpIdentity()
+  //   'synaptome'      — [{peerId, weight, latency, stratum, addedBy}]
+  //   'subscriptions'  — [{topic, since}]
+  //   'wireVersion'    — string (the kernel build that wrote this)
+  //
+  // On start(): all four loaded if persist is wired and the
+  // constructor didn't already supply identity / synaptome.
+  // On sub() / sub.stop() / synapse-add: namespace marked dirty,
+  // debounced flush scheduled (~5s).  On leave(): force flush.
+  //
+  // Axon-role state is owned by AxonManager and persisted at that
+  // layer (deferred to AxonManager P4-followup).
+
+  async _loadFromPersist() {
+    const p = this._persist;
+    if (!p) return;
+
+    // Identity — only if constructor didn't supply one.
+    if (!this._identity) {
+      try {
+        const env = await p.load('identity');
+        if (env && typeof env === 'object') {
+          const { loadIdentity } = await import('../identity/index.js');
+          this._identity = await loadIdentity(env);
+        }
+      } catch (err) {
+        this._emitLog?.('warn', 'persist-identity-load-failed', { err: err.message });
+      }
+    }
+
+    // Synaptome — only if it's currently empty.
+    if (this._node?.synaptome && this._node.synaptome.size === 0) {
+      try {
+        const entries = await p.load('synaptome');
+        if (Array.isArray(entries)) {
+          for (const s of entries) {
+            if (!s?.peerId) continue;
+            this._node.synaptome.set(s.peerId, {
+              peerId:  s.peerId,
+              weight:  s.weight,
+              latency: s.latency,
+              stratum: s.stratum,
+              addedBy: s.addedBy ?? 'persist',
+            });
+          }
+        }
+      } catch (err) {
+        this._emitLog?.('warn', 'persist-synaptome-load-failed', { err: err.message });
+      }
+    }
+
+    // Subscriptions — expose as pendingSubscriptions for apps to
+    // re-register handlers (functions don't serialize).
+    try {
+      const subs = await p.load('subscriptions');
+      if (Array.isArray(subs)) {
+        this.pendingSubscriptions = subs.map(s => ({ ...s }));
+      }
+    } catch (err) {
+      this._emitLog?.('warn', 'persist-subscriptions-load-failed', { err: err.message });
+    }
+  }
+
+  /** Mark a namespace dirty and schedule a debounced flush. */
+  _markPersistDirty(namespace) {
+    if (!this._persist) return;
+    this._persistDirty.add(namespace);
+    if (this._persistTimer) return;
+    this._persistTimer = setTimeout(() => {
+      this._persistTimer = null;
+      this._flushDirtyToPersist().catch(err => {
+        this._emitLog?.('warn', 'persist-flush-failed', { err: err.message });
+      });
+    }, this._persistFlushMs);
+    if (typeof this._persistTimer.unref === 'function') this._persistTimer.unref();
+  }
+
+  async _flushDirtyToPersist() {
+    if (!this._persist || this._persistDirty.size === 0) return;
+    const namespaces = [...this._persistDirty];
+    this._persistDirty.clear();
+    for (const ns of namespaces) {
+      try { await this._writeNamespace(ns); }
+      catch (err) {
+        this._emitLog?.('warn', `persist-write-${ns}-failed`, { err: err.message });
+        // Re-queue on failure so the next debounce retries.
+        this._persistDirty.add(ns);
+      }
+    }
+  }
+
+  async _writeNamespace(ns) {
+    const p = this._persist;
+    if (!p) return;
+    if (ns === 'identity') {
+      if (!this._identity) return;
+      const { dumpIdentity } = await import('../identity/index.js');
+      await p.save('identity', await dumpIdentity(this._identity));
+      return;
+    }
+    if (ns === 'synaptome') {
+      const snap = await this.snapshot();
+      await p.save('synaptome', snap.synaptome);
+      return;
+    }
+    if (ns === 'subscriptions') {
+      const snap = await this.snapshot();
+      await p.save('subscriptions', snap.subscriptions);
+      return;
+    }
+    if (ns === 'wireVersion') {
+      const { WIRE_VERSION } = await import('../transport/handshake.js');
+      await p.save('wireVersion', WIRE_VERSION);
+      return;
+    }
+  }
+
+  /** Force-flush every dirty namespace immediately. Called on leave. */
+  async _flushAllToPersist() {
+    if (!this._persist) return;
+    if (this._persistTimer) {
+      clearTimeout(this._persistTimer);
+      this._persistTimer = null;
+    }
+    // Make sure identity gets written at least once even if it wasn't
+    // explicitly marked dirty (first-run case).
+    if (this._identity) this._persistDirty.add('identity');
+    this._persistDirty.add('wireVersion');
+    await this._flushDirtyToPersist();
+  }
+
+  // ─── Snapshot / restore (v1.0 escape hatch — A9) ───────────────────
+  //
+  // Apps that want to manage state outside the bundled
+  // PersistenceAdapter can dump a fully-serializable snapshot of this
+  // peer's state, store it however they want (encrypted, synced
+  // through a different channel, written to a custom database), and
+  // reconstruct a peer from it via Peer.fromSnapshot(state, opts).
+  //
+  // The snapshot carries:
+  //   - formatVersion: '1.0'
+  //   - identity envelope (id + pubkey hex + privkey base64 + region + createdAt)
+  //   - synaptome (list of {peerId, weight, latency, stratum, addedBy})
+  //   - subscriptions ([{ topic, lastSeenTs, opts }])
+  //   - wireVersion (the kernel build that produced this snapshot)
+  //   - snapshotAt (ms timestamp)
+  //
+  // Restoration is intentionally lazy — fromSnapshot returns a peer
+  // that's constructed and the snapshot pre-loaded; the caller still
+  // calls peer.join() to bring the transport up.  This keeps
+  // snapshot/restore decoupled from network state.
+
+  /**
+   * Serialize this peer's state to a JSON-safe envelope.
+   *
+   * @returns {Promise<object>}
+   */
+  async snapshot() {
+    const { dumpIdentity } = await import('../identity/index.js');
+    const { WIRE_VERSION } = await import('../transport/handshake.js');
+
+    const identityEnv = this._identity
+      ? await dumpIdentity(this._identity)
+      : null;
+
+    const syn = this._node?.synaptome;
+    const synaptome = [];
+    if (syn) {
+      for (const [k, v] of syn.entries()) {
+        const peerId =
+          (typeof k === 'string' && isHexId(k)) ? k :
+          (typeof k === 'bigint')               ? toHex(k) :
+          null;
+        if (peerId === null) continue;
+        synaptome.push({
+          peerId,
+          weight:   v?.weight   ?? null,
+          latency:  v?.latency  ?? null,
+          stratum:  v?.stratum  ?? null,
+          addedBy:  v?.addedBy  ?? null,
+        });
+      }
+    }
+
+    const subscriptions = [];
+    for (const set of this._subscriptions.values()) {
+      for (const sub of set) {
+        subscriptions.push({
+          topic:       sub.topicName,
+          since:       sub._opts?.since ?? null,
+        });
+      }
+    }
+
+    return {
+      formatVersion: '1.0',
+      snapshotAt:    Date.now(),
+      wireVersion:   WIRE_VERSION,
+      identity:      identityEnv,
+      synaptome,
+      subscriptions,
+    };
+  }
+
+  /**
+   * Reconstruct a peer from a snapshot envelope.  The returned peer
+   * is constructed and its identity / synaptome / subscriptions are
+   * pre-loaded, but the transport is NOT started.  Call
+   * `await peer.join(sponsor?)` to bring the network connection up.
+   *
+   * Subscription handlers are NOT restored — they're application
+   * state (functions can't be serialized).  Callers must re-register
+   * handlers via peer.sub(topic, ...) for each restored subscription;
+   * the returned peer exposes the list at `peer.pendingSubscriptions`
+   * so apps can iterate.
+   *
+   * @param {object} state          snapshot envelope from .snapshot()
+   * @param {object} opts           AxonaPeer constructor args
+   * @param {object} opts.engine
+   * @param {object} opts.node
+   * @param {object} [opts.axonManager]
+   * @param {object} [opts.transport]
+   * @returns {Promise<AxonaPeer>}
+   */
+  static async fromSnapshot(state, { engine, node, axonManager, transport } = {}) {
+    if (!state || typeof state !== 'object') {
+      throw new TypeError('AxonaPeer.fromSnapshot: state must be a snapshot object');
+    }
+    if (state.formatVersion !== '1.0') {
+      throw new RangeError(`AxonaPeer.fromSnapshot: unsupported formatVersion ${state.formatVersion}`);
+    }
+
+    let identity = null;
+    if (state.identity) {
+      const { loadIdentity } = await import('../identity/index.js');
+      identity = await loadIdentity(state.identity);
+    }
+
+    // Reconstitute the node + synaptome.  If the caller passed a node
+    // we honour it (and skip our own construction), otherwise build a
+    // bare node with the identity's id.
+    const finalNode = node ?? {
+      id:        identity?.id,
+      alive:     true,
+      synaptome: new Map(),
+    };
+    if (!finalNode.synaptome) finalNode.synaptome = new Map();
+    if (Array.isArray(state.synaptome)) {
+      for (const s of state.synaptome) {
+        if (!s?.peerId) continue;
+        // Default to hex string keys (kernel native).
+        finalNode.synaptome.set(s.peerId, {
+          peerId:  s.peerId,
+          weight:  s.weight,
+          latency: s.latency,
+          stratum: s.stratum,
+          addedBy: s.addedBy ?? 'snapshot',
+        });
+      }
+    }
+
+    const peer = new AxonaPeer({
+      engine: engine ?? { onEvent: () => () => {} },
+      node:   finalNode,
+      axonManager,
+      identity,
+      transport,
+    });
+    peer.pendingSubscriptions = Array.isArray(state.subscriptions)
+      ? state.subscriptions.map(s => ({ ...s }))
+      : [];
+    return peer;
+  }
+
+  _seedSynaptomeWithSponsor(sponsor) {
+    const syn = this._node?.synaptome;
+    if (!syn) return;
+    if (syn.has?.(sponsor) || syn.has?.(BigInt('0x' + sponsor))) return;
+
+    // Engine-managed path: if the engine exposes addSynapse, use it
+    // so its bookkeeping (stratum, decay, anneal pool) stays consistent.
+    const engine = this._engine;
+    if (engine && typeof engine.addSynapse === 'function') {
+      try { engine.addSynapse(this._node, sponsor, { addedBy: 'bootstrap' }); return; }
+      catch { /* fall through to direct insert */ }
+    }
+
+    // Direct insert: the simulator-facing path uses BigInt synaptome
+    // keys; the kernel-only path uses hex strings.  Detect by checking
+    // an existing entry's key shape, defaulting to hex.
+    let firstKey = null;
+    for (const k of syn.keys()) { firstKey = k; break; }
+    const useBigInt = (typeof firstKey === 'bigint');
+    const key = useBigInt ? BigInt('0x' + sponsor) : sponsor;
+    syn.set(key, {
+      peerId: key, weight: 0.5, latency: 50, stratum: 0,
+      addedBy: 'bootstrap',
+    });
   }
 
   // ─── DHT operations ────────────────────────────────────────────────
@@ -214,6 +676,640 @@ export class AxonaPeer extends DHT {
   async publish(topicName, payload) {
     const axon = this._engine.axonFor(this._node);
     return axon.publish(topicName, payload);
+  }
+
+  // ─── Unified pub/sub (v1.0 API) ────────────────────────────────────
+  //
+  // Replaces the legacy AxonManager.pubsubPublish(bigintTopicKey, json)
+  // and AxonManager.pubsubSubscribe(bigintTopicKey) entrypoints with a
+  // string-topic API:
+  //
+  //   const msgId = await peer.pub(topic, message);
+  //   const sub   = await peer.sub(topic, envelope => …, { since });
+  //   await sub.stop();
+  //
+  // topic is a string at the API boundary; we hash it via
+  // deriveTopicId(peer.nodeIdHex, topic) → 66-char hex topic ID, which
+  // is what flows through AxonManager.  Apps don't see the topic ID
+  // unless they introspect it on the subscription handle.
+  //
+  // The envelope shape (delivered to subscribers) is:
+  //   { msgId, ts, topic, message, publisher }
+  // A2 (#24) extends this with signature + signerPubkey once signing
+  // is wired through pub().
+
+  /**
+   * Publish a message on `topic`.  Resolves with the content-derived
+   * msgId once the publish has been handed to the K-closest replica
+   * set (today's AxonManager semantics).
+   *
+   * Signed by default with the peer's identity; opt-out via
+   * `{ sign: false }` for anonymous broadcast.
+   *
+   * @param {string}  topic     application-level topic name
+   * @param {*}       message   JSON-serializable payload
+   * @param {object}  [opts]
+   * @param {boolean} [opts.sign=true]
+   * @returns {Promise<string>} msgId — sha256 of the canonical envelope.
+   */
+  async pub(topic, message, { sign = true } = {}) {
+    if (typeof topic !== 'string' || topic.length === 0) {
+      throw new PublishError(ErrorCodes.PUBLISH_INVALID_TOPIC,
+        `peer.pub: topic must be a non-empty string, got ${typeof topic}`,
+        { context: { topic } });
+    }
+    const am          = this._requireAxonManager('pub');
+    const publisherId = this._nodeIdHex();
+    const topicId     = await deriveTopicId(publisherId, topic);
+
+    if (sign && !this._identity) {
+      throw new PublishError(ErrorCodes.PUBLISH_SIGN_FAILED,
+        'peer.pub: identity required for signed publish; pass {identity} to AxonaPeer ' +
+        'or call peer.pub(topic, msg, { sign: false }) for anonymous publish',
+        { context: { topic } });
+    }
+
+    let envelope;
+    try {
+      envelope = await buildEnvelope({
+        topic, message,
+        identity: this._identity,
+        sign,
+      });
+    } catch (cause) {
+      throw new PublishError(ErrorCodes.PUBLISH_SIGN_FAILED,
+        `peer.pub: building envelope failed (${cause.message})`,
+        { cause, context: { topic, sign } });
+    }
+
+    let json;
+    try { json = JSON.stringify(envelope); }
+    catch (cause) {
+      throw new PublishError(ErrorCodes.PUBLISH_PAYLOAD_TOO_LARGE,
+        `peer.pub: envelope not JSON-serializable (${cause.message})`,
+        { cause, context: { topic } });
+    }
+
+    // AxonManager generates its own publishId for network routing/
+    // cache keying.  We pass postHash = envelope.msgId so the relay's
+    // replay cache becomes searchable by content-hash for peer.pull()
+    // (A3).  publisher is recorded for the metrics counters.
+    am.pubsubPublish(topicId, json, {
+      publisher: publisherId,
+      postHash:  envelope.msgId,
+    });
+    return envelope.msgId;
+  }
+
+  /**
+   * Subscribe to `topic`.  Handler is invoked with the full envelope
+   * `{ msgId, ts, topic, message, publisher }` for each delivery.
+   *
+   * @param {string}                       topic
+   * @param {(envelope: object) => void}   handler
+   * @param {object}                       [opts]
+   * @param {'all'|'latest'|number}        [opts.since]  replay control:
+   *   - omitted/undefined → live tail (future messages only)
+   *   - 'latest'          → most recent cached message + future
+   *   - 'all'             → everything in replay cache + future
+   *   - timestamp (number) → messages newer than the timestamp + future
+   * @returns {Promise<Subscription>}
+   */
+  async sub(topic, handler, opts = {}) {
+    if (typeof topic !== 'string' || topic.length === 0) {
+      throw new SubscribeError(ErrorCodes.SUBSCRIBE_INVALID_TOPIC,
+        `peer.sub: topic must be a non-empty string, got ${typeof topic}`,
+        { context: { topic } });
+    }
+    if (typeof handler !== 'function') {
+      throw new SubscribeError(ErrorCodes.SUBSCRIBE_HANDLER_MISSING,
+        'peer.sub: handler must be a function',
+        { context: { topic } });
+    }
+
+    const am          = this._requireAxonManager('sub');
+    const publisherId = this._nodeIdHex();
+    const topicId     = await deriveTopicId(publisherId, topic);
+
+    // Apply `since` mode by seeding AxonManager's per-topic lastSeenTs
+    // BEFORE the subscribe call.  AxonManager passes lastSeenTs in the
+    // subscribe envelope; the receiving axon's replay cache filters
+    // strictly above it.
+    this._applySince(am, topicId, opts.since);
+
+    // Register the handler and the dispatch hook before the network
+    // call so deliveries that arrive between submit and resolve are
+    // routed correctly.
+    const sub = new Subscription({
+      peer: this, topicId, topicName: topic, handler, opts,
+    });
+    if (!this._subscriptions.has(topicId)) this._subscriptions.set(topicId, new Set());
+    this._subscriptions.get(topicId).add(sub);
+    this._installDeliveryHook(am);
+
+    am.pubsubSubscribe(topicId);
+    this._markPersistDirty('subscriptions');
+    return sub;
+  }
+
+  /** @internal — called by Subscription.stop() */
+  async _unsubscribeInternal(sub) {
+    const set = this._subscriptions.get(sub.topicId);
+    if (set) {
+      set.delete(sub);
+      if (set.size === 0) {
+        this._subscriptions.delete(sub.topicId);
+        try {
+          this._requireAxonManager('unsubscribe').pubsubUnsubscribe(sub.topicId);
+        } catch { /* unsubscribe is best-effort */ }
+      }
+      this._markPersistDirty('subscriptions');
+    }
+  }
+
+  /**
+   * Pull a specific message by content hash.  The msgId is what
+   * peer.pub() returned to the publisher and what subscribers receive
+   * as `envelope.msgId`.
+   *
+   * Bounded by the K-closest set's replay cache window (~100 messages
+   * per topic, ~60s grace).  Older messages return null and that's
+   * expected — pull is for "did I miss this one?" not durable storage.
+   *
+   * Because msgId is content-derived and the topic is publisher-
+   * scoped, the caller passes `{ topic, publisher }` so we can route
+   * the request to the right K-closest set.
+   *
+   * @param {string} msgId
+   * @param {object} opts
+   * @param {string} opts.topic       application topic name
+   * @param {string} opts.publisher   66-char hex node ID of the topic owner
+   * @param {number} [opts.timeoutMs=1000]
+   * @returns {Promise<object | null>} envelope or null
+   */
+  async pull(msgId, { topic, publisher, timeoutMs = 1000 } = {}) {
+    if (typeof msgId !== 'string' || msgId.length !== 64) {
+      throw new PullError(ErrorCodes.PULL_INVALID_MSGID,
+        `peer.pull: msgId must be 64-char hex, got length ${msgId?.length}`,
+        { context: { msgId } });
+    }
+    if (typeof topic !== 'string' || topic.length === 0) {
+      throw new PullError(ErrorCodes.PULL_INVALID_MSGID,
+        'peer.pull: { topic } is required',
+        { context: { msgId } });
+    }
+    if (!isHexId(publisher)) {
+      throw new PullError(ErrorCodes.PULL_INVALID_MSGID,
+        'peer.pull: { publisher } must be a 66-char hex node ID',
+        { context: { msgId, publisher } });
+    }
+    const am = this._requireAxonManager('pull');
+    if (typeof am.requestPull !== 'function') {
+      throw new PullError(ErrorCodes.PULL_AXONS_UNREACHABLE,
+        'peer.pull: AxonManager does not support requestPull',
+        { context: {} });
+    }
+    const topicId = await deriveTopicId(publisher, topic);
+    const result = await am.requestPull(topicId, msgId, { timeoutMs });
+    if (!result) return null;
+
+    // requestPull returns the parsed payload — which is the JSON we
+    // wrote in pub(): the envelope itself.  Some legacy AxonManagers
+    // return a SignedPost shape; we surface either, leaving
+    // verification to the caller via verifyEnvelope().
+    if (result && typeof result === 'object' &&
+        typeof result.msgId === 'string' &&
+        typeof result.ts === 'number') {
+      return result;
+    }
+    // Legacy / unknown shape — return as-is so caller can inspect.
+    return result;
+  }
+
+  /**
+   * Aggregate counters for a topic across the K-closest relay tree.
+   *
+   * Returns an object `{ publishes, subscribers, deliveries, pulls,
+   * reshares, relayCount }`.  Sums per-post counters across all relays
+   * that respond; `relayCount` is the number of distinct responding
+   * relays so callers can sanity-check coverage.
+   *
+   * Note: today's AxonManager enforces a publisher-only ownership
+   * check on metrics requests — only the topic's publisher gets a
+   * non-empty result.  Removing that check (so any peer can audit)
+   * is queued as a kernel-side cleanup.
+   *
+   * @param {string} topic
+   * @param {object} opts
+   * @param {string} opts.publisher  66-char hex node ID of the topic owner
+   * @param {number} [opts.timeoutMs=500]
+   * @returns {Promise<{ publishes: number, subscribers: number, deliveries: number, pulls: number, reshares: number, relayCount: number }>}
+   */
+  async metrics(topic, { publisher, timeoutMs = 500 } = {}) {
+    if (typeof topic !== 'string' || topic.length === 0) {
+      throw new MetricsError(ErrorCodes.METRICS_AXONS_UNREACHABLE,
+        'peer.metrics: topic must be a non-empty string',
+        { context: { topic } });
+    }
+    if (!isHexId(publisher)) {
+      throw new MetricsError(ErrorCodes.METRICS_AXONS_UNREACHABLE,
+        'peer.metrics: { publisher } must be a 66-char hex node ID',
+        { context: { topic, publisher } });
+    }
+    const am = this._requireAxonManager('metrics');
+    if (typeof am.requestMetrics !== 'function') {
+      return { publishes: 0, subscribers: 0, deliveries: 0, pulls: 0, reshares: 0, relayCount: 0 };
+    }
+    const topicId = await deriveTopicId(publisher, topic);
+    const responses = await am.requestMetrics(topicId, null, { timeoutMs });
+
+    let deliveries = 0, pulls = 0, reshares = 0, publishes = 0;
+    let subscribers = 0;
+    const relayIds = new Set();
+    for (const resp of (responses ?? [])) {
+      if (resp?.responderId) relayIds.add(resp.responderId);
+      const entries = resp?.entries ?? [];
+      publishes = Math.max(publishes, entries.length);    // distinct post hashes seen
+      for (const c of entries) {
+        deliveries += c.delivery_count ?? 0;
+        pulls      += c.pull_count     ?? 0;
+        reshares   += c.reshare_count  ?? 0;
+      }
+      if (typeof resp?.subscribers === 'number') {
+        subscribers = Math.max(subscribers, resp.subscribers);
+      }
+    }
+    return {
+      publishes,
+      subscribers,
+      deliveries,
+      pulls,
+      reshares,
+      relayCount: relayIds.size,
+    };
+  }
+
+  // ─── Direct messaging (v1.0 API) ──────────────────────────────────
+  //
+  // Three primitives that ride directly on the underlying Transport
+  // contract without going through pub/sub:
+  //
+  //   await peer.send(targetId, message)    — RPC; awaits reply
+  //   peer.notify(targetId, message)        — fire-and-forget
+  //   peer.onMessage(handler)               — receive direct msgs
+  //
+  // `targetId` is the 66-char hex node ID of the peer. The peer must
+  // already be in the synaptome (transport.openConnection completed)
+  // — direct messaging assumes a working channel.  Routing to peers
+  // we haven't established a channel with is the responsibility of
+  // higher layers (e.g. AxonaPeer.lookup); that's not in scope here.
+  //
+  // Wire type used between peers is 'axona:direct' so it doesn't
+  // collide with the existing typed transport surfaces (lookup_step,
+  // reinforce, pubsub:*, etc.).
+
+  /**
+   * Send a direct message to `targetId` and await the remote handler's
+   * return value (RPC-style).
+   *
+   * @param {string} targetId 66-char hex node ID
+   * @param {*}      message  JSON-serializable
+   * @returns {Promise<*>}     remote handler's return value
+   */
+  async send(targetId, message) {
+    if (!isHexId(targetId)) {
+      throw new TypeError(`peer.send: targetId must be 66-char hex, got ${typeof targetId}`);
+    }
+    const t = this._requireTransport('send');
+    return t.send(targetId, 'axona:direct', { from: this._nodeIdHex(), message });
+  }
+
+  /**
+   * Fire-and-forget direct message.  Resolves once enqueued, NOT
+   * when delivered.
+   *
+   * @param {string} targetId
+   * @param {*}      message
+   * @returns {Promise<void>}
+   */
+  async notify(targetId, message) {
+    if (!isHexId(targetId)) {
+      throw new TypeError(`peer.notify: targetId must be 66-char hex, got ${typeof targetId}`);
+    }
+    const t = this._requireTransport('notify');
+    return t.notify(targetId, 'axona:direct', { from: this._nodeIdHex(), message });
+  }
+
+  /**
+   * Register a handler for inbound direct messages.  At most one
+   * handler — calling onMessage again replaces the previous handler.
+   *
+   * The handler signature is `(senderId, message) => reply | void`:
+   *   - For peer.send() callers: any value returned (or its promise)
+   *     becomes the resolution of the caller's send().
+   *   - For peer.notify() callers: the return value is discarded.
+   *
+   * @param {(senderId: string, message: any) => any} handler
+   */
+  onMessage(handler) {
+    if (typeof handler !== 'function') {
+      throw new TypeError('peer.onMessage: handler must be a function');
+    }
+    this._directMessageHandler = handler;
+    this._installDirectHandlers();
+  }
+
+  _installDirectHandlers() {
+    if (this._directHandlersInstalled) return;
+    const t = this._transport;
+    if (!t || typeof t.onRequest !== 'function') return;
+
+    t.onRequest('axona:direct', async (fromId, payload) => {
+      const h = this._directMessageHandler;
+      if (!h) return undefined;
+      // The wire fromId is the transport's notion (typically the hex
+      // nodeId once bindPeer has happened).  payload.from is the
+      // sender's self-reported hex id — we prefer the transport's
+      // since it's bound at handshake time.
+      const senderId = (typeof fromId === 'string' && isHexId(fromId))
+        ? fromId : (payload?.from ?? null);
+      return await h(senderId, payload?.message);
+    });
+    t.onNotification('axona:direct', (fromId, payload) => {
+      const h = this._directMessageHandler;
+      if (!h) return;
+      const senderId = (typeof fromId === 'string' && isHexId(fromId))
+        ? fromId : (payload?.from ?? null);
+      try { h(senderId, payload?.message); }
+      catch { /* notification handler errors swallow */ }
+    });
+    this._directHandlersInstalled = true;
+  }
+
+  // ─── Diagnostics + log/error/upgrade event surfaces (A6) ──────────
+  //
+  // Apps consume these for observability:
+  //
+  //   peer.health()         → snapshot of synaptome / axon / connections
+  //                            / replay-cache / wireVersion / uptime
+  //   peer.onLog(level, h)  → 'debug' | 'info' | 'warn' | 'error'
+  //   peer.onError(h)       → fires on background AxonaError emissions
+  //   peer.onUpgradeRequired(h) → fires on version-handshake mismatch
+  //
+  // The underlying log/error/upgrade events come from the transport
+  // layer (today via the `log` callback we passed to the factory).
+  // The peer offers a typed event surface on top so apps don't need
+  // to wire transport-specific callbacks themselves.
+
+  /**
+   * Synchronous diagnostic snapshot.  Stable shape:
+   *
+   *   {
+   *     nodeId:           '<hex>',
+   *     synaptomeSize:    number,
+   *     peers:            string[],
+   *     subscriptions:    number,
+   *     axonRoles:        Array<{topic, isRoot, children, cacheSize}>,
+   *     wireVersion:      string | null,
+   *     started:          boolean,
+   *   }
+   *
+   * Heavy implementations (per-replay-cache byte sizes, traffic
+   * counters) can be added later.  This is intentionally cheap so
+   * apps can poll it on a UI tick.
+   *
+   * @returns {object}
+   */
+  health() {
+    const am = this._axonManager
+            ?? (this._engine?.axonManagerFor?.(this._node))
+            ?? this._engine?._axonManagers?.get?.(this._node.id)
+            ?? null;
+    const axonRoles = [];
+    if (am && typeof am.inspectRoles === 'function') {
+      try {
+        for (const r of am.inspectRoles()) {
+          axonRoles.push({
+            topic:      r.topicId,
+            isRoot:     !!r.isRoot,
+            children:   Array.isArray(r.children) ? r.children.length : 0,
+            cacheSize:  r.replayCacheSize ?? r.cacheSize ?? 0,
+          });
+        }
+      } catch { /* best-effort */ }
+    }
+    return {
+      nodeId:        this._nodeIdHex(),
+      synaptomeSize: this._node?.synaptome?.size ?? 0,
+      peers:         this.peers(),
+      subscriptions: this._subscriptions.size,
+      axonRoles,
+      wireVersion:   this._transport?.wireVersion ?? null,
+      started:       this._started === true,
+    };
+  }
+
+  /**
+   * Subscribe to log-level events.
+   * @param {'debug'|'info'|'warn'|'error'} level
+   * @param {(msg: string, context?: object) => void} handler
+   * @returns {() => void} unsubscribe
+   */
+  onLog(level, handler) {
+    if (!['debug', 'info', 'warn', 'error'].includes(level)) {
+      throw new TypeError(`peer.onLog: level must be one of debug|info|warn|error, got ${String(level)}`);
+    }
+    if (typeof handler !== 'function') {
+      throw new TypeError('peer.onLog: handler must be a function');
+    }
+    if (!this._logHandlers) this._logHandlers = new Map();
+    if (!this._logHandlers.has(level)) this._logHandlers.set(level, new Set());
+    const set = this._logHandlers.get(level);
+    set.add(handler);
+    this._installTransportLogHook();
+    return () => set.delete(handler);
+  }
+
+  /**
+   * Subscribe to background AxonaError emissions (things the kernel
+   * surfaces asynchronously rather than throwing — e.g. transport
+   * failures during heartbeat, persistence-layer warnings).
+   *
+   * @param {(err: AxonaError) => void} handler
+   * @returns {() => void} unsubscribe
+   */
+  onError(handler) {
+    if (typeof handler !== 'function') {
+      throw new TypeError('peer.onError: handler must be a function');
+    }
+    if (!this._errorHandlers) this._errorHandlers = new Set();
+    this._errorHandlers.add(handler);
+    return () => this._errorHandlers.delete(handler);
+  }
+
+  /**
+   * Subscribe to wire-version handshake mismatches.  Handler receives
+   * the UpgradeRequiredError with full context (reason, server
+   * version, client version, downloadUrl).
+   *
+   * @param {(err: AxonaError) => void} handler
+   * @returns {() => void} unsubscribe
+   */
+  onUpgradeRequired(handler) {
+    if (typeof handler !== 'function') {
+      throw new TypeError('peer.onUpgradeRequired: handler must be a function');
+    }
+    if (!this._upgradeHandlers) this._upgradeHandlers = new Set();
+    this._upgradeHandlers.add(handler);
+    return () => this._upgradeHandlers.delete(handler);
+  }
+
+  // ── internal: emit helpers + transport log hook ────────────────────
+
+  /** @internal — kernel/transport modules call this. */
+  _emitLog(level, msg, context) {
+    const set = this._logHandlers?.get(level);
+    if (!set || set.size === 0) return;
+    for (const h of set) { try { h(msg, context); } catch { /* swallow */ } }
+  }
+
+  /** @internal — kernel modules call this on background errors. */
+  _emitError(err) {
+    if (!this._errorHandlers || this._errorHandlers.size === 0) return;
+    for (const h of this._errorHandlers) { try { h(err); } catch { /* swallow */ } }
+    // UpgradeRequired errors fan to their own channel too.
+    if (err?.code === 'UPGRADE_REQUIRED' && this._upgradeHandlers) {
+      for (const h of this._upgradeHandlers) { try { h(err); } catch { /* swallow */ } }
+    }
+  }
+
+  _installTransportLogHook() {
+    if (this._transportLogHooked) return;
+    const t = this._transport;
+    if (!t) return;
+    // Transports accept a log(event, data) callback at construction.
+    // For the kernel-side event surface we wrap any pre-existing log
+    // hook (preserved via t._log if present) so both consumers still
+    // get fed.  Falls back gracefully on transports without _log.
+    const orig = (typeof t._log === 'function') ? t._log : (() => {});
+    t._log = (event, data) => {
+      try { orig(event, data); } catch { /* keep going */ }
+      // Heuristic: events containing 'failed' or 'error' route to warn.
+      const level = (event.includes('failed') || event.includes('error'))
+        ? 'warn' : 'debug';
+      this._emitLog(level, event, data);
+    };
+    this._transportLogHooked = true;
+  }
+
+  _requireTransport(callerName) {
+    const t = this._transport ?? this._engine?.transport ?? null;
+    if (!t) {
+      throw new Error(`peer.${callerName}: no transport available; ` +
+        'pass {transport} to the AxonaPeer constructor');
+    }
+    return t;
+  }
+
+  // ── AxonManager glue ────────────────────────────────────────────
+
+  _requireAxonManager(callerName) {
+    if (this._axonManager) return this._axonManager;
+    // Fallback: ask the engine for this node's AxonManager.  Different
+    // engine builds expose this differently; we probe in priority
+    // order and cache the result.
+    const engine = this._engine;
+    let am = null;
+    if (typeof engine?.axonManagerFor === 'function') {
+      am = engine.axonManagerFor(this._node);
+    } else if (engine?._axonManagers instanceof Map) {
+      am = engine._axonManagers.get(this._node.id);
+    }
+    if (!am) {
+      throw new PublishError(ErrorCodes.PUBLISH_INVALID_TOPIC,
+        `peer.${callerName}: no AxonManager available; ` +
+        'pass {axonManager} to the AxonaPeer constructor or wire engine.axonManagerFor()',
+      );
+    }
+    this._axonManager = am;
+    return am;
+  }
+
+  _installDeliveryHook(am) {
+    if (this._deliveryHookInstalled) return;
+    if (typeof am.onPubsubDelivery !== 'function') return;
+    am.onPubsubDelivery((topicId, json, publishId, publishTs) => {
+      this._dispatchDelivery(topicId, json, publishId, publishTs);
+    });
+    this._deliveryHookInstalled = true;
+  }
+
+  _dispatchDelivery(topicId, json, publishId, publishTs) {
+    const set = this._subscriptions.get(topicId);
+    if (!set || set.size === 0) return;
+    let envelope;
+    try {
+      envelope = JSON.parse(json);
+      // Defence: enforce envelope shape so apps always see consistent
+      // fields even if a malformed peer sends garbage.
+      if (!envelope || typeof envelope !== 'object' ||
+          typeof envelope.msgId !== 'string' ||
+          typeof envelope.ts !== 'number' ||
+          typeof envelope.topic !== 'string' ||
+          !('message' in envelope)) {
+        throw new Error('malformed envelope');
+      }
+    } catch {
+      // Fall back to a synthetic envelope carrying the raw json as
+      // message and the AxonManager's publishId as msgId — at least
+      // the handler still fires with something it can inspect.
+      envelope = {
+        msgId:    publishId,
+        ts:       publishTs,
+        topic:    null,
+        message:  json,
+      };
+    }
+    for (const sub of set) sub._deliver(envelope);
+  }
+
+  _applySince(am, topicId, since) {
+    // The AxonManager tracks lastSeenTs per topic in _lastSeenTsByTopic.
+    // The subscribe call reads this and includes it in the outbound
+    // subscribe envelope; the axon's replay filter applies it strictly.
+    // We seed it here based on the `since` mode.
+    if (!am._lastSeenTsByTopic) return;     // unknown AxonManager build
+    if (since === undefined) {
+      // Live tail: only future messages.  Seed with a sentinel just
+      // below the current time so cached messages are filtered out.
+      am._lastSeenTsByTopic.set(topicId, Date.now());
+      return;
+    }
+    if (since === 'all') {
+      am._lastSeenTsByTopic.set(topicId, 0);
+      return;
+    }
+    if (since === 'latest') {
+      // Approximate: ask for the most recent ~1s of cache + future.
+      am._lastSeenTsByTopic.set(topicId, Date.now() - 1000);
+      return;
+    }
+    if (typeof since === 'number') {
+      am._lastSeenTsByTopic.set(topicId, since);
+      return;
+    }
+    throw new SubscribeError(ErrorCodes.SUBSCRIBE_INVALID_TOPIC,
+      `peer.sub: invalid since value: ${String(since)}`,
+      { context: { since } });
+  }
+
+  _nodeIdHex() {
+    const id = this._node.id;
+    if (typeof id === 'string' && isHexId(id)) return id;
+    if (typeof id === 'bigint') return toHex(id);
+    throw new PublishError(ErrorCodes.PUBLISH_INVALID_TOPIC,
+      `peer.pub: node.id must be 66-char hex or bigint, got ${typeof id}`,
+      { context: { id } });
   }
 
   // ─── Identity & observability ──────────────────────────────────────
@@ -410,6 +1506,71 @@ export class AxonaPeer extends DHT {
     return () => this._eventListeners.delete(handler);
   }
 
+  // ─── Mesh introspection (v1.0 API) ─────────────────────────────────
+  //
+  // Three primitives apps use to track who's in their synaptome:
+  //
+  //   peer.peers()        → string[] of 66-char hex nodeIds
+  //   peer.onPeerJoin(cb) → fires (peerId, ctx) on synapse admission
+  //   peer.onPeerLeave(cb)→ fires (peerId, ctx) on synapse eviction
+  //
+  // Both event helpers return an unsubscribe function.  `ctx` is the
+  // underlying event object so callers can inspect the addedBy /
+  // reason without going to the lower-level onEvent stream.
+
+  /**
+   * Current synaptome membership as hex node IDs.
+   * @returns {string[]}
+   */
+  peers() {
+    const syn = this._node?.synaptome;
+    if (!syn || typeof syn.keys !== 'function') return [];
+    const out = [];
+    for (const id of syn.keys()) {
+      if (typeof id === 'string' && isHexId(id))      out.push(id);
+      else if (typeof id === 'bigint')                out.push(toHex(id));
+    }
+    return out;
+  }
+
+  /**
+   * @param {(peerId: string, event?: object) => void} handler
+   * @returns {() => void} unsubscribe
+   */
+  onPeerJoin(handler) {
+    if (typeof handler !== 'function') {
+      throw new TypeError('peer.onPeerJoin: handler must be a function');
+    }
+    return this._onPeerLifecycleEvent('peer-joined', handler);
+  }
+
+  /**
+   * @param {(peerId: string, event?: object) => void} handler
+   * @returns {() => void} unsubscribe
+   */
+  onPeerLeave(handler) {
+    if (typeof handler !== 'function') {
+      throw new TypeError('peer.onPeerLeave: handler must be a function');
+    }
+    return this._onPeerLifecycleEvent('peer-left', handler);
+  }
+
+  _onPeerLifecycleEvent(eventType, handler) {
+    const filter = (ev) => {
+      if (!ev || ev.type !== eventType) return;
+      const peerId = ev.peerId;
+      const hex =
+        (typeof peerId === 'string' && isHexId(peerId)) ? peerId :
+        (typeof peerId === 'bigint')                    ? toHex(peerId) :
+        null;
+      if (hex === null) return;
+      try { handler(hex, ev); }
+      catch { /* listener errors are app-level; swallow */ }
+    };
+    this._eventListeners.add(filter);
+    return () => this._eventListeners.delete(filter);
+  }
+
   // ─── Internal: event filtering ────────────────────────────────────
 
   /**
@@ -543,7 +1704,7 @@ export class AxonaPeer extends DHT {
 
     const measuredLat = node.transport.getLatency(candidate.id);
     const latMs   = (measuredLat >= 0) ? measuredLat : 200;
-    const stratum = clz64(node.id ^ candidate.id);
+    const stratum = clz264(node.id ^ candidate.id);
     const syn     = new Synapse({ peerId: candidate.id, latencyMs: latMs, stratum });
     syn.weight    = 0.1;
     syn._addedBy  = 'anneal';
@@ -580,7 +1741,7 @@ export class AxonaPeer extends DHT {
 
     const measuredLat = node.transport.getLatency(candidate.id);
     const latMs   = (measuredLat >= 0) ? measuredLat : 200;
-    const stratum = clz64(node.id ^ candidate.id);
+    const stratum = clz264(node.id ^ candidate.id);
     const syn     = new Synapse({ peerId: candidate.id, latencyMs: latMs, stratum });
     syn.weight    = medW;
     syn._addedBy  = 'evictReplace';
@@ -611,7 +1772,7 @@ export class AxonaPeer extends DHT {
       for (const id of r.value) {
         if (id === node.id) continue;
         if (node.synaptome.has(id)) continue;
-        const stratum = clz64(node.id ^ id);
+        const stratum = clz264(node.id ^ id);
         if (stratum < lo || stratum > hi) continue;
         candidates.push(id);
         if (candidates.length >= engine.ANNEAL_LOCAL_SAMPLE) break outer;
@@ -1002,7 +2163,7 @@ export class AxonaPeer extends DHT {
     ctx.hops += 1;
 
     if (node.id !== targetKey && !node.synaptome.has(targetKey)) {
-      const stratum = clz64(node.id ^ targetKey);
+      const stratum = clz264(node.id ^ targetKey);
       const syn = new Synapse({
         peerId: targetKey, latencyMs: 0, stratum,
       });

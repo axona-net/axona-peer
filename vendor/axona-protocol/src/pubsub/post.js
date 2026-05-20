@@ -7,13 +7,17 @@
 // treats the `content` field as opaque bytes (end-to-end argument —
 // any encryption / structure lives inside the application).
 //
-// Topic identity is self-authenticating:
+// Topic identity is self-authenticating and anchored to the publisher's
+// region in the keyspace:
 //
-//     topic_id = sha256(publisher || ':' || topic_name)
+//     topic_id = [publisher.s2Prefix(8 bits)]
+//             || [sha256(publisher.nodeId || ':' || topic_name) (256 bits)]
 //
-// This means anyone querying metrics for a topic must sign with the
-// key that hashes to the topic_id; relays can verify by recomputation
-// alone, no central registry.
+// Total: 264 bits = 66 hex chars.  The S2-prefix anchor means routing
+// to a topic_id naturally lands near the publisher's region in the
+// K-closest neighborhood, without any extra mechanism.  Anyone with
+// the publisher's nodeId and the topic name can recompute the topic_id;
+// relays verify by recomputation alone, no central registry.
 //
 // Post identity is content-addressed:
 //
@@ -39,7 +43,7 @@
 
 /** Stable JSON encoding: object keys sorted at every level so two
  *  semantically-identical posts hash to the same value across runs. */
-function canonical(value) {
+export function canonical(value) {
   if (value === null || typeof value !== 'object') return JSON.stringify(value);
   if (Array.isArray(value)) {
     return '[' + value.map(canonical).join(',') + ']';
@@ -51,7 +55,7 @@ function canonical(value) {
 const _enc = new TextEncoder();
 
 /** sha256 → hex.  Web Crypto in both Node 19+ and modern browsers. */
-async function sha256Hex(input) {
+export async function sha256Hex(input) {
   const bytes  = (typeof input === 'string') ? _enc.encode(input) : input;
   const buf    = await crypto.subtle.digest('SHA-256', bytes);
   const arr    = new Uint8Array(buf);
@@ -61,17 +65,38 @@ async function sha256Hex(input) {
 }
 
 /**
- * Derive a topic identifier from a publisher and a topic name.
+ * Derive a topic identifier from a publisher's nodeId and a topic name.
+ *
+ *     topic_id = [publisher.s2Prefix (2 hex chars / 8 bits)]
+ *             || [sha256(publisher.nodeId || ':' || topic_name)
+ *                  (64 hex chars / 256 bits)]
+ *
+ * The publisher's S2 prefix is prepended so the resulting topic_id
+ * lands in the publisher's region of the keyspace — K-closest routing
+ * to a topic naturally finds its publisher's neighborhood without
+ * extra mechanism.
+ *
+ * Two publishers with the same topic_name produce DIFFERENT topic_ids;
+ * names are scoped to publishers.
+ *
  * Async (uses sha256Hex which uses Web Crypto).
  *
- * @param {string} publisher  NodeId (or pubkey fingerprint).
- * @param {string} topicName  Two publishers with the same topic_name
- *                            produce DIFFERENT topic_ids — names are
- *                            scoped to publishers.
- * @returns {Promise<string>} Hex-encoded sha256 (64 chars).
+ * @param {string} publisherNodeId  66-char lowercase hex node ID.
+ * @param {string} topicName        Application-chosen topic name.
+ * @returns {Promise<string>}       66-char lowercase hex topic ID.
  */
-export async function deriveTopicId(publisher, topicName) {
-  return sha256Hex(publisher + ':' + topicName);
+export async function deriveTopicId(publisherNodeId, topicName) {
+  if (typeof publisherNodeId !== 'string' || publisherNodeId.length !== 66) {
+    throw new RangeError(
+      `deriveTopicId: publisherNodeId must be a 66-char hex string, got length ${publisherNodeId?.length}`,
+    );
+  }
+  if (!/^[0-9a-fA-F]+$/.test(publisherNodeId)) {
+    throw new RangeError('deriveTopicId: publisherNodeId contains non-hex characters');
+  }
+  const s2Prefix = publisherNodeId.slice(0, 2).toLowerCase();
+  const hash256  = await sha256Hex(publisherNodeId + ':' + topicName);
+  return s2Prefix + hash256;
 }
 
 /**

@@ -1,0 +1,305 @@
+// =====================================================================
+// bridge.js — BridgeTransport: client-side Transport implementation
+//             that carries Axona wire frames over a single browser ↔
+//             bridge WebSocket connection.
+//
+// Symmetric counterpart to axona-bridge/src/ws_transport.js.  Each
+// browser has at most one bridge WebSocket, so this transport
+// manages a single peer relationship (browser ↔ bridge) — unlike
+// WebRTCTransport which manages many (one per mesh peer).
+//
+// Wire envelope (matches the bridge):
+//
+//     { type: 'axona', payload: { k: 'req'|'res'|'ntf', ... } }
+//
+// where the payload is a standard Axona wire frame.  Outbound frames
+// are written via the constructor-provided `sendToBridge` hook;
+// inbound frames arrive via `handleIncoming(payload)` called by the
+// caller's WS message dispatcher.
+//
+// Lifecycle:
+//   - Construct with { sendToBridge, isBridgeOpen, log }
+//   - Start with the browser's local 66-char hex nodeId
+//   - The webTransport orchestrator sends a `hello` notification to
+//     the bridge; the bridge replies with `hello-ack` carrying its
+//     nodeId.  On hello-ack receipt, bindPeer(bridgeNodeId, 'bridge')
+//     is called.
+//   - From there, send / notify / onRequest etc. work uniformly.
+//
+// nodeId convention: 66-char hex strings (matches WebRTCTransport).
+// =====================================================================
+
+import { Transport }            from '../../contracts/Transport.js';
+import { isHexId }              from '../../utils/hexid.js';
+import { TransportError, ErrorCodes } from '../../errors.js';
+
+const REQUEST_TIMEOUT_MS = 5000;
+const MAX_REQ_ID = 0x7fffffff;
+
+const BRIDGE_CONN_ID = 'bridge';  // stable mesh-side id for the bridge
+
+export class BridgeTransport extends Transport {
+  /**
+   * @param {Object} opts
+   * @param {string} [opts.localNodeId]  66-char hex; set via start() if omitted
+   * @param {(msg: object) => boolean} opts.sendToBridge
+   *        Synchronous send: serializes `msg` and writes to the
+   *        bridge WebSocket.  Returns true if the socket accepted
+   *        the frame.  Throws if the socket is closed.
+   * @param {() => boolean} opts.isBridgeOpen
+   * @param {(event:string, data?:object) => void} [opts.log]
+   */
+  constructor({ localNodeId = null, sendToBridge, isBridgeOpen, log }) {
+    super();
+    if (typeof sendToBridge !== 'function' || typeof isBridgeOpen !== 'function') {
+      throw new TypeError('BridgeTransport: sendToBridge + isBridgeOpen required');
+    }
+    this._localNodeId  = localNodeId;
+    this._sendToBridge = sendToBridge;
+    this._isBridgeOpen = isBridgeOpen;
+    this._log          = log ?? (() => {});
+
+    this._reqHandlers = new Map();
+    this._ntfHandlers = new Map();
+    this._pending     = new Map();
+    this._nextId      = 1;
+    this._peerDiedHandlers = [];
+
+    // Single binding: the bridge's 66-char hex nodeId ↔ the fixed
+    // 'bridge' connId.  Set by bindPeer once hello-ack arrives.
+    /** @type {string | null} */
+    this._bridgeNodeId = null;
+
+    this._started = false;
+  }
+
+  async start(localNodeId) {
+    if (localNodeId !== undefined) this._localNodeId = localNodeId;
+    this._started = true;
+  }
+
+  async stop() {
+    for (const [, p] of this._pending) {
+      clearTimeout(p.timer);
+      p.reject(new TransportError(ErrorCodes.TRANSPORT_CHANNEL_CLOSED,
+        'BridgeTransport stopped'));
+    }
+    this._pending.clear();
+    this._started = false;
+  }
+
+  getLocalNodeId() { return this._localNodeId; }
+
+  // ── nodeId binding (single peer: the bridge) ──────────────────────
+
+  bindPeer(nodeId, connId) {
+    if (!isHexId(nodeId)) {
+      throw new TypeError(`BridgeTransport.bindPeer: nodeId must be 66-char hex, got ${typeof nodeId}`);
+    }
+    if (connId !== BRIDGE_CONN_ID) {
+      throw new Error(`BridgeTransport bind expects connId='${BRIDGE_CONN_ID}', got ${connId}`);
+    }
+    this._bridgeNodeId = nodeId;
+  }
+
+  unbindPeer(_connId) {
+    this._bridgeNodeId = null;
+  }
+
+  connIdFor(nodeId) {
+    return (this._bridgeNodeId !== null && this._bridgeNodeId === nodeId) ? BRIDGE_CONN_ID : null;
+  }
+
+  nodeIdFor(connId) {
+    return (connId === BRIDGE_CONN_ID) ? this._bridgeNodeId : null;
+  }
+
+  /** True if this transport knows about this peer (i.e., it's the bridge). */
+  ownsPeer(nodeId) {
+    return this._bridgeNodeId !== null && this._bridgeNodeId === nodeId;
+  }
+
+  // ── Channel pool ──────────────────────────────────────────────────
+
+  async openConnection(nodeId) {
+    return this.ownsPeer(nodeId) && this._isBridgeOpen();
+  }
+
+  async closeConnection(_nodeId) {
+    // Bridge channel lifecycle is owned by client.js; nothing to do.
+  }
+
+  isConnected(nodeId) {
+    return this.ownsPeer(nodeId) && this._isBridgeOpen();
+  }
+
+  // ── Messaging ─────────────────────────────────────────────────────
+
+  async send(nodeId, type, body) {
+    if (!this._started) {
+      throw new TransportError(ErrorCodes.TRANSPORT_NOT_STARTED,
+        'BridgeTransport.send: not started');
+    }
+    if (!this.ownsPeer(nodeId) || !this._isBridgeOpen()) {
+      throw new TransportError(ErrorCodes.TRANSPORT_CHANNEL_CLOSED,
+        `BridgeTransport.send: peer ${nodeId} not connected`,
+        { context: { nodeId, type } });
+    }
+
+    const id = this._nextId;
+    this._nextId = (this._nextId >= MAX_REQ_ID) ? 1 : this._nextId + 1;
+
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this._pending.delete(id);
+        reject(new TransportError(ErrorCodes.TRANSPORT_TIMEOUT,
+          `BridgeTransport.send: timeout awaiting '${type}'`,
+          { context: { nodeId, type } }));
+      }, REQUEST_TIMEOUT_MS);
+      this._pending.set(id, { nodeId, resolve, reject, timer });
+
+      try {
+        this._sendToBridge({ type: 'axona', payload: { k: 'req', id, type, body } });
+      } catch (err) {
+        clearTimeout(timer);
+        this._pending.delete(id);
+        reject(new TransportError(ErrorCodes.TRANSPORT_PEER_UNREACHABLE,
+          `BridgeTransport.send: bridge write failed (${err.message})`,
+          { cause: err, context: { nodeId, type } }));
+      }
+    });
+  }
+
+  async notify(nodeId, type, body) {
+    if (!this._started) {
+      throw new TransportError(ErrorCodes.TRANSPORT_NOT_STARTED,
+        'BridgeTransport.notify: not started');
+    }
+    // Hello / hello-ack flow special case: the orchestrator may want
+    // to send a notification BEFORE bindPeer happens (e.g., a hello
+    // reply targeting BRIDGE_CONN_ID).  Allow that by accepting the
+    // sentinel.  Otherwise: peer must be the bound bridge.
+    if (!this.ownsPeer(nodeId) && nodeId !== BRIDGE_CONN_ID) {
+      this._log('bridge-notify-not-bridge-peer', { nodeId: String(nodeId), type });
+      return;
+    }
+    if (!this._isBridgeOpen()) {
+      this._log('bridge-notify-ws-closed', { type });
+      return;
+    }
+    try {
+      this._sendToBridge({ type: 'axona', payload: { k: 'ntf', type, body } });
+    } catch (err) {
+      this._log('notify-failed', { type, err: err.message });
+    }
+  }
+
+  onRequest(type, handler) {
+    if (typeof handler !== 'function') throw new TypeError('onRequest: handler must be a function');
+    this._reqHandlers.set(type, handler);
+  }
+
+  onNotification(type, handler) {
+    if (typeof handler !== 'function') throw new TypeError('onNotification: handler must be a function');
+    this._ntfHandlers.set(type, handler);
+  }
+
+  onPeerDied(handler) {
+    if (typeof handler !== 'function') throw new TypeError('onPeerDied: handler must be a function');
+    this._peerDiedHandlers.push(handler);
+    return () => {
+      const i = this._peerDiedHandlers.indexOf(handler);
+      if (i >= 0) this._peerDiedHandlers.splice(i, 1);
+    };
+  }
+
+  /** Approximate RTT.  Future: thread through the application-ping
+   *  rttBuffer from client.js's existing bridge ping loop. */
+  getLatency(_nodeId) { return 50; }
+
+  // ── Inbound dispatch ──────────────────────────────────────────────
+
+  /**
+   * Called from client.js when an `{type:'axona', payload:...}`
+   * message arrives on the bridge WebSocket.
+   */
+  handleIncoming(payload) {
+    if (!payload || typeof payload !== 'object') return;
+    const fromNodeId = this._bridgeNodeId;   // null until bindPeer
+
+    if (payload.k === 'req') {
+      this._handleRequest(fromNodeId, payload);
+    } else if (payload.k === 'res') {
+      this._handleResponse(payload);
+    } else if (payload.k === 'ntf') {
+      this._handleNotification(fromNodeId, payload);
+    }
+  }
+
+  async _handleRequest(fromNodeId, msg) {
+    const handler = this._reqHandlers.get(msg.type);
+    if (!handler) {
+      this._reply(msg.id, false, { error: `no handler for '${msg.type}'` });
+      return;
+    }
+    try {
+      const result = await handler(fromNodeId, msg.body);
+      this._reply(msg.id, true, result);
+    } catch (err) {
+      this._reply(msg.id, false, { error: err.message ?? String(err) });
+    }
+  }
+
+  _reply(id, ok, body) {
+    try {
+      this._sendToBridge({ type: 'axona', payload: { k: 'res', id, ok, body } });
+    } catch (err) {
+      this._log('reply-failed', { id, err: err.message });
+    }
+  }
+
+  _handleResponse(msg) {
+    const pending = this._pending.get(msg.id);
+    if (!pending) return;
+    clearTimeout(pending.timer);
+    this._pending.delete(msg.id);
+    if (msg.ok) pending.resolve(msg.body);
+    else {
+      const errMsg = (msg.body && typeof msg.body === 'object')
+        ? (msg.body.error ?? 'remote-error') : 'remote-error';
+      pending.reject(new TransportError(ErrorCodes.TRANSPORT_PEER_UNREACHABLE,
+        `bridge handler error: ${errMsg}`,
+        { context: { remoteError: errMsg } }));
+    }
+  }
+
+  _handleNotification(fromNodeId, msg) {
+    const handler = this._ntfHandlers.get(msg.type);
+    if (!handler) return;
+    try {
+      handler(fromNodeId ?? BRIDGE_CONN_ID, msg.body);
+    } catch (err) {
+      this._log('ntf-handler-threw', { type: msg.type, err: err.message });
+    }
+  }
+
+  /** Called by client.js when the bridge WebSocket closes. */
+  handleConnClosed() {
+    const reported = this._bridgeNodeId ?? BRIDGE_CONN_ID;
+    for (const h of this._peerDiedHandlers) {
+      try { h(reported); }
+      catch (err) { this._log('peer-died-handler-threw', { err: err.message }); }
+    }
+    for (const [id, p] of this._pending.entries()) {
+      clearTimeout(p.timer);
+      this._pending.delete(id);
+      p.reject(new TransportError(ErrorCodes.TRANSPORT_PEER_UNREACHABLE,
+        'bridge connection closed',
+        { context: { nodeId: p.nodeId } }));
+    }
+    this._bridgeNodeId = null;
+  }
+}
+
+// Export the sentinel for orchestrators that need it (axona_node.js).
+export const BRIDGE_CONN_ID_EXPORT = BRIDGE_CONN_ID;

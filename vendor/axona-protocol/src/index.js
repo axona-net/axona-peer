@@ -16,11 +16,84 @@ export { Transport }        from './contracts/Transport.js';
 export { DHT }              from './contracts/DHT.js';
 export { BootstrapService } from './contracts/BootstrapService.js';
 
+// ── Errors ────────────────────────────────────────────────────────────
+export {
+  AxonaError,
+  IdentityError,
+  TransportError,
+  PublishError,
+  SubscribeError,
+  PullError,
+  MetricsError,
+  UpgradeRequiredError,
+  ErrorCodes,
+  isWireError,
+  fromWire,
+} from './errors.js';
+
+// ── Version handshake ─────────────────────────────────────────────────
+// Wire frames + compatibility checks used by the web and node
+// transports on each fresh signaling channel.  Most apps don't touch
+// these directly — they're plumbed into the transport factories.
+export {
+  WIRE_VERSION,
+  KERNEL_VERSION,
+  UPGRADE_CLOSE_CODE,
+  buildClientHello,
+  buildServerHello,
+  parseHello,
+  parseVersion,
+  compareVersions,
+  wireCompatible,
+  performClientHandshake,
+  performServerHandshake,
+} from './transport/handshake.js';
+
+// ── Sim transport (in-process; tests + dht-sim) ──────────────────────
+// Always-environment-neutral; safe to ship in the main barrel.
+export {
+  SimNetwork,
+  SimTransport,
+  simTransport,
+} from './transport/sim/index.js';
+
+// ── Persistence ───────────────────────────────────────────────────────
+// PersistenceAdapter is the abstract contract; InMemoryPersistence is
+// the reference implementation used by `persist: false` and by tests.
+// Both are environment-neutral (no node:fs, no browser globals) so
+// they ship in the main barrel.
+//
+// Platform-specific impls are sub-path imports only — including them
+// here would pull node:fs into browser bundles or globalThis.indexedDB
+// into Node module load:
+//
+//   import { FilePersistence }      from '@axona/protocol/persistence/file.js';
+//   import { IndexedDBPersistence } from '@axona/protocol/persistence/indexeddb.js';
+export {
+  PersistenceAdapter,
+  InMemoryPersistence,
+} from './persistence/interface.js';
+
+// ── Identity ─────────────────────────────────────────────────────────
+// Ed25519 keypair + 264-bit nodeId + S2-prefix region anchor.
+// deriveIdentity({ lat, lng }) generates a fresh identity;
+// dumpIdentity/loadIdentity persist and restore. computeNodeId is
+// the public helper for verifying a claimed nodeId against the
+// stored pubkey + region.
+export {
+  deriveIdentity,
+  dumpIdentity,
+  loadIdentity,
+  computeNodeId,
+  computeNodeIdBigInt,
+} from './identity/index.js';
+
 // ── Per-node DHT implementation (NH-1) ──────────────────────────────
-export { AxonaPeer } from './dht/AxonaPeer.js';
+export { AxonaPeer }    from './dht/AxonaPeer.js';
 export { DHTNode, GEO_CELL_BITS } from './dht/DHTNode.js';
-export { NeuronNode } from './dht/NeuronNode.js';
-export { Synapse }    from './dht/Synapse.js';
+export { NeuronNode }   from './dht/NeuronNode.js';
+export { Synapse }      from './dht/Synapse.js';
+export { Subscription } from './dht/Subscription.js';
 
 // ── Pub/sub primitives ─────────────────────────────────────────────
 export { AxonManager } from './pubsub/AxonManager.js';
@@ -31,7 +104,14 @@ export {
   verifyPostHash,
   verifyTopicOwnership,
   verifySignature,
+  canonical,
+  sha256Hex,
 } from './pubsub/post.js';
+export {
+  buildEnvelope,
+  verifyEnvelope,
+  computeMsgId,
+} from './pubsub/envelope.js';
 
 // ── Ed25519 helpers (Web Crypto wrapper) ─────────────────────────
 // Optional companion to post.js for runtimes that support Web Crypto
@@ -55,10 +135,32 @@ export {
 // detection, XOR routing-table builders, etc.) are reachable via
 // the `@axona/protocol/utils/geo.js` sub-path import for consumers
 // that need them.
+
+// 264-bit identifier math — node ID and topic ID share the same
+// keyspace: [8-bit S2 prefix] || [256-bit hash].
 export {
-  clz64,
+  ID_BITS,
+  HASH_BITS,
+  S2_BITS,
+  HEX_CHARS,
+  MAX_ID,
+  MAX_HASH,
+  MAX_S2,
+  toHex,
+  fromHex,
+  isHexId,
+  assembleId,
+  extractS2Prefix,
+  extractHash,
+  s2PrefixOfHex,
+  xorDistance,
+  stratumOf,
+  clz264,
+  randomU256,
+} from './utils/hexid.js';
+
+export {
   randomU32,
-  randomU64,
   roundTripLatency,
   haversine,
 } from './utils/geo.js';

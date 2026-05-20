@@ -190,7 +190,17 @@ async function main() {
   // ── Pre-populate A's synaptome with B (production: bootstrap does this)
   //    — give A a Synapse pointing at B with reasonable initial weight.
   const { Synapse } = await import('../vendor/axona-protocol/src/dht/Synapse.js');
-  const { clz64 }   = await import('../vendor/axona-protocol/src/utils/geo.js');
+  // clz64 was dropped from the kernel (it now ships clz264 for 264-bit
+  // hex IDs); inline a tiny 64-bit version for the legacy BigInt path.
+  const clz64 = (x) => {
+    if (x === 0n) return 64;
+    let n = 0;
+    for (let i = 63n; i >= 0n; i--) {
+      if ((x >> i) & 1n) break;
+      n++;
+    }
+    return n;
+  };
   const stratum = clz64(A_ID ^ B_ID);
   const synAB = new Synapse({ peerId: B_ID, latencyMs: 42, stratum });
   synAB.weight = 0.7;

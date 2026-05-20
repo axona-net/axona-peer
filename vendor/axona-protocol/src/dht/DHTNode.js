@@ -6,8 +6,8 @@
  * RealNetwork implementation would replace SimulatedNetwork, intercepting
  * send/receive at the same interface without touching this class.
  */
-import { geoCellId } from '../utils/s2.js';
-import { clz64 }     from '../utils/geo.js';
+import { geoCellId }       from '../utils/s2.js';
+import { clz264, ID_BITS } from '../utils/hexid.js';
 
 /**
  * Number of bits used for the S2 geographic cell stored on every node.
@@ -188,16 +188,17 @@ export class DHTNode {
    * @param {DHTNode} candidate
    */
   _trySwapIn(candidate) {
-    const candidateStratum = Math.min(63, clz64(this.id ^ candidate.id));
-    const counts = new Array(64).fill(0);
+    const TOP_STRATUM = ID_BITS - 1;
+    const candidateStratum = Math.min(TOP_STRATUM, clz264(this.id ^ candidate.id));
+    const counts = new Array(ID_BITS).fill(0);
     for (const pid of this.connections) {
-      const s = Math.min(63, clz64(this.id ^ pid));
+      const s = Math.min(TOP_STRATUM, clz264(this.id ^ pid));
       counts[s]++;
     }
     // Find the most over-represented stratum OTHER than the candidate's.
     let evictStratum = -1;
     let maxCount    = 0;
-    for (let s = 0; s < 64; s++) {
+    for (let s = 0; s < ID_BITS; s++) {
       if (s === candidateStratum) continue;
       if (counts[s] > maxCount) { maxCount = counts[s]; evictStratum = s; }
     }
@@ -234,8 +235,9 @@ export class DHTNode {
    * @returns {bigint|null} peerId to evict, or null if no peer is in this stratum
    */
   _chooseVictim(stratum) {
+    const TOP_STRATUM = ID_BITS - 1;
     for (const pid of this.connections) {
-      const s = Math.min(63, clz64(this.id ^ pid));
+      const s = Math.min(TOP_STRATUM, clz264(this.id ^ pid));
       if (s === stratum) return pid;
     }
     return null;

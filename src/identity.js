@@ -35,7 +35,19 @@
 // =====================================================================
 
 import { geoCellId } from '../vendor/axona-protocol/src/utils/s2.js';
-import { randomU64 } from '../vendor/axona-protocol/src/utils/geo.js';
+import { randomU32 } from '../vendor/axona-protocol/src/utils/geo.js';
+
+// Local 64-bit random helper.  @axona/protocol v1.0 dropped randomU64
+// in favour of the 264-bit primitives in utils/hexid.js; we keep this
+// shim alive only for the legacy BigInt-id path inside axona-peer.
+// When axona-peer migrates to the kernel's 264-bit hex identities,
+// identity.js will switch to deriveIdentity() from the kernel and this
+// shim disappears.
+function randomU64() {
+  const hi = BigInt(randomU32());
+  const lo = BigInt(randomU32());
+  return (hi << 32n) | lo;
+}
 
 const STORAGE_KEY = 'axona.identity.v1';
 const GEO_BITS    = 8;
