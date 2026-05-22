@@ -2018,8 +2018,15 @@ export class AxonaPeer extends DHT {
     for (let i = trace.length - 1; i >= 0; i--) {
       const { fromId, synapse } = trace[i];
       if (fromId === selfId) continue;
+      // LTP reinforcement is opportunistic.  When the trace hop's
+      // channel isn't open (common when lookup_step used routed
+      // delivery rather than a direct send to that hop) the notify
+      // throws and we silently skip — the lookup itself succeeded.
+      // Without silencing, at scale (25K × 5000 warmup lookups) the
+      // synchronous console.error spam becomes the wall-clock
+      // bottleneck.
       this._node.transport.notify(fromId, 'reinforce', { synapsePeerId: synapse.peerId })
-        .catch(err => console.error('AxonaPeer: reinforce notify failed:', err));
+        .catch(() => { /* opportunistic — see comment */ });
     }
   }
 
@@ -2035,7 +2042,7 @@ export class AxonaPeer extends DHT {
     if (count >= this._domain.TRIADIC_THRESHOLD) {
       node.transitCache.delete(key);
       node.transport.notify(originId, 'triadic_introduce', { peerId: nextId })
-        .catch(err => console.error('AxonaPeer: triadic_introduce notify failed:', err));
+        .catch(() => { /* opportunistic — see _reinforceWave comment */ });
     } else {
       node.transitCache.set(key, count);
     }
@@ -2577,7 +2584,7 @@ export class AxonaPeer extends DHT {
         for (let i = 0; i < Math.min(domain.LATERAL_K, regional.length); i++) {
           node.transport.notify(regional[i].peerId, 'lateral_spread',
                                 { target: targetKey, depth: 1 })
-            .catch(err => console.error('AxonaPeer: lateral_spread notify failed:', err));
+            .catch(() => { /* opportunistic — see _reinforceWave comment */ });
         }
       }
     }

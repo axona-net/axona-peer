@@ -10,6 +10,20 @@
 //   - defaults to 0 (synchronous-under-the-hood, fastest possible)
 //   - tests can plug a haversine-based fn to model real geography
 //
+// Latency-simulation mode controls *whether* latency burns real
+// wall-clock time:
+//   - 'wall-clock' (default): SimTransport.send/notify `await sleep`
+//     for the latencyFn-returned ms.  Smoke tests, integration runs,
+//     anything that wants its time-domain behaviour to match a real
+//     transport keeps this mode.
+//   - 'instant': sends resolve in the same microtask; the geometric
+//     latency is still recorded in `_latency` (so getLatency reports
+//     correctly to the protocol's analytics) but no wall-clock blocking.
+//     Designed for large-scale in-process simulators (e.g. dht-sim
+//     25K-node sweeps) where the simulator drives the clock through
+//     its own model and serial latency-sleeps would dominate wall
+//     time without changing the measured outcome.
+//
 // Used by:
 //   - test/smoke_transport_sim.js (kernel)
 //   - dht-sim's 'axona' protocol entry (task #33)
@@ -31,11 +45,26 @@ export class SimNetwork {
    * @param {object} [opts]
    * @param {(fromId: string, toId: string) => number} [opts.latencyFn]
    *        One-way latency in ms. Default 0.
+   * @param {'wall-clock'|'instant'} [opts.latencySimulation]
+   *        How `send`/`notify` honour the latencyFn-returned ms.
+   *        Default 'wall-clock' (await real-time sleep).  'instant'
+   *        skips the wall-clock sleep but keeps the geometric value
+   *        in each peer's `_latency` map (so `transport.getLatency`
+   *        and analytics still report the right number).
    */
-  constructor({ latencyFn = ZERO_LATENCY } = {}) {
+  constructor({
+    latencyFn          = ZERO_LATENCY,
+    latencySimulation  = 'wall-clock',
+  } = {}) {
+    if (latencySimulation !== 'wall-clock' && latencySimulation !== 'instant') {
+      throw new Error(
+        `SimNetwork: latencySimulation must be 'wall-clock' or 'instant', got ${latencySimulation}`
+      );
+    }
     /** @type {Map<string, import('./transport.js').SimTransport>} */
-    this._transports = new Map();
-    this._latencyFn  = latencyFn;
+    this._transports        = new Map();
+    this._latencyFn         = latencyFn;
+    this._latencySimulation = latencySimulation;
   }
 
   /**
@@ -69,11 +98,30 @@ export class SimNetwork {
   }
 
   /**
+   * Geometric one-way latency (analytics). Always returns the
+   * latencyFn value — used by `_addConnection` to populate the
+   * per-peer `_latency` map so the protocol's reported RTT numbers
+   * remain accurate even in 'instant' simulation mode.
+   *
    * @param {string} fromId
    * @param {string} toId
    * @returns {number}
    */
   _latencyMs(fromId, toId) {
+    return this._latencyFn(fromId, toId);
+  }
+
+  /**
+   * Wall-clock delay actually paid by `send`/`notify`.  In
+   * 'instant' simulation mode this is always 0; the protocol still
+   * receives the geometric RTT via `_addConnection` / getLatency.
+   *
+   * @param {string} fromId
+   * @param {string} toId
+   * @returns {number}
+   */
+  _wallClockDelayMs(fromId, toId) {
+    if (this._latencySimulation === 'instant') return 0;
     return this._latencyFn(fromId, toId);
   }
 

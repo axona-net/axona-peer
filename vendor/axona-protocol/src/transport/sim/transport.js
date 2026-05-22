@@ -224,8 +224,15 @@ export class SimTransport extends Transport {
 
     // Round-trip latency simulation. The forward-trip delays handler
     // invocation; the return-trip delays the resolution.
-    const fwd = this._network._latencyMs(this._localId, peerId);
-    const back = this._network._latencyMs(peerId, this._localId);
+    //
+    // In 'wall-clock' mode (default) we await real-time sleeps so a
+    // smoke test or production-shape integration sees genuine
+    // network-delay behaviour.  In 'instant' mode the sleeps are
+    // skipped (sleep(0) collapses to Promise.resolve()) but the
+    // geometric RTT is still stored in `_latency` by openConnection
+    // so the protocol's getLatency reports unchanged.
+    const fwd  = this._network._wallClockDelayMs(this._localId, peerId);
+    const back = this._network._wallClockDelayMs(peerId, this._localId);
     await sleep(fwd);
 
     const fromId = this._localId;
@@ -256,8 +263,11 @@ export class SimTransport extends Transport {
     // Schedule on the next tick so notify() returns immediately
     // regardless of latency.  Real transports do the same — the
     // round-trip cost is absorbed by the receiver, not the sender.
+    // In 'instant' simulation mode this collapses to setTimeout(0)
+    // — still a macrotask so it doesn't starve the event loop, but
+    // no wall-clock blocking.
     const fromId  = this._localId;
-    const fwd     = this._network._latencyMs(this._localId, peerId);
+    const fwd     = this._network._wallClockDelayMs(this._localId, peerId);
     setTimeout(() => {
       try { handler(fromId, payload); }
       catch (err) { /* notifications swallow handler errors */ }

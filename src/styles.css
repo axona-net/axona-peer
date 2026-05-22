@@ -5,8 +5,12 @@
    connection (bridge + each WebRTC peer) gets its own row with its
    own indicator dot:
      .indicator-red     — solid red, not connected / failed / closed
-     .indicator-orange  — blinking orange, connecting / signaling / stale
-     .indicator-green   — blinking green, open + pongs flowing
+     .indicator-orange  — dim orange, connecting / signaling / stale;
+                          pulses bright on real ping/pong traffic
+     .indicator-green   — dim green, open;
+                          pulses bright on real ping/pong traffic
+   A peer with no actual data-channel traffic looks dim and steady;
+   the blink rate now reflects bytes-on-the-wire, not a CSS clock.
    ===================================================================== */
 
 :root {
@@ -271,26 +275,40 @@ header .subtitle {
   height: 16px;
   border-radius: 50%;
   flex-shrink: 0;
-  transition: background-color 0.15s ease;
+  /* Resting state for orange / green is dim; pulses brighten on
+     actual ping/pong traffic.  Red is full-bright and steady so
+     a dead row is visually distinct from a stuck-but-quiet one. */
+  opacity: 0.32;
+  transition: background-color 0.15s ease, opacity 320ms ease-out;
 }
 .indicator-red {
   background: var(--red);
   box-shadow: 0 0 10px var(--shadow-red);
+  /* Red is the only steady-bright state.  No pulse — a failed peer
+     should look obviously different from an active one. */
+  opacity: 1;
 }
 .indicator-orange {
   background: var(--orange);
   box-shadow: 0 0 10px var(--shadow-orange);
-  animation: blink 1s step-end infinite;
 }
 .indicator-green {
   background: var(--green);
   box-shadow: 0 0 10px var(--shadow-green);
-  animation: blink 1s step-end infinite;
 }
 
-@keyframes blink {
-  0%, 49.999%  { opacity: 1; }
-  50%, 100%    { opacity: 0.25; }
+/* Single-shot pulse: client.js adds this class on every observed
+   ping-out / pong-in, then removes it ~80 ms later.  The opacity
+   snaps to 1 on apply (transition: opacity 0ms) and fades back
+   over 320 ms when the class is removed (default transition).  The
+   net visual is a discrete flash per real frame of traffic — a
+   healthy peer pulses ~2 Hz (ping out + pong back), a stale peer
+   pulses ~1 Hz (ping out only, no pong back), a stuck-in-signaling
+   peer doesn't pulse at all. */
+.indicator-orange.indicator--pulse,
+.indicator-green.indicator--pulse {
+  opacity: 1;
+  transition: opacity 0ms;
 }
 
 /* ── Peer / cell content ───────────────────────────────────────── */

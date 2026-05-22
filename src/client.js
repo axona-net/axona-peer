@@ -46,7 +46,7 @@ import { encode, decode } from './wire.js';
 // where the bfcache can serve a stale module set for ages).  The
 // bridge version arrives separately in its `welcome` message; the
 // "version" row in the me panel shows both side by side.
-const PEER_VERSION = '1.1.2';
+const PEER_VERSION = '1.1.3';
 
 const BRIDGE_PING_INTERVAL_MS = 1000;
 const BRIDGE_STALE_PONG_MS    = 3000;
@@ -199,6 +199,32 @@ const mesh = new MeshManager({
 
 mesh.onChange(() => render());
 
+// Traffic-driven indicator pulse.  Every real ping-out / pong-in
+// briefly brightens that row's dot, which then fades back to its
+// dim resting opacity (320 ms transition in CSS).  The visual
+// effect mirrors actual bytes-on-the-wire: healthy peers pulse ~2
+// Hz (ping + pong), stale peers pulse ~1 Hz (ping only, pong
+// absent), and peers stuck in `connecting` / `signaling` do not
+// pulse at all — their indicator sits dim and steady, which is the
+// honest signal that nothing is actually happening on that
+// connection.  Replaces the prior continuous `animation: blink 1s
+// step-end infinite` CSS animation that ran off a clock regardless
+// of traffic.  Used both for the WebRTC peer rows (driven by
+// mesh.onPingTraffic) and the bridge row (driven by the bridge
+// ping/pong loop in this file).
+const PULSE_HOLD_MS = 80;
+function pulseIndicator(peerId) {
+  const refs = rowElements.get(peerId);
+  if (!refs) return;
+  // Already pulsing — restart the hold timer rather than stacking.
+  refs.indicator.classList.add('indicator--pulse');
+  clearTimeout(refs._pulseTimer);
+  refs._pulseTimer = setTimeout(() => {
+    refs.indicator.classList.remove('indicator--pulse');
+  }, PULSE_HOLD_MS);
+}
+mesh.onPingTraffic((peerId, _kind) => pulseIndicator(peerId));
+
 // ── Event log ────────────────────────────────────────────────────────
 function appendLog(event, detail, kind) {
   const li = document.createElement('li');
@@ -234,17 +260,11 @@ function appendLog(event, detail, kind) {
 //
 // Diffing renderer.  Each row's <tr> is created once and kept alive
 // across renders; only its text content and indicator class change in
-// place.  This is what makes the CSS blink animation continue smoothly:
-// removing-and-reinserting an element restarts its CSS animation, so a
-// naive "rebuild tbody on every render" approach with the previous
-// renderer caused the indicator to never visibly blink under high
-// render frequency (every pong fires a render).
-//
-// Note that we deliberately allow the indicator class to swap between
-// `.indicator-green` and `.indicator-orange` — both declare the same
-// `animation: blink 1s step-end infinite`, so the browser keeps the
-// running animation rather than restarting it.  Only transitions to
-// `.indicator-red` (which has no animation) reset the cycle.
+// place.  Reusing the DOM nodes is also what lets the indicator's
+// `.indicator--pulse` class survive across renders — the renderer
+// edits class names in place rather than rebuilding the tbody, so a
+// pulse applied by mesh.onPingTraffic isn't yanked out from under
+// the CSS opacity transition by the next render tick.
 
 const INDICATOR_CLASS = {
   disconnected:           'indicator-red',
@@ -353,7 +373,18 @@ function buildRow(peerId) {
 
 function updateRow(refs, data) {
   setClass(refs.tr, `peer-row peer-row-${data.kind}`);
-  setClass(refs.indicator, `indicator ${INDICATOR_CLASS[data.state] ?? 'indicator-red'}`);
+  // Indicator: state-color class via classList so a concurrently-
+  // applied `.indicator--pulse` (from mesh.onPingTraffic) isn't
+  // overwritten by the next render.  setClass's bulk assignment
+  // would wipe it; classList lets the pulse and the state class
+  // coexist.
+  const stateClass = INDICATOR_CLASS[data.state] ?? 'indicator-red';
+  if (!refs.indicator.classList.contains(stateClass)) {
+    refs.indicator.classList.remove(
+      'indicator-red', 'indicator-orange', 'indicator-green',
+    );
+    refs.indicator.classList.add(stateClass);
+  }
   setText(refs.labelText, data.label);
   setText(refs.stateText, data.state);
 
@@ -566,6 +597,7 @@ function onBridgeMessage(ev) {
       // OR for the uptime ticker to tick.  But we DO want RTT to update
       // visibly, so render here too.
       render();
+      pulseIndicator(BRIDGE_ROW_ID);
       break;
     }
 
@@ -675,6 +707,7 @@ function startBridgePingLoop() {
     try {
       bridge.ws.send(encode({ type: 'ping', t: Date.now() }));
       bridge.pings++;
+      pulseIndicator(BRIDGE_ROW_ID);
     } catch (err) {
       appendLog('bridge:ping-send-failed', err.message, 'error');
     }

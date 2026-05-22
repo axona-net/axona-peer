@@ -120,6 +120,17 @@ export class MeshManager {
     this._messageListeners = new Set();
     /** @type {Set<(peerId: string) => void>} */
     this._peerLostListeners = new Set();
+    // v1.1.x — per-frame ping/pong traffic notifications drive the
+    // row indicators' single-shot pulse animation.  Without these
+    // the indicator's blink ran off a continuous CSS animation that
+    // was decoupled from whether bytes were actually moving — a
+    // peer stuck in `signaling` looked just as alive as a peer
+    // exchanging pongs at 1 Hz.  Subscribers receive a callback per
+    // observed ping-out or pong-in; the renderer briefly brightens
+    // the row's dot and lets CSS fade it back to a dim resting
+    // state.  Peers with no DC traffic now look dim and steady.
+    /** @type {Set<(peerId: string, kind: 'sent'|'recv') => void>} */
+    this._pingTrafficListeners = new Set();
   }
 
   // ── External lifecycle ────────────────────────────────────────────
@@ -174,6 +185,33 @@ export class MeshManager {
   onPeerLost(callback) {
     this._peerLostListeners.add(callback);
     return () => this._peerLostListeners.delete(callback);
+  }
+
+  /**
+   * Subscribe to per-frame ping/pong notifications.  The callback
+   * fires every time a ping is sent on a peer's data channel
+   * (kind = 'sent') and every time a pong arrives on one
+   * (kind = 'recv').  Used by the UI to drive a single-shot pulse
+   * animation on the per-row indicator dot so the blink reflects
+   * real bytes-on-the-wire rather than a continuous CSS clock.
+   * Returns an unsubscribe fn.
+   */
+  onPingTraffic(callback) {
+    this._pingTrafficListeners.add(callback);
+    return () => this._pingTrafficListeners.delete(callback);
+  }
+
+  /** @private — internal fan-out for onPingTraffic. */
+  _firePingTraffic(peerId, kind) {
+    if (this._pingTrafficListeners.size === 0) return;
+    for (const cb of this._pingTrafficListeners) {
+      try { cb(peerId, kind); }
+      catch (err) {
+        this._log('ping-traffic-listener-threw', {
+          peerId, kind, err: err.message,
+        });
+      }
+    }
   }
 
   /**
@@ -618,6 +656,7 @@ export class MeshManager {
         state.rttBuffer.push(rtt);
         if (state.rttBuffer.length > RTT_WINDOW) state.rttBuffer.shift();
         if (state.state === 'stale') state.state = 'open';
+        this._firePingTraffic(state.peerId, 'recv');
         this._notify();
       } else {
         // v0.4.0 — non-ping/pong frame: forward to Transport listeners.
@@ -642,6 +681,7 @@ export class MeshManager {
       try {
         state.dc.send(JSON.stringify({ type: 'ping', t: Date.now() }));
         state.pings++;
+        this._firePingTraffic(state.peerId, 'sent');
       } catch (err) {
         this._log('ping-send-failed', {
           peerId: state.peerId, err: err.message,
