@@ -688,7 +688,14 @@ export class MeshManager {
   _teardown(peerId, reason) {
     const state = this._peers.get(peerId);
     if (!state) return;
-    const wasOpen = state.dc?.readyState === 'open';
+    // "Was this channel ever open?" — check the openedAt timestamp set
+    // when dc.onopen first fired, NOT the dc's current readyState.  By
+    // the time _teardown runs the browser may already have flipped the
+    // dc from 'open' to 'closing'/'closed', which masked the real
+    // open-history and skipped onPeerLost notifications — that left
+    // stale bindings (unbindPeer never ran) and ghost children in
+    // AxonManager roles across the network.
+    const wasOpen = state.openedAt > 0;
     this._log('teardown', {
       peerId, reason,
       role:    state.role,
