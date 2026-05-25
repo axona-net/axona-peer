@@ -46,7 +46,7 @@ import { encode, decode } from './wire.js';
 // where the bfcache can serve a stale module set for ages).  The
 // bridge version arrives separately in its `welcome` message; the
 // "version" row in the me panel shows both side by side.
-const PEER_VERSION = '1.1.5';
+const PEER_VERSION = '1.1.6';
 
 const BRIDGE_PING_INTERVAL_MS = 1000;
 const BRIDGE_STALE_PONG_MS    = 3000;
@@ -152,7 +152,8 @@ const bridge = {
   connectedAt:  0,
   backoffMs:    BACKOFF_INITIAL_MS,
   myConnId:     null,
-  version:      null,           // populated by `welcome`
+  version:       null,          // populated by `welcome` (bridge package version)
+  kernelVersion: null,          // populated by `welcome` (bridge's @axona/protocol kernel version)
   // timers
   pingTimer:    null,
   staleTimer:   null,
@@ -160,12 +161,22 @@ const bridge = {
   reconnectTimer: null,
 };
 
-// "peer v0.1.0 · bridge v0.3.0" once the bridge has welcomed us.
-// Bridge half stays "—" until welcome arrives — that gap is itself
-// useful UX since it signals "WS still negotiating."
+// Pull the kernel version this peer is running.  Imported via the
+// vendored kernel path so it's exactly the build we shipped, never
+// stale relative to PEER_VERSION.  Kernel-version mismatch between
+// peer and bridge is the kind of bug surfaced here by the matching
+// "kernel vX" segments in the version row.
+import { KERNEL_VERSION as PEER_KERNEL_VERSION } from '../vendor/axona-protocol/src/transport/handshake.js';
+
+// "peer v1.1.5 · kernel v1.5.0 · bridge v1.1.3 (kernel v1.5.0)" once
+// welcome has arrived.  The bridge halves stay "—" until then — that
+// gap is itself useful UX since it signals "WS still negotiating."
 function renderVersion() {
-  const bridgeStr = bridge.version ? `v${bridge.version}` : '—';
-  $version.textContent = `peer v${PEER_VERSION} · bridge ${bridgeStr}`;
+  const bridgeStr       = bridge.version       ? `v${bridge.version}`       : '—';
+  const bridgeKernelStr = bridge.kernelVersion ? `kernel v${bridge.kernelVersion}` : 'kernel —';
+  $version.textContent =
+    `peer v${PEER_VERSION} · kernel v${PEER_KERNEL_VERSION} · ` +
+    `bridge ${bridgeStr} (${bridgeKernelStr})`;
 }
 renderVersion();
 
@@ -554,8 +565,9 @@ function onBridgeMessage(ev) {
 
   switch (msg.type) {
     case 'welcome':
-      bridge.myConnId = msg.connId;
-      bridge.version  = msg.version ?? null;
+      bridge.myConnId      = msg.connId;
+      bridge.version       = msg.version ?? null;
+      bridge.kernelVersion = msg.kernelVersion ?? null;
       mesh.setMyId(msg.connId);
       // Hand any bridge-supplied TURN credential to the mesh BEFORE
       // peer-list arrives.  peer-list will trigger _initiateTo, which
