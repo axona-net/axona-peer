@@ -1253,6 +1253,7 @@ export class AxonManager {
     for (const [childId] of role.children) {
       if (childId === this.nodeId) {
         if (this._deliveryCallback) this._deliveryCallback(topicId, json, publishId, publishTs);
+        // Self is also a direct subscriber when it appears in children.
         if (postHash) this._bumpDelivery(topicId, postHash);
         continue;
       }

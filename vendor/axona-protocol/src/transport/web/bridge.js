@@ -30,13 +30,25 @@
 // =====================================================================
 
 import { Transport }            from '../../contracts/Transport.js';
-import { isHexId }              from '../../utils/hexid.js';
+import { isHexId, toHex }       from '../../utils/hexid.js';
 import { TransportError, ErrorCodes } from '../../errors.js';
 
 const REQUEST_TIMEOUT_MS = 5000;
 const MAX_REQ_ID = 0x7fffffff;
 
 const BRIDGE_CONN_ID = 'bridge';  // stable mesh-side id for the bridge
+
+// nodeId at the Transport surface can arrive as 66-char hex (the
+// kernel-canonical wire form, what bindPeer admits) OR as the BigInt
+// the AxonaPeer routing layer uses (peer.sendDirect / peer.routeMessage
+// pass BigInt through to transport.notify / transport.send).  Internal
+// state — this._bridgeNodeId etc. — uses hex, so we normalise inputs
+// at every public surface point.  Sim transport has the same helper.
+function _normPeerId(peerId) {
+  if (typeof peerId === 'bigint') return toHex(peerId);
+  if (typeof peerId === 'string') return peerId.replace(/^0x/, '').toLowerCase();
+  return peerId;
+}
 
 export class BridgeTransport extends Transport {
   /**
@@ -99,7 +111,14 @@ export class BridgeTransport extends Transport {
     if (connId !== BRIDGE_CONN_ID) {
       throw new Error(`BridgeTransport bind expects connId='${BRIDGE_CONN_ID}', got ${connId}`);
     }
+    const isNew = (this._bridgeNodeId !== nodeId);
     this._bridgeNodeId = nodeId;
+    if (isNew && this._peerBoundHandlers) {
+      for (const h of this._peerBoundHandlers) {
+        try { h(nodeId); }
+        catch (err) { this._log?.('peer-bound-handler-threw', { err: err.message }); }
+      }
+    }
   }
 
   unbindPeer(_connId) {
@@ -107,7 +126,8 @@ export class BridgeTransport extends Transport {
   }
 
   connIdFor(nodeId) {
-    return (this._bridgeNodeId !== null && this._bridgeNodeId === nodeId) ? BRIDGE_CONN_ID : null;
+    const hex = _normPeerId(nodeId);
+    return (this._bridgeNodeId !== null && this._bridgeNodeId === hex) ? BRIDGE_CONN_ID : null;
   }
 
   nodeIdFor(connId) {
@@ -116,7 +136,42 @@ export class BridgeTransport extends Transport {
 
   /** True if this transport knows about this peer (i.e., it's the bridge). */
   ownsPeer(nodeId) {
-    return this._bridgeNodeId !== null && this._bridgeNodeId === nodeId;
+    if (this._bridgeNodeId === null) return false;
+    return this._bridgeNodeId === _normPeerId(nodeId);
+  }
+
+  /**
+   * Currently-bound peer node IDs (66-char hex).  At most one for a
+   * BridgeTransport: the bridge's own embedded peer.  Empty until the
+   * hello-ack admission completes.  Consumed by AxonaPeer.start() so
+   * peers known to the transport are auto-admitted to the synaptome.
+   *
+   * @returns {string[]}
+   */
+  boundPeers() {
+    return this._bridgeNodeId !== null ? [this._bridgeNodeId] : [];
+  }
+
+  /**
+   * Register a callback that fires when a new peer is bound via
+   * `bindPeer(nodeId, connId)`.  Used by AxonaPeer.start() to admit
+   * synapses dynamically as the bridge handshake / mesh handshake
+   * complete.
+   *
+   * @param {(nodeIdHex: string) => void} handler
+   * @returns {() => void} unsubscribe
+   */
+  onPeerBound(handler) {
+    if (typeof handler !== 'function') {
+      throw new TypeError('onPeerBound: handler must be a function');
+    }
+    if (!this._peerBoundHandlers) this._peerBoundHandlers = new Set();
+    this._peerBoundHandlers.add(handler);
+    // Fire immediately for any peer already bound at subscribe time.
+    if (this._bridgeNodeId) {
+      try { handler(this._bridgeNodeId); } catch { /* swallow */ }
+    }
+    return () => { this._peerBoundHandlers?.delete(handler); };
   }
 
   // ── Channel pool ──────────────────────────────────────────────────

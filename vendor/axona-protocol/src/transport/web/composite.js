@@ -102,6 +102,60 @@ export class CompositeTransport extends Transport {
     return null;
   }
 
+  /**
+   * Aggregate boundPeers() across sub-transports.  Each sub may
+   * implement `boundPeers()` (BridgeTransport, WebRTCTransport) to
+   * report the 66-char hex nodeIds it has admitted via its own
+   * handshake.  AxonaPeer.start() consumes this to auto-admit peers
+   * into the synaptome, so consumers don't have to wire the synapse
+   * by hand after a webTransport handshake.
+   *
+   * Sub-transports without `boundPeers()` contribute nothing here;
+   * the SimNetwork-only path (dht-sim, tests) keeps its existing
+   * synaptome-seeding flow.
+   *
+   * @returns {string[]} deduplicated list of bound nodeIds
+   */
+  boundPeers() {
+    const seen = new Set();
+    for (const t of this._subs) {
+      if (typeof t.boundPeers !== 'function') continue;
+      for (const id of t.boundPeers()) {
+        if (typeof id === 'string') seen.add(id);
+      }
+    }
+    return [...seen];
+  }
+
+  /**
+   * Subscribe to bind events across all sub-transports that emit them.
+   * The composite's handler fires for every new peer bound on any sub,
+   * deduplicated across sub-transports (a peer that gets bound on both
+   * the bridge and the mesh fires once).
+   *
+   * @param {(nodeIdHex: string) => void} handler
+   * @returns {() => void} unsubscribe
+   */
+  onPeerBound(handler) {
+    if (typeof handler !== 'function') {
+      throw new TypeError('onPeerBound: handler must be a function');
+    }
+    const seen = new Set();
+    const wrapped = (nodeIdHex) => {
+      if (seen.has(nodeIdHex)) return;
+      seen.add(nodeIdHex);
+      try { handler(nodeIdHex); }
+      catch (err) { this._log?.('peer-bound-fanout-threw', { err: err.message }); }
+    };
+    const unsubs = [];
+    for (const t of this._subs) {
+      if (typeof t.onPeerBound === 'function') {
+        unsubs.push(t.onPeerBound(wrapped));
+      }
+    }
+    return () => { for (const u of unsubs) try { u(); } catch { /* swallow */ } };
+  }
+
   // ── Channel pool ────────────────────────────────────────────────────
 
   async openConnection(nodeId) {
