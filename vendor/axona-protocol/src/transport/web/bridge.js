@@ -19,18 +19,20 @@
 //
 // Lifecycle:
 //   - Construct with { sendToBridge, isBridgeOpen, log }
-//   - Start with the browser's local 66-char hex nodeId
+//   - Start with the browser's local hex nodeId (converted internally
+//     to BigInt; the contract surface is BigInt-only for nodeId).
 //   - The webTransport orchestrator sends a `hello` notification to
 //     the bridge; the bridge replies with `hello-ack` carrying its
-//     nodeId.  On hello-ack receipt, bindPeer(bridgeNodeId, 'bridge')
-//     is called.
-//   - From there, send / notify / onRequest etc. work uniformly.
+//     nodeId (hex on the wire).  On hello-ack receipt the dispatcher
+//     converts to BigInt and calls bindPeer(bridgeNodeIdBig, 'bridge').
+//   - From there, send / notify / onRequest etc. work uniformly with
+//     BigInt nodeIds in the kernel; hex appears only on the wire.
 //
-// nodeId convention: 66-char hex strings (matches WebRTCTransport).
+// nodeId convention: BigInt in memory; 66-char lowercase hex on the
+// wire and as the user-facing display form.
 // =====================================================================
 
 import { Transport }            from '../../contracts/Transport.js';
-import { isHexId, toHex }       from '../../utils/hexid.js';
 import { TransportError, ErrorCodes } from '../../errors.js';
 
 const REQUEST_TIMEOUT_MS = 5000;
@@ -38,22 +40,10 @@ const MAX_REQ_ID = 0x7fffffff;
 
 const BRIDGE_CONN_ID = 'bridge';  // stable mesh-side id for the bridge
 
-// nodeId at the Transport surface can arrive as 66-char hex (the
-// kernel-canonical wire form, what bindPeer admits) OR as the BigInt
-// the AxonaPeer routing layer uses (peer.sendDirect / peer.routeMessage
-// pass BigInt through to transport.notify / transport.send).  Internal
-// state — this._bridgeNodeId etc. — uses hex, so we normalise inputs
-// at every public surface point.  Sim transport has the same helper.
-function _normPeerId(peerId) {
-  if (typeof peerId === 'bigint') return toHex(peerId);
-  if (typeof peerId === 'string') return peerId.replace(/^0x/, '').toLowerCase();
-  return peerId;
-}
-
 export class BridgeTransport extends Transport {
   /**
    * @param {Object} opts
-   * @param {string} [opts.localNodeId]  66-char hex; set via start() if omitted
+   * @param {bigint} [opts.localNodeId]  BigInt nodeId; set via start() if omitted
    * @param {(msg: object) => boolean} opts.sendToBridge
    *        Synchronous send: serializes `msg` and writes to the
    *        bridge WebSocket.  Returns true if the socket accepted
@@ -77,9 +67,9 @@ export class BridgeTransport extends Transport {
     this._nextId      = 1;
     this._peerDiedHandlers = [];
 
-    // Single binding: the bridge's 66-char hex nodeId ↔ the fixed
-    // 'bridge' connId.  Set by bindPeer once hello-ack arrives.
-    /** @type {string | null} */
+    // Single binding: the bridge's BigInt nodeId ↔ the fixed 'bridge'
+    // connId.  Set by bindPeer once hello-ack arrives.
+    /** @type {bigint | null} */
     this._bridgeNodeId = null;
 
     this._started = false;
@@ -104,9 +94,13 @@ export class BridgeTransport extends Transport {
 
   // ── nodeId binding (single peer: the bridge) ──────────────────────
 
+  /**
+   * @param {bigint} nodeId  264-bit BigInt nodeId
+   * @param {string} connId  must equal BRIDGE_CONN_ID ('bridge')
+   */
   bindPeer(nodeId, connId) {
-    if (!isHexId(nodeId)) {
-      throw new TypeError(`BridgeTransport.bindPeer: nodeId must be 66-char hex, got ${typeof nodeId}`);
+    if (typeof nodeId !== 'bigint') {
+      throw new TypeError(`BridgeTransport.bindPeer: nodeId must be bigint, got ${typeof nodeId}`);
     }
     if (connId !== BRIDGE_CONN_ID) {
       throw new Error(`BridgeTransport bind expects connId='${BRIDGE_CONN_ID}', got ${connId}`);
@@ -125,11 +119,13 @@ export class BridgeTransport extends Transport {
     this._bridgeNodeId = null;
   }
 
+  /** @param {bigint} nodeId */
   connIdFor(nodeId) {
-    const hex = _normPeerId(nodeId);
-    return (this._bridgeNodeId !== null && this._bridgeNodeId === hex) ? BRIDGE_CONN_ID : null;
+    if (this._bridgeNodeId === null) return null;
+    return (this._bridgeNodeId === nodeId) ? BRIDGE_CONN_ID : null;
   }
 
+  /** @param {string} connId @returns {bigint|null} */
   nodeIdFor(connId) {
     return (connId === BRIDGE_CONN_ID) ? this._bridgeNodeId : null;
   }
@@ -137,16 +133,16 @@ export class BridgeTransport extends Transport {
   /** True if this transport knows about this peer (i.e., it's the bridge). */
   ownsPeer(nodeId) {
     if (this._bridgeNodeId === null) return false;
-    return this._bridgeNodeId === _normPeerId(nodeId);
+    return this._bridgeNodeId === nodeId;
   }
 
   /**
-   * Currently-bound peer node IDs (66-char hex).  At most one for a
-   * BridgeTransport: the bridge's own embedded peer.  Empty until the
-   * hello-ack admission completes.  Consumed by AxonaPeer.start() so
-   * peers known to the transport are auto-admitted to the synaptome.
+   * Currently-bound peer node IDs.  At most one for a BridgeTransport:
+   * the bridge's own embedded peer.  Empty until the hello-ack
+   * admission completes.  Consumed by AxonaPeer.start() so peers known
+   * to the transport are auto-admitted to the synaptome.
    *
-   * @returns {string[]}
+   * @returns {bigint[]}
    */
   boundPeers() {
     return this._bridgeNodeId !== null ? [this._bridgeNodeId] : [];
@@ -158,7 +154,7 @@ export class BridgeTransport extends Transport {
    * synapses dynamically as the bridge handshake / mesh handshake
    * complete.
    *
-   * @param {(nodeIdHex: string) => void} handler
+   * @param {(nodeIdBig: bigint) => void} handler
    * @returns {() => void} unsubscribe
    */
   onPeerBound(handler) {
@@ -168,7 +164,7 @@ export class BridgeTransport extends Transport {
     if (!this._peerBoundHandlers) this._peerBoundHandlers = new Set();
     this._peerBoundHandlers.add(handler);
     // Fire immediately for any peer already bound at subscribe time.
-    if (this._bridgeNodeId) {
+    if (this._bridgeNodeId !== null) {
       try { handler(this._bridgeNodeId); } catch { /* swallow */ }
     }
     return () => { this._peerBoundHandlers?.delete(handler); };
@@ -197,8 +193,8 @@ export class BridgeTransport extends Transport {
     }
     if (!this.ownsPeer(nodeId) || !this._isBridgeOpen()) {
       throw new TransportError(ErrorCodes.TRANSPORT_CHANNEL_CLOSED,
-        `BridgeTransport.send: peer ${nodeId} not connected`,
-        { context: { nodeId, type } });
+        `BridgeTransport.send: peer ${String(nodeId)} not connected`,
+        { context: { nodeId: String(nodeId), type } });
     }
 
     const id = this._nextId;
@@ -209,7 +205,7 @@ export class BridgeTransport extends Transport {
         this._pending.delete(id);
         reject(new TransportError(ErrorCodes.TRANSPORT_TIMEOUT,
           `BridgeTransport.send: timeout awaiting '${type}'`,
-          { context: { nodeId, type } }));
+          { context: { nodeId: String(nodeId), type } }));
       }, REQUEST_TIMEOUT_MS);
       this._pending.set(id, { nodeId, resolve, reject, timer });
 
@@ -220,7 +216,7 @@ export class BridgeTransport extends Transport {
         this._pending.delete(id);
         reject(new TransportError(ErrorCodes.TRANSPORT_PEER_UNREACHABLE,
           `BridgeTransport.send: bridge write failed (${err.message})`,
-          { cause: err, context: { nodeId, type } }));
+          { cause: err, context: { nodeId: String(nodeId), type } }));
       }
     });
   }
@@ -230,11 +226,15 @@ export class BridgeTransport extends Transport {
       throw new TransportError(ErrorCodes.TRANSPORT_NOT_STARTED,
         'BridgeTransport.notify: not started');
     }
-    // Hello / hello-ack flow special case: the orchestrator may want
-    // to send a notification BEFORE bindPeer happens (e.g., a hello
-    // reply targeting BRIDGE_CONN_ID).  Allow that by accepting the
-    // sentinel.  Otherwise: peer must be the bound bridge.
-    if (!this.ownsPeer(nodeId) && nodeId !== BRIDGE_CONN_ID) {
+    // Pre-bind hello path: the orchestrator may want to send a
+    // notification BEFORE bindPeer happens (e.g. a hello reply targeting
+    // BRIDGE_CONN_ID).  Allow the literal 'bridge' sentinel through.
+    // Otherwise nodeId must be the bound BigInt bridge id.
+    if (nodeId === BRIDGE_CONN_ID) {
+      // sentinel — fall through
+    } else if (typeof nodeId !== 'bigint') {
+      throw new TypeError(`BridgeTransport.notify: nodeId must be bigint or BRIDGE_CONN_ID sentinel, got ${typeof nodeId}`);
+    } else if (!this.ownsPeer(nodeId)) {
       this._log('bridge-notify-not-bridge-peer', { nodeId: String(nodeId), type });
       return;
     }
@@ -280,7 +280,7 @@ export class BridgeTransport extends Transport {
    */
   handleIncoming(payload) {
     if (!payload || typeof payload !== 'object') return;
-    const fromNodeId = this._bridgeNodeId;   // null until bindPeer
+    const fromNodeId = this._bridgeNodeId;   // BigInt or null (null until bindPeer)
 
     if (payload.k === 'req') {
       this._handleRequest(fromNodeId, payload);
@@ -332,6 +332,8 @@ export class BridgeTransport extends Transport {
     const handler = this._ntfHandlers.get(msg.type);
     if (!handler) return;
     try {
+      // For pre-bind frames (hello before bindPeer), pass the sentinel
+      // string so the orchestrator can recognise the unbound state.
       handler(fromNodeId ?? BRIDGE_CONN_ID, msg.body);
     } catch (err) {
       this._log('ntf-handler-threw', { type: msg.type, err: err.message });
@@ -350,7 +352,7 @@ export class BridgeTransport extends Transport {
       this._pending.delete(id);
       p.reject(new TransportError(ErrorCodes.TRANSPORT_PEER_UNREACHABLE,
         'bridge connection closed',
-        { context: { nodeId: p.nodeId } }));
+        { context: { nodeId: String(p.nodeId) } }));
     }
     this._bridgeNodeId = null;
   }

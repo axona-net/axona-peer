@@ -136,6 +136,37 @@ export async function deriveTopicId(publisherNodeId, topicName) {
 }
 
 /**
+ * BigInt-returning variant of `deriveTopicId`.  Kernel internals
+ * (AxonaPeer.pub / sub, AxonManager state) hold topic IDs as 264-bit
+ * BigInts; this helper is the canonical entrypoint for that form.
+ *
+ * The `publisher` argument is either:
+ *   - a 264-bit BigInt nodeId (canonical), or
+ *   - `null` for public mode (anyone-can-publish topics).
+ *
+ * Returns the same value as `fromHex(await deriveTopicId(toHex(publisher), topic))`
+ * but expresses the contract in BigInt terms for the kernel.
+ *
+ * @param {bigint|null} publisherBig  264-bit BigInt nodeId, or null for public mode.
+ * @param {string}      topicName     Application-chosen topic name.
+ * @returns {Promise<bigint>}         264-bit BigInt topic ID.
+ */
+export async function deriveTopicIdBig(publisherBig, topicName) {
+  if (publisherBig === null || publisherBig === undefined) {
+    const hex = await deriveTopicId(null, topicName);
+    return BigInt('0x' + hex);
+  }
+  if (typeof publisherBig !== 'bigint') {
+    throw new TypeError(
+      `deriveTopicIdBig: publisher must be bigint or null, got ${typeof publisherBig}`,
+    );
+  }
+  const publisherHex = publisherBig.toString(16).padStart(66, '0');
+  const hex = await deriveTopicId(publisherHex, topicName);
+  return BigInt('0x' + hex);
+}
+
+/**
  * @typedef {Object} PostRef
  * @property {string} topic_id
  * @property {string} post_hash

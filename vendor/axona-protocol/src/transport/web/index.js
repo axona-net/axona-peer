@@ -25,21 +25,17 @@
 // common case (browser peer connecting to bridge.axona.net + opening
 // WebRTC channels to other browsers it meets through that bridge).
 //
-// nodeIds at every Transport-contract surface are 66-char lowercase
-// hex strings (matches the kernel's 264-bit address space).
-//
-// Hello/hello-ack admission — the handshake that exchanges nodeIds on
-// each fresh channel and calls bindPeer() — lands as part of the W1
-// task (#22) since it's the version-gated entry point.  Until then,
-// callers wire bindPeer themselves; the existing axona-peer code base
-// has the reference orchestration.
+// nodeIds at every Transport-contract surface are 264-bit BigInts.
+// Hex strings (66-char) appear on the JSON wire (hello/hello-ack
+// body.nodeId fields) and at user-facing display surfaces — converted
+// at the dispatcher boundary inside this factory.
 // =====================================================================
 
 import { MeshManager }       from './mesh.js';
 import { WebRTCTransport }   from './webrtc.js';
 import { BridgeTransport, BRIDGE_CONN_ID_EXPORT as BRIDGE_CONN_ID } from './bridge.js';
 import { CompositeTransport } from './composite.js';
-import { isHexId }            from '../../utils/hexid.js';
+import { isHexId, toHex, fromHex } from '../../utils/hexid.js';
 import { TransportError, ErrorCodes, UpgradeRequiredError } from '../../errors.js';
 import { KERNEL_VERSION }    from '../handshake.js';
 
@@ -61,7 +57,7 @@ export { MeshManager, WebRTCTransport, BridgeTransport, CompositeTransport };
  *                 raw frame on the socket (satisfies the bridge's
  *                 WebSocket-level version gate);
  *             (b) registers a notification handler for the bridge's
- *                 `hello`, calls `bridge.bindPeer(bridgeNodeId, 'bridge')`
+ *                 `hello`, calls `bridge.bindPeer(bridgeNodeIdBig, 'bridge')`
  *                 on receipt, replies with our own `hello-ack`;
  *             (c) `transport.start()` resolves only after the bridge
  *                 has been bound, OR rejects on timeout / WS close.
@@ -86,10 +82,13 @@ export { MeshManager, WebRTCTransport, BridgeTransport, CompositeTransport };
  * also completes the bridge's WebSocket-level version gate AND the
  * application-level hello / hello-ack admission.  After start, the
  * bridge is bound in `transport.bridge` and reachable as a peer.
- * Read `transport.bridgeNodeId` for the bound bridge's 66-char hex id.
+ *
+ * - `transport.bridgeNodeId`   — bridge's 66-char hex nodeId (display surface)
+ * - `transport.bridgeNodeIdBig`— bridge's BigInt nodeId (kernel form)
+ * - `transport.bridgeReady`    — Promise resolving to the BigInt bridge nodeId
  *
  * @param {WebTransportConfig} config
- * @returns {CompositeTransport & { mesh: MeshManager, webrtc: WebRTCTransport, bridge: BridgeTransport, socket: WebSocket | null, bridgeReady: Promise<string|null>, bridgeNodeId: string | null }}
+ * @returns {CompositeTransport & { mesh: MeshManager, webrtc: WebRTCTransport, bridge: BridgeTransport, socket: WebSocket | null, bridgeReady: Promise<bigint|null>, bridgeNodeId: string | null, bridgeNodeIdBig: bigint | null }}
  */
 /** Bridge ping cadence — matches axona-peer's BRIDGE_PING_INTERVAL_MS. */
 const BRIDGE_PING_INTERVAL_MS = 1000;
@@ -121,7 +120,11 @@ export function webTransport({
       { context: {} });
   }
 
-  const localNodeId = identity.id;
+  // Internal canonical form is BigInt; identity.id stays hex (user-facing
+  // display + wire form).  `localNodeIdHex` is used only for hello/hello-ack
+  // wire payloads and for the bridge's setMyId signaling-channel id.
+  const localNodeIdHex = identity.id;
+  const localNodeIdBig = fromHex(identity.id);
 
   // ── 1. Bridge WebSocket connection ───────────────────────────────
   //
@@ -221,7 +224,7 @@ export function webTransport({
         case 'welcome':
           // Bridge greeting (myConnId, server version, optional TURN
           // credentials).  composite.start has already called
-          // mesh.setMyId(localNodeId); here we just thread the TURN
+          // mesh.setMyId(localNodeIdHex); here we just thread the TURN
           // config through to the mesh BEFORE peer-list arrives so the
           // RTCPeerConnections built by _initiateTo can relay through
           // it.  Mirrors axona-peer/src/client.js's `case 'welcome'`.
@@ -268,14 +271,14 @@ export function webTransport({
 
   const webrtc = new WebRTCTransport({
     mesh,
-    localNodeId,
+    localNodeId: localNodeIdBig,
     log,
   });
 
   // ── 4. BridgeTransport over the WebSocket ────────────────────────
 
   const bridge = new BridgeTransport({
-    localNodeId,
+    localNodeId: localNodeIdBig,
     sendToBridge: (msg) => sendToBridge(msg),
     isBridgeOpen: () => socketOpen,
     log,
@@ -283,7 +286,7 @@ export function webTransport({
 
   // ── 5. CompositeTransport — public surface ───────────────────────
 
-  const composite = new CompositeTransport({ localNodeId, log });
+  const composite = new CompositeTransport({ localNodeId: localNodeIdBig, log });
   composite.addSubtransport(bridge);   // bridge is the single-peer fast-path
   composite.addSubtransport(webrtc);   // WebRTC for everyone else
 
@@ -300,11 +303,13 @@ export function webTransport({
   //
   //   (b) Application-level hello / hello-ack.  After admission the
   //       bridge sends an `axona`-framed `hello` carrying its own
-  //       nodeId.  On receipt: bridge.bindPeer(nodeId, 'bridge') +
-  //       reply with hello-ack carrying our nodeId.
+  //       nodeId (hex on the wire).  On receipt: convert to BigInt,
+  //       bridge.bindPeer(nodeIdBig, 'bridge') + reply with hello-ack
+  //       carrying our own hex nodeId.
   //
   // composite.start() awaits both layers when autoHandshake is true.
-  let bridgeNodeId = null;
+  /** @type {bigint|null} */
+  let bridgeNodeIdBig = null;
   let bridgeReadyResolve = null;
   let bridgeReadyReject  = null;
   const bridgeReady = new Promise((resolve, reject) => {
@@ -322,44 +327,49 @@ export function webTransport({
     // Register BEFORE the socket opens so we don't miss the bridge's
     // first hello (which arrives on the same tick as version-gate /
     // welcome).
+    //
+    // Wire form: body.nodeId is hex (66-char).  Convert to BigInt at
+    // the boundary; the rest of the kernel sees BigInt.
     bridge.onNotification('hello', (fromConnId, body) => {
+      // Pre-bind state: fromConnId === BRIDGE_CONN_ID sentinel string.
       if (typeof fromConnId !== 'string') return;     // already bound
       if (!body || !isHexId(body.nodeId)) return;
-      const nodeIdHex = body.nodeId;
+      const nodeIdBig = fromHex(body.nodeId);
       try {
-        bridge.bindPeer(nodeIdHex, BRIDGE_CONN_ID);
+        bridge.bindPeer(nodeIdBig, BRIDGE_CONN_ID);
       } catch (err) {
         log('auto-handshake-bind-failed', { err: err.message });
         bridgeReadyReject(err);
         return;
       }
       // Reply with hello-ack so the bridge knows our nodeId.
+      // Outbound wire: hex.
       bridge.notify(BRIDGE_CONN_ID, 'hello-ack', {
         proto:  'axona/3',
-        nodeId: localNodeId,
+        nodeId: localNodeIdHex,
       }).catch(err => log('auto-handshake-ack-failed', { err: err.message }));
-      bridgeNodeId = nodeIdHex;
-      log('auto-handshake-complete', { bridgeNodeId: nodeIdHex });
-      bridgeReadyResolve(nodeIdHex);
+      bridgeNodeIdBig = nodeIdBig;
+      log('auto-handshake-complete', { bridgeNodeId: body.nodeId });
+      bridgeReadyResolve(nodeIdBig);
     });
     bridge.onNotification('hello-ack', (fromConnId, body) => {
       if (typeof fromConnId !== 'string') return;
       if (!body || !isHexId(body.nodeId)) return;
-      if (bridgeNodeId) return;                       // already done
-      const nodeIdHex = body.nodeId;
+      if (bridgeNodeIdBig !== null) return;           // already done
+      const nodeIdBig = fromHex(body.nodeId);
       try {
-        bridge.bindPeer(nodeIdHex, BRIDGE_CONN_ID);
+        bridge.bindPeer(nodeIdBig, BRIDGE_CONN_ID);
       } catch (err) {
         log('auto-handshake-bind-failed', { err: err.message });
         bridgeReadyReject(err);
         return;
       }
-      bridgeNodeId = nodeIdHex;
-      log('auto-handshake-complete', { bridgeNodeId: nodeIdHex });
-      bridgeReadyResolve(nodeIdHex);
+      bridgeNodeIdBig = nodeIdBig;
+      log('auto-handshake-complete', { bridgeNodeId: body.nodeId });
+      bridgeReadyResolve(nodeIdBig);
     });
     socketEvents.close.add(() => {
-      if (!bridgeNodeId) {
+      if (bridgeNodeIdBig === null) {
         bridgeReadyReject(new UpgradeRequiredError(
           'bridge closed socket before handshake completed',
           { context: { reason: 'socket_closed_pre_handshake', bridgeUrl } }));
@@ -370,9 +380,10 @@ export function webTransport({
     // When a WebRTC DataChannel reaches 'open' state, send hello to
     // the remote.  When their hello (or hello-ack) arrives, bindPeer
     // in WebRTCTransport so subsequent transport.send / notify by
-    // nodeId routes via the mesh.  AxonaPeer's onPeerBound subscriber
-    // then admits the new peer into the synaptome — the kernel now
-    // handles the full multi-peer mesh admission automatically.
+    // BigInt nodeId routes via the mesh.  AxonaPeer's onPeerBound
+    // subscriber then admits the new peer into the synaptome — the
+    // kernel now handles the full multi-peer mesh admission
+    // automatically.
     const helloSentToMeshId = new Set();
     if (typeof mesh.onChange === 'function') {
       mesh.onChange((peers) => {
@@ -386,7 +397,7 @@ export function webTransport({
           try {
             mesh.send(meshId, {
               k: 'ntf', type: 'hello',
-              body: { proto: 'axona/3', nodeId: localNodeId },
+              body: { proto: 'axona/3', nodeId: localNodeIdHex },
             });
             log('mesh-hello-sent', { meshId });
           } catch (err) {
@@ -399,12 +410,15 @@ export function webTransport({
       mesh.onPeerLost((meshId) => helloSentToMeshId.delete(meshId));
     }
     webrtc.onNotification('hello', (fromConnId, body) => {
-      if (typeof fromConnId !== 'string') return;     // already bound
+      // Pre-bind: fromConnId is the meshId string.  Once bound it
+      // would be a BigInt — but the hello path is the binding event,
+      // so we're always in the pre-bind branch here.
+      if (typeof fromConnId !== 'string') return;
       if (!body || !isHexId(body.nodeId)) return;
       const meshId  = fromConnId;
-      const peerHex = body.nodeId;
+      const peerBig = fromHex(body.nodeId);
       try {
-        webrtc.bindPeer(peerHex, meshId);
+        webrtc.bindPeer(peerBig, meshId);
       } catch (err) {
         log('mesh-bind-failed', { meshId, err: err.message });
         return;
@@ -416,25 +430,25 @@ export function webTransport({
       try {
         mesh.send(meshId, {
           k: 'ntf', type: 'hello-ack',
-          body: { proto: 'axona/3', nodeId: localNodeId },
+          body: { proto: 'axona/3', nodeId: localNodeIdHex },
         });
       } catch (err) {
         log('mesh-hello-ack-failed', { meshId, err: err.message });
       }
-      log('mesh-handshake-complete', { meshId, peer: peerHex });
+      log('mesh-handshake-complete', { meshId, peer: body.nodeId });
     });
     webrtc.onNotification('hello-ack', (fromConnId, body) => {
       if (typeof fromConnId !== 'string') return;
       if (!body || !isHexId(body.nodeId)) return;
       const meshId  = fromConnId;
-      const peerHex = body.nodeId;
+      const peerBig = fromHex(body.nodeId);
       try {
-        webrtc.bindPeer(peerHex, meshId);
+        webrtc.bindPeer(peerBig, meshId);
       } catch (err) {
         log('mesh-bind-failed', { meshId, err: err.message });
         return;
       }
-      log('mesh-handshake-complete', { meshId, peer: peerHex });
+      log('mesh-handshake-complete', { meshId, peer: body.nodeId });
     });
   }
 
@@ -453,8 +467,14 @@ export function webTransport({
         socketEvents.close.add(onClose);
       });
     }
-    if (typeof mesh.setMyId === 'function') mesh.setMyId(localNodeId);
-    await origStart(localNodeId);
+    // mesh.setMyId is the signaling-channel identifier the mesh layer
+    // compares against to skip self in peer-list iteration.  The mesh
+    // layer uses bridge connIds (3-char strings) as peerIds; passing
+    // our hex nodeId here is a no-op skip (it never matches a 3-char
+    // connId in the peer-list) — preserved as-is for compatibility
+    // with axona-peer's wiring.  Pass hex (the wire-form of our id).
+    if (typeof mesh.setMyId === 'function') mesh.setMyId(localNodeIdHex);
+    await origStart(localNodeIdBig);
 
     if (autoHandshake) {
       // (a) WebSocket-level version gate: send the raw client-hello
@@ -469,7 +489,7 @@ export function webTransport({
       }
       // (b) Wait for the application-level hello / hello-ack to land.
       const timer = setTimeout(() => {
-        if (!bridgeNodeId) {
+        if (bridgeNodeIdBig === null) {
           bridgeReadyReject(new UpgradeRequiredError(
             `bridge handshake timed out after ${handshakeTimeoutMs}ms`,
             { context: { reason: 'handshake_timeout', bridgeUrl } }));
@@ -532,9 +552,17 @@ export function webTransport({
   composite.mesh    = mesh;
   composite.webrtc  = webrtc;
   composite.bridge  = bridge;
-  Object.defineProperty(composite, 'socket',       { get() { return socket; } });
-  Object.defineProperty(composite, 'bridgeReady',  { get() { return bridgeReady; } });
-  Object.defineProperty(composite, 'bridgeNodeId', { get() { return bridgeNodeId; } });
+  Object.defineProperty(composite, 'socket',          { get() { return socket; } });
+  Object.defineProperty(composite, 'bridgeReady',     { get() { return bridgeReady; } });
+  // Display surface: hex (derived from BigInt).  External UI / log
+  // consumers read this for human-readable bridge nodeId.
+  Object.defineProperty(composite, 'bridgeNodeId',    {
+    get() { return bridgeNodeIdBig === null ? null : toHex(bridgeNodeIdBig); },
+  });
+  // Kernel-internal form: BigInt.
+  Object.defineProperty(composite, 'bridgeNodeIdBig', {
+    get() { return bridgeNodeIdBig; },
+  });
 
   return composite;
 }

@@ -46,7 +46,7 @@ export const WIRE_VERSION = '1.0';
 
 /** The kernel's own peer-version string.  Apps wrapping the kernel
  *  pass their own version through; this is just the default. */
-export const KERNEL_VERSION = '1.4.1';
+export const KERNEL_VERSION = '1.5.0';
 
 /** WebSocket close code for version mismatches (custom, in the
  *  application-specific 4000-4999 range). */

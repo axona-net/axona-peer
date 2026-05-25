@@ -19,26 +19,24 @@
 // internally.  The orchestrator (axona_node.js) calls bindPeer on
 // the correct sub-transport directly when each handshake completes.
 //
-// Conformance: this class implements the same surface as the
-// concrete transports.  Adding/removing sub-transports at runtime
-// is allowed; new sub-transports inherit the currently-registered
-// handlers.
+// nodeId convention: 264-bit BigInt throughout the public surface
+// here.  The sub-transports likewise speak BigInt internally; hex is
+// only on the wire (JSON payloads) and at user-facing display points.
 // =====================================================================
 
 import { Transport }       from '../../contracts/Transport.js';
-import { isHexId }         from '../../utils/hexid.js';
 import { TransportError, ErrorCodes } from '../../errors.js';
 
 export class CompositeTransport extends Transport {
   /**
    * @param {Object} opts
-   * @param {string} opts.localNodeId   66-char hex node ID
+   * @param {bigint} opts.localNodeId   264-bit BigInt nodeId
    * @param {(event:string, data?:object) => void} [opts.log]
    */
   constructor({ localNodeId, log }) {
     super();
-    if (!isHexId(localNodeId)) {
-      throw new TypeError(`CompositeTransport: localNodeId must be 66-char hex, got ${typeof localNodeId}`);
+    if (typeof localNodeId !== 'bigint') {
+      throw new TypeError(`CompositeTransport: localNodeId must be bigint, got ${typeof localNodeId}`);
     }
     this._localNodeId = localNodeId;
     this._log         = log ?? (() => {});
@@ -71,7 +69,7 @@ export class CompositeTransport extends Transport {
   async start(localNodeId) {
     if (localNodeId !== undefined) this._localNodeId = localNodeId;
     if (this._started) return;
-    for (const t of this._subs) await t.start(localNodeId);
+    for (const t of this._subs) await t.start(this._localNodeId);
     this._started = true;
   }
 
@@ -105,23 +103,23 @@ export class CompositeTransport extends Transport {
   /**
    * Aggregate boundPeers() across sub-transports.  Each sub may
    * implement `boundPeers()` (BridgeTransport, WebRTCTransport) to
-   * report the 66-char hex nodeIds it has admitted via its own
-   * handshake.  AxonaPeer.start() consumes this to auto-admit peers
-   * into the synaptome, so consumers don't have to wire the synapse
-   * by hand after a webTransport handshake.
+   * report the BigInt nodeIds it has admitted via its own handshake.
+   * AxonaPeer.start() consumes this to auto-admit peers into the
+   * synaptome, so consumers don't have to wire the synapse by hand
+   * after a webTransport handshake.
    *
    * Sub-transports without `boundPeers()` contribute nothing here;
    * the SimNetwork-only path (dht-sim, tests) keeps its existing
    * synaptome-seeding flow.
    *
-   * @returns {string[]} deduplicated list of bound nodeIds
+   * @returns {bigint[]} deduplicated list of bound nodeIds
    */
   boundPeers() {
     const seen = new Set();
     for (const t of this._subs) {
       if (typeof t.boundPeers !== 'function') continue;
       for (const id of t.boundPeers()) {
-        if (typeof id === 'string') seen.add(id);
+        if (typeof id === 'bigint') seen.add(id);
       }
     }
     return [...seen];
@@ -133,7 +131,7 @@ export class CompositeTransport extends Transport {
    * deduplicated across sub-transports (a peer that gets bound on both
    * the bridge and the mesh fires once).
    *
-   * @param {(nodeIdHex: string) => void} handler
+   * @param {(nodeIdBig: bigint) => void} handler
    * @returns {() => void} unsubscribe
    */
   onPeerBound(handler) {
@@ -141,10 +139,11 @@ export class CompositeTransport extends Transport {
       throw new TypeError('onPeerBound: handler must be a function');
     }
     const seen = new Set();
-    const wrapped = (nodeIdHex) => {
-      if (seen.has(nodeIdHex)) return;
-      seen.add(nodeIdHex);
-      try { handler(nodeIdHex); }
+    const wrapped = (nodeIdBig) => {
+      if (typeof nodeIdBig !== 'bigint') return;
+      if (seen.has(nodeIdBig)) return;
+      seen.add(nodeIdBig);
+      try { handler(nodeIdBig); }
       catch (err) { this._log?.('peer-bound-fanout-threw', { err: err.message }); }
     };
     const unsubs = [];
@@ -180,8 +179,8 @@ export class CompositeTransport extends Transport {
     const t = this._routeFor(nodeId);
     if (!t) {
       throw new TransportError(ErrorCodes.TRANSPORT_PEER_UNREACHABLE,
-        `CompositeTransport.send: no route to ${nodeId}`,
-        { context: { nodeId, type } });
+        `CompositeTransport.send: no route to ${String(nodeId)}`,
+        { context: { nodeId: String(nodeId), type } });
     }
     return t.send(nodeId, type, body);
   }
@@ -226,9 +225,11 @@ export class CompositeTransport extends Transport {
 
   // ── Convenience: ask every sub-transport for its mapping ──────────
 
-  /** Reverse-lookup nodeId from a mesh-layer connId / meshId.  Tries
-   *  every sub-transport that exposes the helper; returns the first
-   *  hit, or null. */
+  /** Reverse-lookup BigInt nodeId from a mesh-layer connId / meshId.
+   *  Tries every sub-transport that exposes the helper; returns the
+   *  first hit, or null.
+   *  @param {string} channelId
+   *  @returns {bigint|null} */
   nodeIdFor(channelId) {
     for (const t of this._subs) {
       if (typeof t.nodeIdFor !== 'function') continue;
@@ -238,7 +239,8 @@ export class CompositeTransport extends Transport {
     return null;
   }
 
-  /** Forward-lookup the channel id (meshId or 'bridge') for a nodeId. */
+  /** Forward-lookup the channel id (meshId or 'bridge') for a BigInt nodeId.
+   *  @param {bigint} nodeId */
   channelIdFor(nodeId) {
     for (const t of this._subs) {
       if (typeof t.meshIdFor === 'function') {
