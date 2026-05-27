@@ -219,6 +219,16 @@ Full list: `AxonaError`, `IdentityError`, `TransportError`, `PublishError`,
   local kernel source via `file:../..`, so `npm install && node index.js`
   picks up whatever's in `src/`. The right starting point for new
   developers.
+- [`examples/minimal-pubsub-browser/`](examples/minimal-pubsub-browser/)
+  — browser version of the same demo, served live at
+  [`demo.axona.net`](https://demo.axona.net). Connects to the production
+  bridge over WebSocket and runs a kernel peer in the page.
+- [`examples/s2-region-visualizer/`](examples/s2-region-visualizer/)
+  — interactive 3D globe showing the 256 S2 cells that anchor every
+  Axona nodeId and pub/sub topic. Click a cell in the legend to see
+  it lit up on the globe; hit "Detect my location" to find your own
+  region. Useful when explaining why polar cells shrink, or for
+  picking a region label for a topic.
 
 For real-world wiring (WebRTC + bridge fallback, identity persistence,
 region pickers), the canonical example is
