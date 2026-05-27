@@ -28,8 +28,9 @@ import {
 } from './identity.js';
 // v1.1: region-keyed topics use a synthetic publisher whose top 8
 // bits match the chosen region's S2 cell, so deriveTopicId emits a
-// topic ID with that S2 prefix and us-east peers (S2='df') become
-// naturally XOR-closest to us-east topics.
+// topic ID with that S2 prefix and us-east peers (S2=0x89 under the
+// standard-S2 partition, kernel v2.0+) become naturally XOR-closest
+// to us-east topics.
 import { geoCellId }   from '../vendor/axona-protocol/src/utils/s2.js';
 // Shared codec: same BigInt + Set conventions as mesh.js and the
 // bridge's server.js — keeps every channel on one wire format.
