@@ -12,7 +12,7 @@
 // satisfies AxonaPeer's read/write surface.
 //
 // What this class does (Phase 3+ — pub/sub on):
-//   - `axonFor(node)` returns a cached per-node AxonManager wired to
+//   - `axonFor(node)` returns a cached per-node AxonaManager wired to
 //     the AxonaPeer's DHT primitives.  AxonaPeer.publish/subscribe now
 //     reach the real protocol pubsub layer.  Caller passes the peer
 //     reference via `setPeerForNode(node, peer)` after constructing
@@ -25,7 +25,7 @@
 //     AxonaPeer.lookup()'s periodic decay trigger.
 // =====================================================================
 
-import { AxonManager } from '../vendor/axona-protocol/src/pubsub/AxonManager.js';
+import { AxonaManager } from '../vendor/axona-protocol/src/pubsub/AxonaManager.js';
 
 export class BrowserEngine {
   constructor(config = {}) {
@@ -87,14 +87,14 @@ export class BrowserEngine {
     // ── The one and only peer reference (production: one per tab) ────
     /** @type {object | null} */  this._theNode = null;
 
-    // ── Per-node AxonManager + AxonaPeer back-ref ────────────────────
+    // ── Per-node AxonaManager + AxonaPeer back-ref ────────────────────
     // `setPeerForNode(node, peer)` is called by AxonaNode after it
     // constructs the AxonaPeer (engine is built first, peer second).
     // axonFor(node) reads _peerByNode to build the dht adapter the
-    // AxonManager constructor needs.
+    // AxonaManager constructor needs.
     /** @type {Map<object, object>}  node → AxonaPeer        */
     this._peerByNode = new Map();
-    /** @type {Map<object, object>}  node → AxonManager       */
+    /** @type {Map<object, object>}  node → AxonaManager       */
     this._axonByNode = new Map();
   }
 
@@ -150,10 +150,10 @@ export class BrowserEngine {
     }
   }
 
-  // ── Pub/sub: real AxonManager wiring ───────────────────────────────
+  // ── Pub/sub: real AxonaManager wiring ───────────────────────────────
   //
-  // `axonFor(node)` returns a cached AxonManager for this node.  The
-  // AxonManager talks to a `dht` adapter that fronts the AxonaPeer's
+  // `axonFor(node)` returns a cached AxonaManager for this node.  The
+  // AxonaManager talks to a `dht` adapter that fronts the AxonaPeer's
   // DHT primitives (findKClosest, sendDirect, routeMessage, …).
   // AxonaPeer's onDirectMessage / onRoutedMessage installs the wire
   // listeners via transport.onNotification, so we don't have to wire
@@ -170,16 +170,16 @@ export class BrowserEngine {
   }
 
   /**
-   * I3 (unified-API consumer): alias `axonManagerFor` → `axonFor`
-   * so the kernel's `AxonaPeer._requireAxonManager` resolution
-   * chain finds our per-node AxonManager.  Lets consumers use
+   * I3 (unified-API consumer): alias `axonaManagerFor` → `axonFor`
+   * so the kernel's `AxonaPeer._requireAxonaManager` resolution
+   * chain finds our per-node AxonaManager.  Lets consumers use
    * `peer.pub`, `peer.sub`, `peer.pull`, `peer.metrics` directly
-   * without the SDK having to pre-stash an axonManager handle.
+   * without the SDK having to pre-stash an axonaManager handle.
    * Without this alias the kernel falls through to checking
-   * `engine._axonManagers` (a Map keyed by hex node id) which
+   * `engine._axonaManagers` (a Map keyed by hex node id) which
    * BrowserEngine doesn't expose; throws PUBLISH_INVALID_TOPIC.
    */
-  axonManagerFor(node) {
+  axonaManagerFor(node) {
     return this.axonFor(node);
   }
 
@@ -196,7 +196,7 @@ export class BrowserEngine {
       );
     }
 
-    // The dht adapter the AxonManager talks to.  AxonaPeer exposes
+    // The dht adapter the AxonaManager talks to.  AxonaPeer exposes
     // every primitive; we add the missing alias (getSelfId vs
     // getNodeId), intercept self-targets, and add a routed fallback
     // to sendDirect.
@@ -282,7 +282,7 @@ export class BrowserEngine {
         // Not bound — fall back to routed delivery via the DHT.
         // Fire-and-forget; the routed walk will time out on its own if
         // it can't reach the target.  Return true optimistically so
-        // AxonManager's child-dead-detection doesn't false-positive.
+        // AxonaManager's child-dead-detection doesn't false-positive.
         peer.routeMessage(peerId, '__tunneled_direct__', {
           targetId:  peerId.toString(16).padStart(66, '0'),
           innerType: type,
@@ -321,7 +321,7 @@ export class BrowserEngine {
       return 'consumed';
     });
 
-    const axon = new AxonManager({ dht });
+    const axon = new AxonaManager({ dht });
     this._axonByNode.set(node, axon);
     return axon;
   }

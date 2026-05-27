@@ -57,7 +57,7 @@ import { BridgeTransport,
 import { CompositeTransport } from './composite_transport.js';
 import { deriveIdentity, getCurrentIdentity } from './identity.js';
 // pubsub_axonal.js (legacy { msg, publisher } wrapper around the
-// kernel's AxonManager) was retired in I3.  Consumers now use the
+// kernel's AxonaManager) was retired in I3.  Consumers now use the
 // kernel's unified pub/sub via this AxonaNode's .pub/.sub/.pull/
 // .metrics delegators — same wire as peer.pub/sub etc.
 
@@ -176,13 +176,13 @@ export class AxonaNode {
     await this._peer.start();
 
     // Register the peer with the engine so axonFor(node) can build
-    // the AxonManager dht adapter on demand.  AxonManager wakes up
-    // when peer.sub / peer.pub call _requireAxonManager → engine
-    // .axonManagerFor → axonFor → constructs once + caches.
+    // the AxonaManager dht adapter on demand.  AxonaManager wakes up
+    // when peer.sub / peer.pub call _requireAxonaManager → engine
+    // .axonaManagerFor → axonFor → constructs once + caches.
     this._engine.setPeerForNode(this._node, this._peer);
 
     // Register the wire-level 'route_msg' request handler so multi-hop
-    // routed DHT messages (used by AxonManager's fallback paths +
+    // routed DHT messages (used by AxonaManager's fallback paths +
     // future reshare/metrics paths) actually forward.  AxonaPeer
     // exposes routeMessage to SEND, but the wire format is a
     // 'route_msg' REQUEST that downstream peers need to handle.

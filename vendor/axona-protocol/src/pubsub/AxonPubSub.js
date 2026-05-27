@@ -1,9 +1,9 @@
 // =====================================================================
-// AxonPubSub — feed-style pub/sub API on top of AxonManager.
+// AxonPubSub — feed-style pub/sub API on top of AxonaManager.
 //
 // This is the application-facing layer for the Axona protocol. It
 // builds SignedPost envelopes, threads post_hash metadata through the
-// existing AxonManager fan-out, and translates raw per-relay
+// existing AxonaManager fan-out, and translates raw per-relay
 // MetricsResponse fragments into aggregate AggregateMetrics that a
 // publisher's UI can display.
 //
@@ -51,8 +51,8 @@ const DEFAULT_PULL_CACHE_SIZE = 512;
 export class AxonPubSub {
   /**
    * @param {Object} opts
-   * @param {import('./AxonManager.js').AxonManager} opts.axon
-   *        The underlying AxonManager (already wired to a MockDHTNode).
+   * @param {import('./AxonaManager.js').AxonaManager} opts.axon
+   *        The underlying AxonaManager (already wired to a MockDHTNode).
    */
   constructor({ axon, pullCacheSize = DEFAULT_PULL_CACHE_SIZE } = {}) {
     if (!axon) throw new Error('AxonPubSub: axon is required');
@@ -71,7 +71,7 @@ export class AxonPubSub {
     this._pullCache    = new Map();
     this._pullCacheCap = pullCacheSize;
 
-    // Register a single delivery callback with AxonManager that
+    // Register a single delivery callback with AxonaManager that
     // fans out to our local listeners. Idempotent — if another
     // AxonPubSub on the same node has registered first, this would
     // replace it; one AxonPubSub per node is the expected pattern.

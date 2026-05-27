@@ -97,7 +97,7 @@ export { Synapse }      from './dht/Synapse.js';
 export { Subscription } from './dht/Subscription.js';
 
 // ── Pub/sub primitives ─────────────────────────────────────────────
-export { AxonManager } from './pubsub/AxonManager.js';
+export { AxonaManager } from './pubsub/AxonaManager.js';
 export { AxonPubSub }  from './pubsub/AxonPubSub.js';
 export {
   makePost,

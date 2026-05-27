@@ -43,7 +43,7 @@ import { Subscription }   from './Subscription.js';
 import { clz264, toHex, fromHex, isHexId } from '../utils/hexid.js';
 import { deriveTopicId, deriveTopicIdBig } from '../pubsub/post.js';
 import { buildEnvelope }  from '../pubsub/envelope.js';
-import { AxonManager }    from '../pubsub/AxonManager.js';
+import { AxonaManager }    from '../pubsub/AxonaManager.js';
 import { PublishError, SubscribeError, PullError, MetricsError, ErrorCodes } from '../errors.js';
 
 export class AxonaPeer extends DHT {
@@ -53,17 +53,17 @@ export class AxonaPeer extends DHT {
    *        The legacy multi-node engine (Phase 1: delegate target).
    * @param {import('./NeuronNode.js').NeuronNode} opts.node
    *        The NeuronNode this peer wraps.
-   * @param {object} [opts.axonManager]
-   *        Optional explicit AxonManager instance to use for the
+   * @param {object} [opts.axonaManager]
+   *        Optional explicit AxonaManager instance to use for the
    *        unified pub()/sub() API.  When omitted, pub/sub fall back
-   *        to the engine's per-node AxonManager (engine.axonManagerFor
+   *        to the engine's per-node AxonaManager (engine.axonaManagerFor
    *        if present, else throws).
    * @param {object} [opts.identity]
    *        Identity envelope from `deriveIdentity()` — required for
    *        signed publishes (the default).  Apps that only call
    *        `peer.pub(topic, message, { sign: false })` can omit it.
    */
-  constructor({ engine = null, domain = null, node, axonManager = null, identity = null, transport = null, persist = null }) {
+  constructor({ engine = null, domain = null, node, axonaManager = null, identity = null, transport = null, persist = null }) {
     super();
     if (!node) throw new Error('AxonaPeer: node is required');
 
@@ -103,7 +103,7 @@ export class AxonaPeer extends DHT {
     this._engine = engine;
     this._domain = domain ?? engine;
     this._node   = node;
-    this._axonManager = axonManager;
+    this._axonaManager = axonaManager;
     this._identity = identity;
     this._transport = transport;
     this._persist  = persist;
@@ -121,7 +121,7 @@ export class AxonaPeer extends DHT {
     // ─── Unified pub/sub state ────────────────────────────────────
     /** @type {Map<bigint, Set<Subscription>>} topicId(BigInt) → handles */
     this._subscriptions = new Map();
-    /** True once we've installed the AxonManager-side delivery hook. */
+    /** True once we've installed the AxonaManager-side delivery hook. */
     this._deliveryHookInstalled = false;
 
     // ─── Direct messaging state ───────────────────────────────────
@@ -294,7 +294,7 @@ export class AxonaPeer extends DHT {
    *   · local_probe       — needed by _tryAnneal (anneal not run
    *                          in the kernel-driven loop yet)
    *   · route_msg         — needed by peer.routeMessage()
-   *   · find_closest_set  — needed by AxonManager K-closest queries
+   *   · find_closest_set  — needed by AxonaManager K-closest queries
    *
    * Bodies are 1:1 mirrors of dht-sim/.../AxonaEngine.js's
    * _registerNH1Handlers — the engine version uses
@@ -408,7 +408,7 @@ export class AxonaPeer extends DHT {
     });
 
     // ── find_closest_set — top-K closest peers from local synaptome
-    // Used by AxonManager's findKClosest (pub/sub) and by iterative
+    // Used by AxonaManager's findKClosest (pub/sub) and by iterative
     // discovery.  Insertion-sorted scan; cheap because synaptome is
     // bounded by MAX_SYNAPTOME.  Caller merges results across rounds.
     transport.onRequest('find_closest_set', async (_fromId, payload) => {
@@ -688,8 +688,8 @@ export class AxonaPeer extends DHT {
   // On sub() / sub.stop() / synapse-add: namespace marked dirty,
   // debounced flush scheduled (~5s).  On leave(): force flush.
   //
-  // Axon-role state is owned by AxonManager and persisted at that
-  // layer (deferred to AxonManager P4-followup).
+  // Axon-role state is owned by AxonaManager and persisted at that
+  // layer (deferred to AxonaManager P4-followup).
 
   async _loadFromPersist() {
     const p = this._persist;
@@ -898,11 +898,11 @@ export class AxonaPeer extends DHT {
    * @param {object} opts           AxonaPeer constructor args
    * @param {object} opts.engine
    * @param {object} opts.node
-   * @param {object} [opts.axonManager]
+   * @param {object} [opts.axonaManager]
    * @param {object} [opts.transport]
    * @returns {Promise<AxonaPeer>}
    */
-  static async fromSnapshot(state, { engine, node, axonManager, transport } = {}) {
+  static async fromSnapshot(state, { engine, node, axonaManager, transport } = {}) {
     if (!state || typeof state !== 'object') {
       throw new TypeError('AxonaPeer.fromSnapshot: state must be a snapshot object');
     }
@@ -942,7 +942,7 @@ export class AxonaPeer extends DHT {
     const peer = new AxonaPeer({
       engine: engine ?? { onEvent: () => () => {} },
       node:   finalNode,
-      axonManager,
+      axonaManager,
       identity,
       transport,
     });
@@ -1054,7 +1054,7 @@ export class AxonaPeer extends DHT {
   }
 
   async subscribe(topicName, handler) {
-    // Phase 1: subscribe through the engine-owned AxonManager for
+    // Phase 1: subscribe through the engine-owned AxonaManager for
     // this node.  Future phases move this into the peer itself.
     const axon = this._engine.axonFor(this._node);
     return axon.subscribe(this._node.id, topicName, handler);
@@ -1073,8 +1073,8 @@ export class AxonaPeer extends DHT {
 
   // ─── Unified pub/sub (v1.0 API) ────────────────────────────────────
   //
-  // Replaces the legacy AxonManager.pubsubPublish(bigintTopicKey, json)
-  // and AxonManager.pubsubSubscribe(bigintTopicKey) entrypoints with a
+  // Replaces the legacy AxonaManager.pubsubPublish(bigintTopicKey, json)
+  // and AxonaManager.pubsubSubscribe(bigintTopicKey) entrypoints with a
   // string-topic API:
   //
   //   const msgId = await peer.pub(topic, message);
@@ -1083,7 +1083,7 @@ export class AxonaPeer extends DHT {
   //
   // topic is a string at the API boundary; we hash it via
   // deriveTopicId(peer.nodeIdHex, topic) → 66-char hex topic ID, which
-  // is what flows through AxonManager.  Apps don't see the topic ID
+  // is what flows through AxonaManager.  Apps don't see the topic ID
   // unless they introspect it on the subscription handle.
   //
   // The envelope shape (delivered to subscribers) is:
@@ -1094,7 +1094,7 @@ export class AxonaPeer extends DHT {
   /**
    * Publish a message on `topic`.  Resolves with the content-derived
    * msgId once the publish has been handed to the K-closest replica
-   * set (today's AxonManager semantics).
+   * set (today's AxonaManager semantics).
    *
    * Signed by default with the peer's identity; opt-out via
    * `{ sign: false }` for anonymous broadcast.
@@ -1112,7 +1112,7 @@ export class AxonaPeer extends DHT {
         `peer.pub: topic must be a non-empty string, got ${typeof topic}`,
         { context: { topic } });
     }
-    const am          = this._requireAxonManager('pub');
+    const am          = this._requireAxonaManager('pub');
     // opts.publisher selects the topic-id derivation mode:
     //   undefined (default)  → publisher-keyed, this peer's nodeId
     //   null                 → public mode (anyone-can-publish, simple hash)
@@ -1122,7 +1122,7 @@ export class AxonaPeer extends DHT {
     //
     // publisherId stays hex at this layer — it's the user-facing form
     // and is what flows into the envelope's `publisher` field.  Kernel
-    // internals (AxonManager) use BigInt; we derive both.
+    // internals (AxonaManager) use BigInt; we derive both.
     const publisherId = 'publisher' in opts ? opts.publisher : this._nodeIdHex();
     const publisherBig = publisherId === null ? null : fromHex(publisherId);
     const topicIdBig  = await deriveTopicIdBig(publisherBig, topic);
@@ -1155,7 +1155,7 @@ export class AxonaPeer extends DHT {
         { cause, context: { topic } });
     }
 
-    // AxonManager generates its own publishId for network routing/
+    // AxonaManager generates its own publishId for network routing/
     // cache keying.  We pass postHash = envelope.msgId so the relay's
     // replay cache becomes searchable by content-hash for peer.pull()
     // (A3).  publisher is recorded for the metrics counters.
@@ -1192,7 +1192,7 @@ export class AxonaPeer extends DHT {
         { context: { topic } });
     }
 
-    const am          = this._requireAxonManager('sub');
+    const am          = this._requireAxonaManager('sub');
     // opts.publisher selects the topic-id derivation mode (same
     // semantics as peer.pub):
     //   undefined (default)  → publisher-keyed, this peer's nodeId
@@ -1205,8 +1205,8 @@ export class AxonaPeer extends DHT {
     const publisherBig = publisherId === null ? null : fromHex(publisherId);
     const topicIdBig  = await deriveTopicIdBig(publisherBig, topic);
 
-    // Apply `since` mode by seeding AxonManager's per-topic lastSeenTs
-    // BEFORE the subscribe call.  AxonManager passes lastSeenTs in the
+    // Apply `since` mode by seeding AxonaManager's per-topic lastSeenTs
+    // BEFORE the subscribe call.  AxonaManager passes lastSeenTs in the
     // subscribe envelope; the receiving axon's replay cache filters
     // strictly above it.
     this._applySince(am, topicIdBig, opts.since);
@@ -1238,7 +1238,7 @@ export class AxonaPeer extends DHT {
       if (set.size === 0) {
         this._subscriptions.delete(key);
         try {
-          this._requireAxonManager('unsubscribe').pubsubUnsubscribe(key);
+          this._requireAxonaManager('unsubscribe').pubsubUnsubscribe(key);
         } catch { /* unsubscribe is best-effort */ }
       }
       this._markPersistDirty('subscriptions');
@@ -1284,10 +1284,10 @@ export class AxonaPeer extends DHT {
         'peer.pull: { publisher } must be a 66-char hex node ID or null',
         { context: { msgId, publisher } });
     }
-    const am = this._requireAxonManager('pull');
+    const am = this._requireAxonaManager('pull');
     if (typeof am.requestPull !== 'function') {
       throw new PullError(ErrorCodes.PULL_AXONS_UNREACHABLE,
-        'peer.pull: AxonManager does not support requestPull',
+        'peer.pull: AxonaManager does not support requestPull',
         { context: {} });
     }
     const publisherBig = publisher === null ? null : fromHex(publisher);
@@ -1296,7 +1296,7 @@ export class AxonaPeer extends DHT {
     if (!result) return null;
 
     // requestPull returns the parsed payload — which is the JSON we
-    // wrote in pub(): the envelope itself.  Some legacy AxonManagers
+    // wrote in pub(): the envelope itself.  Some legacy AxonaManagers
     // return a SignedPost shape; we surface either, leaving
     // verification to the caller via verifyEnvelope().
     if (result && typeof result === 'object' &&
@@ -1316,7 +1316,7 @@ export class AxonaPeer extends DHT {
    * that respond; `relayCount` is the number of distinct responding
    * relays so callers can sanity-check coverage.
    *
-   * Note: today's AxonManager enforces a publisher-only ownership
+   * Note: today's AxonaManager enforces a publisher-only ownership
    * check on metrics requests — only the topic's publisher gets a
    * non-empty result.  Removing that check (so any peer can audit)
    * is queued as a kernel-side cleanup.
@@ -1341,7 +1341,7 @@ export class AxonaPeer extends DHT {
         'peer.metrics: { publisher } must be a 66-char hex node ID or null',
         { context: { topic, publisher } });
     }
-    const am = this._requireAxonManager('metrics');
+    const am = this._requireAxonaManager('metrics');
     if (typeof am.requestMetrics !== 'function') {
       return { publishes: 0, subscribers: 0, deliveries: 0, pulls: 0, reshares: 0, relayCount: 0 };
     }
@@ -1516,9 +1516,9 @@ export class AxonaPeer extends DHT {
    * @returns {object}
    */
   health() {
-    const am = this._axonManager
-            ?? (this._engine?.axonManagerFor?.(this._node))
-            ?? this._engine?._axonManagers?.get?.(this._node.id)
+    const am = this._axonaManager
+            ?? (this._engine?.axonaManagerFor?.(this._node))
+            ?? this._engine?._axonaManagers?.get?.(this._node.id)
             ?? null;
     const axonRoles = [];
     if (am && typeof am.inspectRoles === 'function') {
@@ -1646,19 +1646,19 @@ export class AxonaPeer extends DHT {
     return t;
   }
 
-  // ── AxonManager glue ────────────────────────────────────────────
+  // ── AxonaManager glue ────────────────────────────────────────────
 
-  _requireAxonManager(callerName) {
-    if (this._axonManager) return this._axonManager;
-    // Fallback 1: ask the engine for this node's AxonManager.  Different
+  _requireAxonaManager(callerName) {
+    if (this._axonaManager) return this._axonaManager;
+    // Fallback 1: ask the engine for this node's AxonaManager.  Different
     // engine builds expose this differently; we probe in priority
     // order and cache the result.
     const engine = this._engine;
     let am = null;
-    if (typeof engine?.axonManagerFor === 'function') {
-      am = engine.axonManagerFor(this._node);
-    } else if (engine?._axonManagers instanceof Map) {
-      am = engine._axonManagers.get(this._node.id);
+    if (typeof engine?.axonaManagerFor === 'function') {
+      am = engine.axonaManagerFor(this._node);
+    } else if (engine?._axonaManagers instanceof Map) {
+      am = engine._axonaManagers.get(this._node.id);
     }
     // Fallback 2: build one ourselves.  Standalone consumers (the
     // browser pub/sub demo, kernel smoke tests, anyone constructing
@@ -1670,23 +1670,23 @@ export class AxonaPeer extends DHT {
     // ghost-peer drops, and sendDirect with a routed __tunneled_direct__
     // fallback for K-closest axons we don't have a direct channel to.
     if (!am) {
-      am = this._buildDefaultAxonManager();
+      am = this._buildDefaultAxonaManager();
     }
     if (!am) {
       throw new PublishError(ErrorCodes.PUBLISH_INVALID_TOPIC,
-        `peer.${callerName}: no AxonManager available; ` +
-        'pass {axonManager} to the AxonaPeer constructor or wire engine.axonManagerFor()',
+        `peer.${callerName}: no AxonaManager available; ` +
+        'pass {axonaManager} to the AxonaPeer constructor or wire engine.axonaManagerFor()',
       );
     }
-    this._axonManager = am;
+    this._axonaManager = am;
     return am;
   }
 
   /**
-   * Construct an AxonManager wired to a dht adapter that uses this
+   * Construct an AxonaManager wired to a dht adapter that uses this
    * peer's reachable peer set (self + bound transport peers + learned
-   * synaptome).  Used as the default when no explicit AxonManager and
-   * no engine.axonManagerFor are available — typically browser apps
+   * synaptome).  Used as the default when no explicit AxonaManager and
+   * no engine.axonaManagerFor are available — typically browser apps
    * that talk to bridge.axona.net directly via webTransport.
    *
    * The two production hardenings this adapter ships with:
@@ -1705,15 +1705,15 @@ export class AxonaPeer extends DHT {
    *     axons reachable even when the local transport only has a
    *     channel to the bridge.
    *
-   * @returns {AxonManager}
+   * @returns {AxonaManager}
    */
-  _buildDefaultAxonManager() {
+  _buildDefaultAxonaManager() {
     const peer = this;
     const node = this._node;
     if (!node) return null;
     // Only auto-build when there's a transport to route over.  Smoke
     // tests that construct an AxonaPeer with a mock node (no transport,
-    // no synaptome) keep getting the explicit "no AxonManager" error
+    // no synaptome) keep getting the explicit "no AxonaManager" error
     // — they're exercising the validation surface, not the runtime.
     if (!node.transport) return null;
     const selfId = peer.getNodeId();
@@ -1721,7 +1721,7 @@ export class AxonaPeer extends DHT {
     const dht = {
       getSelfId:    () => peer.getNodeId(),
       findKClosest: async (targetIdBig, K = 5) => {
-        // AxonManager now passes BigInt targetId; the adapter is
+        // AxonaManager now passes BigInt targetId; the adapter is
         // BigInt-throughout.  No hex conversion needed.
         if (typeof targetIdBig !== 'bigint') {
           throw new TypeError(
@@ -1751,7 +1751,7 @@ export class AxonaPeer extends DHT {
       },
       routeMessage: (...args) => peer.routeMessage(...args),
       sendDirect: async (peerIdBig, type, payload) => {
-        // AxonManager calls with BigInt peerId.
+        // AxonaManager calls with BigInt peerId.
         if (peerIdBig === selfId) {
           const h = peer._directHandlers?.get(type);
           if (!h) return false;
@@ -1773,7 +1773,7 @@ export class AxonaPeer extends DHT {
           return peer.sendDirect(peerIdBig, type, payload);
         }
         // Tunnel via routed delivery — fire-and-forget; report
-        // success so AxonManager's child-dead detection doesn't
+        // success so AxonaManager's child-dead detection doesn't
         // false-positive while the walk is in flight.  The
         // `targetId` wire field is hex (wire form).
         peer.routeMessage(peerIdBig, '__tunneled_direct__', {
@@ -1818,12 +1818,12 @@ export class AxonaPeer extends DHT {
     });
 
     // Match axona-peer's wiring: do NOT call am.start() here.
-    // axona-peer constructs AxonManager via engine.axonFor(node)
+    // axona-peer constructs AxonaManager via engine.axonFor(node)
     // and never arms the 10s refreshTick interval.  Applications
     // call peer.sub after the mesh has stabilised, so the
     // initial K-closest is already wide and refresh isn't needed
     // to recover from a stale boot-time target set.
-    return new AxonManager({ dht });
+    return new AxonaManager({ dht });
   }
 
   _installDeliveryHook(am) {
@@ -1852,7 +1852,7 @@ export class AxonaPeer extends DHT {
       }
     } catch {
       // Fall back to a synthetic envelope carrying the raw json as
-      // message and the AxonManager's publishId as msgId — at least
+      // message and the AxonaManager's publishId as msgId — at least
       // the handler still fires with something it can inspect.
       envelope = {
         msgId:    publishId,
@@ -1871,11 +1871,11 @@ export class AxonaPeer extends DHT {
   }
 
   _applySince(am, topicId, since) {
-    // The AxonManager tracks lastSeenTs per topic in _lastSeenTsByTopic.
+    // The AxonaManager tracks lastSeenTs per topic in _lastSeenTsByTopic.
     // The subscribe call reads this and includes it in the outbound
     // subscribe envelope; the axon's replay filter applies it strictly.
     // We seed it here based on the `since` mode.
-    if (!am._lastSeenTsByTopic) return;     // unknown AxonManager build
+    if (!am._lastSeenTsByTopic) return;     // unknown AxonaManager build
     if (since === undefined) {
       // Live tail: only future messages.  Seed with a sentinel just
       // below the current time so cached messages are filtered out.
@@ -2431,7 +2431,7 @@ export class AxonaPeer extends DHT {
 
   // ─── Routed messaging + pub/sub primitives (Phase 3d–f) ────────────
   //
-  // These deliver AxonManager's pub/sub on top of NH-1's transport
+  // These deliver AxonaManager's pub/sub on top of NH-1's transport
   // contract.  Bodies are copied from the engine verbatim; `node` →
   // `this._node`; the per-peer handler tables continue to live on
   // `this._engine._routedHandlers` / `_directHandlers` until Phase 4
@@ -2603,8 +2603,8 @@ export class AxonaPeer extends DHT {
   _pickRecruitPeer(role, meta, subscriberId) {
     // role.children keys are BigInt (kernel form).  subscriberId is
     // BigInt.  This hook is consumed by external orchestrators that
-    // override AxonManager.pickRecruitPeer; the signature mirrors the
-    // AxonManager-internal _pickExistingChildForRecruit but with the
+    // override AxonaManager.pickRecruitPeer; the signature mirrors the
+    // AxonaManager-internal _pickExistingChildForRecruit but with the
     // additional synapse-weight scoring.
     const node = this._node;
     if (role.children.size === 0) return null;

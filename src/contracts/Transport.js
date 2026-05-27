@@ -2,7 +2,7 @@
 // Transport — the contract for moving typed messages between peers.
 //
 // One Transport instance per running node. The protocol layer
-// (NeuromorphicDHTNH1, NeuronNode, AxonManager, ...) calls into this
+// (NeuromorphicDHTNH1, NeuronNode, AxonaManager, ...) calls into this
 // abstraction; concrete transports implement it.
 //
 // Implementations:

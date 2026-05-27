@@ -1,5 +1,5 @@
 /**
- * AxonManager — distributed pub/sub membership protocol.
+ * AxonaManager — distributed pub/sub membership protocol.
  *
  * Implements the PubSubAdapter transport contract on top of a DHT that
  * provides the routed-messaging primitives (routeMessage, onRoutedMessage,
@@ -63,9 +63,9 @@ function _wire(hex) {
   return fromHex(hex);
 }
 
-// ── AxonManager ────────────────────────────────────────────────────────────
+// ── AxonaManager ────────────────────────────────────────────────────────────
 
-export class AxonManager {
+export class AxonaManager {
   /**
    * @param {Object} opts
    * @param {MockDHTNode} opts.dht     — the DHT primitive (routeMessage etc.)
@@ -91,7 +91,7 @@ export class AxonManager {
     shouldRecruitSubAxon = null,   // protocol-specific override
     now                  = () => Date.now(),
   } = {}) {
-    if (!dht) throw Error('AxonManager: dht is required');
+    if (!dht) throw Error('AxonaManager: dht is required');
 
     this.dht                   = dht;
     this.nodeId                = dht.getSelfId();    // BigInt (kernel-canonical)
@@ -124,7 +124,7 @@ export class AxonManager {
     this._seenPublishCap = 4096;
     this._seenPublishTtlMs = 60_000;
 
-    // Per-AxonManager findKClosest cache.  Keyed by a string computed
+    // Per-AxonaManager findKClosest cache.  Keyed by a string computed
     // from the BigInt topicId — see _findKClosest for the format.
     this._kClosestCache = new Map();     // `${topicHex}_${K}` -> { epoch, value: bigint[] }
     this._kClosestEpoch = 0;
@@ -250,12 +250,12 @@ export class AxonManager {
    */
   pubsubPublish(topicId, json, meta) {
     if (typeof topicId !== 'bigint') {
-      throw new TypeError(`AxonManager.pubsubPublish: topicId must be bigint, got ${typeof topicId}`);
+      throw new TypeError(`AxonaManager.pubsubPublish: topicId must be bigint, got ${typeof topicId}`);
     }
     const publishId = `${this.nodeId}:${++this._publishCounter}`;
     const publishTs = this._now();
     this._asyncPublish(topicId, json, publishId, publishTs, meta)
-      .catch(err => console.error('AxonManager: publish failed:', err));
+      .catch(err => console.error('AxonaManager: publish failed:', err));
     return publishId;
   }
 
@@ -327,12 +327,12 @@ export class AxonManager {
    */
   pubsubSubscribe(topicId) {
     if (typeof topicId !== 'bigint') {
-      throw new TypeError(`AxonManager.pubsubSubscribe: topicId must be bigint, got ${typeof topicId}`);
+      throw new TypeError(`AxonaManager.pubsubSubscribe: topicId must be bigint, got ${typeof topicId}`);
     }
     this.mySubscriptions.set(topicId, { subscribedAt: this._now() });
     const lastSeenTs = this._lastSeenTsByTopic.get(topicId);
     this._asyncSubscribe(topicId, lastSeenTs)
-      .catch(err => console.error('AxonManager: subscribe failed:', err));
+      .catch(err => console.error('AxonaManager: subscribe failed:', err));
   }
 
   /** @private — burst-send pattern. */
@@ -375,11 +375,11 @@ export class AxonManager {
 
   pubsubUnsubscribe(topicId) {
     if (typeof topicId !== 'bigint') {
-      throw new TypeError(`AxonManager.pubsubUnsubscribe: topicId must be bigint, got ${typeof topicId}`);
+      throw new TypeError(`AxonaManager.pubsubUnsubscribe: topicId must be bigint, got ${typeof topicId}`);
     }
     this.mySubscriptions.delete(topicId);
     this._asyncUnsubscribe(topicId)
-      .catch(err => console.error('AxonManager: unsubscribe failed:', err));
+      .catch(err => console.error('AxonaManager: unsubscribe failed:', err));
   }
 
   /** @private — burst-send pattern. */
@@ -858,7 +858,7 @@ export class AxonManager {
         try {
           this._deliveryCallback(topicId, m.json, m.publishId, m.publishTs);
         } catch (err) {
-          console.error('AxonManager self-replay deliveryCallback threw:', err);
+          console.error('AxonaManager self-replay deliveryCallback threw:', err);
         }
       }
       return;
@@ -1044,7 +1044,7 @@ export class AxonManager {
         }
         if (role) role.parentLastSent = now;
       } catch (err) {
-        console.error('AxonManager refresh: subscribe issue failed:', err);
+        console.error('AxonaManager refresh: subscribe issue failed:', err);
       }
     };
 
@@ -1247,7 +1247,7 @@ export class AxonManager {
    */
   requestPull(topicId, postHash, { timeoutMs = 1000 } = {}) {
     if (typeof topicId !== 'bigint') {
-      throw new TypeError(`AxonManager.requestPull: topicId must be bigint, got ${typeof topicId}`);
+      throw new TypeError(`AxonaManager.requestPull: topicId must be bigint, got ${typeof topicId}`);
     }
     const requestId = `${this.nodeId}:pl${++this._pullCounter}`;
     return new Promise(resolve => {
@@ -1285,7 +1285,7 @@ export class AxonManager {
    */
   requestMetrics(topicId, postHashes, { timeoutMs = 500 } = {}) {
     if (typeof topicId !== 'bigint') {
-      throw new TypeError(`AxonManager.requestMetrics: topicId must be bigint, got ${typeof topicId}`);
+      throw new TypeError(`AxonaManager.requestMetrics: topicId must be bigint, got ${typeof topicId}`);
     }
     const requestId = `${this.nodeId}:m${++this._metricsCounter}`;
     return new Promise(resolve => {

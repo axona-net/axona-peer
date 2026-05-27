@@ -2,15 +2,15 @@
 // smoke_kernel_pubsub.js — verify the kernel's unified pub/sub API
 //                          (peer.pub / peer.sub / peer.pull / peer.metrics)
 //                          works against axona-peer's AxonaNode +
-//                          BrowserEngine + AxonManager stack.
+//                          BrowserEngine + AxonaManager stack.
 //
 // I3 step: confirms the wire-up needed for consumers to use the
 // v1.0 unified pub/sub API is complete inside this repo.  Before
 // this commit, calling `node.peer.pub(topic, msg)` threw
-// PUBLISH_INVALID_TOPIC because the kernel's _requireAxonManager
-// resolution chain looked for `engine.axonManagerFor(node)` which
+// PUBLISH_INVALID_TOPIC because the kernel's _requireAxonaManager
+// resolution chain looked for `engine.axonaManagerFor(node)` which
 // BrowserEngine didn't expose.  A one-line alias in browser_engine.js
-// (`axonManagerFor → axonFor`) closes the gap.
+// (`axonaManagerFor → axonFor`) closes the gap.
 //
 // Scenarios (single AxonaNode — the kernel's pub/sub is publisher-
 // keyed, so a self-publish/self-subscribe exercise is the minimum
@@ -110,7 +110,7 @@ async function main() {
   check('peer.pub returned a 64-char hex msgId',
     typeof msgId === 'string' && msgId.length === 64);
 
-  // Let AxonManager's delivery loop run.  AxonManager publishes via
+  // Let AxonaManager's delivery loop run.  AxonaManager publishes via
   // dht.routeMessage which is async; give the microtask queue +
   // delivery hook a tick.
   await new Promise(r => setTimeout(r, 20));

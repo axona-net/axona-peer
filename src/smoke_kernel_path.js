@@ -27,8 +27,8 @@
 // shape this smoke exercises.
 //
 // Deferred (same gap noted in dht-sim's smoke_kernel_integration.mjs):
-// kernel pub/sub via Transport.sim still requires an AxonManager
-// engine-adapter that doesn't exist yet (the kernel's AxonManager
+// kernel pub/sub via Transport.sim still requires an AxonaManager
+// engine-adapter that doesn't exist yet (the kernel's AxonaManager
 // constructor expects a DHT-like delivery interface that today comes
 // from the simulator's AxonaEngine).  Once that adapter lands, the
 // pub/sub/pull/metrics surface gets added here.  Until then this

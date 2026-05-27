@@ -694,7 +694,7 @@ export class MeshManager {
     // dc from 'open' to 'closing'/'closed', which masked the real
     // open-history and skipped onPeerLost notifications — that left
     // stale bindings (unbindPeer never ran) and ghost children in
-    // AxonManager roles across the network.
+    // AxonaManager roles across the network.
     const wasOpen = state.openedAt > 0;
     this._log('teardown', {
       peerId, reason,

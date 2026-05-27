@@ -137,7 +137,7 @@ export async function deriveTopicId(publisherNodeId, topicName) {
 
 /**
  * BigInt-returning variant of `deriveTopicId`.  Kernel internals
- * (AxonaPeer.pub / sub, AxonManager state) hold topic IDs as 264-bit
+ * (AxonaPeer.pub / sub, AxonaManager state) hold topic IDs as 264-bit
  * BigInts; this helper is the canonical entrypoint for that form.
  *
  * The `publisher` argument is either:

@@ -46,7 +46,7 @@ import { encode, decode } from './wire.js';
 // where the bfcache can serve a stale module set for ages).  The
 // bridge version arrives separately in its `welcome` message; the
 // "version" row in the me panel shows both side by side.
-const PEER_VERSION = '1.1.7';
+const PEER_VERSION = '1.2.0';
 
 const BRIDGE_PING_INTERVAL_MS = 1000;
 const BRIDGE_STALE_PONG_MS    = 3000;
@@ -1003,7 +1003,7 @@ async function bootAxonaNode(opts = {}) {
         peerRoots: role.peerRoots ? [...role.peerRoots].map(hex) : [],
       }));
     },
-    /** Topics we're subscribed to (from AxonManager's POV, not just the
+    /** Topics we're subscribed to (from AxonaManager's POV, not just the
      *  UI's `subs()`).  Should match — if it doesn't, we have a sync bug. */
     mySubscriptions: () => {
       const axon = axonaNode._axon;
