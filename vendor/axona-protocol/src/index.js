@@ -166,4 +166,20 @@ export {
   haversine,
 } from './utils/geo.js';
 
-export { geoCellId } from './utils/s2.js';
+// S2 geographic cell math — the foundation of every Axona address.
+// `geoCellId(lat, lng)` returns the 8-bit cell prefix that occupies
+// the top byte of every nodeId and publisher-keyed topic ID.  The
+// inverse and bound helpers let applications display, label, or
+// route by region without reimplementing the S2 cube math.  The
+// 8-bit cellId matches the top 8 bits of Google S2's level-3 cell
+// ID — full interop with any standard S2 library.
+export {
+  geoCellId,
+  geoCellCenter,
+  geoCellCorners,
+  geoCellFace,
+  isValidCellId,
+  S2_FACES,
+  S2_CELL_COUNT,
+  S2_RESERVED_FROM,
+} from './utils/s2.js';
