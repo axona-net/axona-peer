@@ -218,6 +218,24 @@ export class CompositeTransport extends Transport {
     };
   }
 
+  /**
+   * v2.0.2 — Aggregate onPingTraffic across sub-transports.  Only
+   * sub-transports that implement it contribute; the rest silently
+   * skip.  Returns an unsubscribe that detaches from all of them.
+   */
+  onPingTraffic(handler) {
+    if (typeof handler !== 'function') {
+      throw new TypeError('onPingTraffic: handler must be a function');
+    }
+    const unsubs = [];
+    for (const t of this._subs) {
+      if (typeof t.onPingTraffic === 'function') {
+        unsubs.push(t.onPingTraffic(handler));
+      }
+    }
+    return () => { for (const u of unsubs) try { u(); } catch {} };
+  }
+
   getLatency(nodeId) {
     const t = this._routeFor(nodeId);
     return t ? t.getLatency(nodeId) : -1;

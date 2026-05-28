@@ -259,8 +259,10 @@ export function webTransport({
           }
           break;
         case 'pong':
+          bridge._emitPingTraffic('recv');
+          return;
         case 'version-gate':
-          // Heartbeat reply / version-gate announcement — no action needed.
+          // Version-gate announcement — no action needed.
           return;
       }
       log('bridge-frame-unhandled', { type: t });
@@ -532,6 +534,7 @@ export function webTransport({
       if (!socket || !socketOpen) return;
       try {
         socket.send(JSON.stringify({ type: 'ping', t: Date.now() }));
+        bridge._emitPingTraffic('sent');
       } catch (err) {
         log('bridge-ping-send-failed', { err: err.message });
       }

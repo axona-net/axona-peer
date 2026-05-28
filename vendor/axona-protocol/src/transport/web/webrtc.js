@@ -455,6 +455,28 @@ export class WebRTCTransport extends Transport {
     }
   }
 
+  /**
+   * v2.0.2 — Surface MeshManager's per-frame ping/pong traffic events
+   * through the Transport.  Translates the mesh's peerId (hex string)
+   * into the bound BigInt nodeId where available, matching the
+   * convention of other Transport callbacks.  Callers can use this to
+   * drive a "channel is moving bytes" UI indicator.
+   *
+   * @param {(nodeId: bigint|string, kind: 'sent'|'recv') => void} callback
+   * @returns {() => void} unsubscribe
+   */
+  onPingTraffic(callback) {
+    return this._mesh.onPingTraffic((meshId, kind) => {
+      const reportedId = this._nodeIdByMeshId.get(meshId) ?? meshId;
+      try { callback(reportedId, kind); }
+      catch (err) {
+        this._log('ping-traffic-handler-threw', {
+          reportedId: String(reportedId), kind, err: err.message,
+        });
+      }
+    });
+  }
+
   _onPeerLost(meshId) {
     const nodeId = this._nodeIdByMeshId.get(meshId);
     // Fan out to peer-died subscribers (translate to BigInt nodeId if bound).

@@ -67,12 +67,46 @@ export class BridgeTransport extends Transport {
     this._nextId      = 1;
     this._peerDiedHandlers = [];
 
+    // v2.0.2 — Per-frame ping/pong traffic listeners.  The webTransport
+    // factory drives the bridge ping loop and the bridge's pong replies
+    // arrive on the WebSocket; it calls _emitPingTraffic on this
+    // BridgeTransport so callers can subscribe to ping traffic via the
+    // Transport contract instead of reaching into the factory.
+    /** @type {Array<(nodeId: bigint, kind: 'sent'|'recv') => void>} */
+    this._pingTrafficHandlers = [];
+
     // Single binding: the bridge's BigInt nodeId ↔ the fixed 'bridge'
     // connId.  Set by bindPeer once hello-ack arrives.
     /** @type {bigint | null} */
     this._bridgeNodeId = null;
 
     this._started = false;
+  }
+
+  /**
+   * v2.0.2 — Subscribe to per-frame ping/pong traffic on the bridge
+   * WebSocket.  Callback receives (bridgeNodeId, kind) where kind is
+   * 'sent' on each outgoing ping and 'recv' on each incoming pong.
+   * Fires only after the bridge has been bound (hello-ack received);
+   * pre-bind ping traffic is silently dropped because there's no
+   * stable nodeId to attribute it to yet.
+   */
+  onPingTraffic(callback) {
+    this._pingTrafficHandlers.push(callback);
+    return () => {
+      const i = this._pingTrafficHandlers.indexOf(callback);
+      if (i >= 0) this._pingTrafficHandlers.splice(i, 1);
+    };
+  }
+
+  /** @internal — webTransport factory calls this on bridge ping send / pong recv. */
+  _emitPingTraffic(kind) {
+    if (this._bridgeNodeId === null) return;
+    if (this._pingTrafficHandlers.length === 0) return;
+    for (const cb of this._pingTrafficHandlers) {
+      try { cb(this._bridgeNodeId, kind); }
+      catch {}
+    }
   }
 
   async start(localNodeId) {

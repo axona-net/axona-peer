@@ -121,6 +121,16 @@ export class MeshManager {
     this._messageListeners = new Set();
     /** @type {Set<(peerId: string) => void>} */
     this._peerLostListeners = new Set();
+    // v2.0.2 — per-frame ping/pong traffic notifications.  Without
+    // this, application UIs that want a "channel is actually moving
+    // bytes" indicator have to roll their own (see axona-peer's
+    // standalone mesh.js).  Subscribers get callback(peerId, kind)
+    // where kind is 'sent' on each ping-out and 'recv' on each
+    // pong-in.  Used by the demo's dot strip to drive a per-peer
+    // pulse animation that fades out within a second if the channel
+    // stops moving bytes.
+    /** @type {Set<(peerId: string, kind: 'sent'|'recv') => void>} */
+    this._pingTrafficListeners = new Set();
   }
 
   // ── External lifecycle ────────────────────────────────────────────
@@ -175,6 +185,37 @@ export class MeshManager {
   onPeerLost(callback) {
     this._peerLostListeners.add(callback);
     return () => this._peerLostListeners.delete(callback);
+  }
+
+  /**
+   * v2.0.2 — Subscribe to per-frame ping/pong traffic on each peer
+   * data channel.  Fires `callback(peerId, 'sent')` immediately after
+   * each outgoing ping and `callback(peerId, 'recv')` on each incoming
+   * pong.  The application-level ping loop runs at 1 Hz, so a healthy
+   * peer triggers two callbacks per second.  Use this to drive a
+   * "channel is moving bytes" UI indicator that decouples from the
+   * state machine — a peer stuck in a half-open state stops blinking
+   * within ~1 s of the underlying socket going dark.
+   * Returns an unsubscribe fn.
+   *
+   * @param {(peerId: string, kind: 'sent'|'recv') => void} callback
+   */
+  onPingTraffic(callback) {
+    this._pingTrafficListeners.add(callback);
+    return () => this._pingTrafficListeners.delete(callback);
+  }
+
+  /** @private — internal fan-out helper for onPingTraffic. */
+  _emitPingTraffic(peerId, kind) {
+    if (this._pingTrafficListeners.size === 0) return;
+    for (const cb of this._pingTrafficListeners) {
+      try { cb(peerId, kind); }
+      catch (err) {
+        this._log('ping-traffic-listener-threw', {
+          peerId, kind, err: err.message,
+        });
+      }
+    }
   }
 
   /**
@@ -619,6 +660,7 @@ export class MeshManager {
         state.rttBuffer.push(rtt);
         if (state.rttBuffer.length > RTT_WINDOW) state.rttBuffer.shift();
         if (state.state === 'stale') state.state = 'open';
+        this._emitPingTraffic(state.peerId, 'recv');
         this._notify();
       } else {
         // v0.4.0 — non-ping/pong frame: forward to Transport listeners.
@@ -643,6 +685,7 @@ export class MeshManager {
       try {
         state.dc.send(JSON.stringify({ type: 'ping', t: Date.now() }));
         state.pings++;
+        this._emitPingTraffic(state.peerId, 'sent');
       } catch (err) {
         this._log('ping-send-failed', {
           peerId: state.peerId, err: err.message,
