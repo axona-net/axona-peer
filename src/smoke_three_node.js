@@ -238,16 +238,26 @@ async function main() {
     check('A synaptome contains B',                  synA.some(s => s.peerId === B.node.nodeId));
     check('B synaptome contains A',                  synB.some(s => s.peerId === A.node.nodeId));
 
-    const bridgeIdFromA = synA.find(s => s.addedBy === 'bridge-handshake')?.peerId;
-    const bridgeIdFromB = synB.find(s => s.addedBy === 'bridge-handshake')?.peerId;
-    check('A admitted bridge via bridge-handshake', typeof bridgeIdFromA === 'bigint');
-    check('B admitted bridge via bridge-handshake', typeof bridgeIdFromB === 'bigint');
+    // v3.0.0 — both bridge and mesh admissions now flow through the
+    // kernel's transport-bound auto-admit path (AxonaPeer.start +
+    // onPeerBound), so every synapse is tagged `addedBy: 'bootstrap'`.
+    // Identify the bridge synapse by elimination: it's the one in the
+    // synaptome that's not the other browser.  The mesh synapse is
+    // identified by peerId (we already check both contain B/A above).
+    const bridgeIdFromA = synA.find(s => s.peerId !== B.node.nodeId)?.peerId;
+    const bridgeIdFromB = synB.find(s => s.peerId !== A.node.nodeId)?.peerId;
+    check('A admitted bridge (transport-bound, tagged bootstrap)',
+      typeof bridgeIdFromA === 'bigint');
+    check('B admitted bridge (transport-bound, tagged bootstrap)',
+      typeof bridgeIdFromB === 'bigint');
     check('A and B agree on bridge nodeId',          bridgeIdFromA === bridgeIdFromB);
 
     const peerSynA = synA.find(s => s.peerId === B.node.nodeId);
     const peerSynB = synB.find(s => s.peerId === A.node.nodeId);
-    check('A admitted B via mesh-handshake',         peerSynA?.addedBy === 'handshake');
-    check('B admitted A via mesh-handshake',         peerSynB?.addedBy === 'handshake');
+    check('A admitted B (kernel onPeerBound → bootstrap tag)',
+      peerSynA?.addedBy === 'handshake' || peerSynA?.addedBy === 'bootstrap');
+    check('B admitted A (kernel onPeerBound → bootstrap tag)',
+      peerSynB?.addedBy === 'handshake' || peerSynB?.addedBy === 'bootstrap');
 
     // ── lookups across both sub-transports ────────────────────────────
     const ab = await A.node.lookup(B.node.nodeId);

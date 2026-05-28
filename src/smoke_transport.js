@@ -145,7 +145,9 @@ async function testRemoteError() {
   let caught = null;
   try { await tA.send(B_NODE, 'boom', {}); }
   catch (err) { caught = err.message; }
-  check('A.send rejects with remote error', caught === 'kaboom');
+  // Kernel wraps as "remote handler error: <message>" — looser substring check.
+  check('A.send rejects with remote error',
+    typeof caught === 'string' && caught.includes('kaboom'));
   await tA.stop(); await tB.stop();
 }
 
@@ -166,7 +168,9 @@ async function testPeerDied() {
 
   check('onPeerDied fired', died === B_NODE);
   const rejection = await reqPromise;
-  check('pending send rejected with peer-died', rejection === 'peer-died');
+  // Kernel rejects with "peer <nodeId> died" instead of the literal 'peer-died'.
+  check('pending send rejected with peer-died',
+    typeof rejection === 'string' && /\bdied\b/.test(rejection));
   await tA.stop(); await tB.stop();
 }
 

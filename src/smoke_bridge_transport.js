@@ -174,8 +174,15 @@ async function main() {
 
   const bridgeSynapse = synaptome[0];
   const bridgeNodeId = bridgeSynapse?.peerId;
-  check('synapse._addedBy === bridge-handshake',
-    bridgeSynapse?.addedBy === 'bridge-handshake');
+  // v3.0.0 — the kernel BridgeTransport exposes boundPeers() and the
+  // AxonaPeer auto-admits the bridge through that path tagged
+  // 'bootstrap'.  The legacy axona_node._completeHandshake path
+  // would have tagged it 'bridge-handshake' but never gets to run
+  // because the kernel got there first.  Either tag is fine — both
+  // mean "the bridge was admitted via the WS hello-ack."
+  check('synapse provenance is bridge-handshake or bootstrap',
+    bridgeSynapse?.addedBy === 'bridge-handshake' ||
+    bridgeSynapse?.addedBy === 'bootstrap');
 
   // ── End-to-end: ask the bridge for its `ping` handler over WS ───
   // (Uses the BridgeTransport.send path under the hood.)
