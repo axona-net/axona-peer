@@ -18,9 +18,15 @@
 // ?bridge=ws://localhost:8080 for local development.
 // =====================================================================
 
-import { MeshManager } from './mesh.js';
 import { renderQR }    from './qr.js';
-import { AxonaNode }   from './axona_node.js';
+// Orchestration now rides directly on the kernel.  webTransport() owns
+// the bridge WebSocket, reconnect/backoff, ping/pong, stale detection,
+// and the version-gate + hello/hello-ack handshake; AxonaPeer +
+// NeuronNode + AxonaDomain own routing and pub/sub.  This replaces the
+// hand-rolled mesh / node / wire codec the prior build wired together
+// in this file.
+import { AxonaPeer, AxonaDomain, NeuronNode } from '../vendor/axona-protocol/src/index.js';
+import { webTransport } from '../vendor/axona-protocol/src/transport/web/index.js';
 import {
   REGIONS,
   getCurrentIdentity,
@@ -32,11 +38,8 @@ import {
 // standard-S2 partition, kernel v2.0+) become naturally XOR-closest
 // to us-east topics.
 import { geoCellId }   from '../vendor/axona-protocol/src/utils/s2.js';
-// Shared codec: same BigInt + Set conventions as mesh.js and the
-// bridge's server.js — keeps every channel on one wire format.
-import { encode, decode } from './wire.js';
-// I3: pub/sub now uses the kernel's unified API via axonaNode.pub /
-// axonaNode.sub.  Topics are public-mode strings (anyone-can-publish,
+// I3: pub/sub now uses the kernel's unified API via peer.pub /
+// peer.sub.  Topics are public-mode strings (anyone-can-publish,
 // anyone-can-subscribe) shaped as `${regionId}/${eventName}` so the
 // (region, event) addressing UX is preserved without forcing a
 // publisher-keyed model.  The application chooses the hashing mode
@@ -47,16 +50,14 @@ import { encode, decode } from './wire.js';
 // where the bfcache can serve a stale module set for ages).  The
 // bridge version arrives separately in its `welcome` message; the
 // "version" row in the me panel shows both side by side.
-const PEER_VERSION = '3.2.0';
+const PEER_VERSION = '3.3.0';
 
-const BRIDGE_PING_INTERVAL_MS = 1000;
-const BRIDGE_STALE_PONG_MS    = 3000;
-const RTT_WINDOW              = 10;
-const BACKOFF_INITIAL_MS      = 1000;
-const BACKOFF_MAX_MS          = 16000;
-const UPTIME_TICK_MS          = 1000;
+// webTransport() now owns the bridge WebSocket lifecycle (ping cadence,
+// stale window, reconnect backoff, uptime), so those constants moved
+// into the kernel.  The app keeps only what the UI itself uses.
 const LOG_MAX_LINES           = 120;
 const BRIDGE_ROW_ID           = '@bridge';   // synthetic id for the bridge row
+const UPTIME_TICK_MS          = 1000;        // re-render cadence for the uptime column
 
 // ── DOM handles ──────────────────────────────────────────────────────
 const $bridgeUrl   = document.getElementById('bridge-url');
@@ -141,26 +142,21 @@ document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') closeQrOverlay();
 });
 
-// ── Bridge connection state (one "peer" for rendering purposes) ──────
-const bridge = {
-  url:          bridgeUrl,
-  ws:           null,
-  state:        'disconnected', // 'disconnected' | 'connecting' | 'open' | 'stale'
-  pings:        0,
-  pongs:        0,
-  lastPongAt:   0,
-  rttBuffer:    [],
-  connectedAt:  0,
-  backoffMs:    BACKOFF_INITIAL_MS,
-  myConnId:     null,
-  version:       null,          // populated by `welcome` (bridge package version)
-  kernelVersion: null,          // populated by `welcome` (bridge's @axona/protocol kernel version)
-  // timers
-  pingTimer:    null,
-  staleTimer:   null,
-  uptimeTimer:  null,
-  reconnectTimer: null,
-};
+// ── Bridge welcome snapshot (for the version row) ────────────────────
+//
+// webTransport surfaces the bridge's `welcome` frame via
+// transport.onWelcome / transport.bridgeInfo.  We cache the last one
+// here so renderVersion() can read the bridge's package + kernel
+// version without reaching into the transport on every paint.
+let bridgeWelcome = null;   // { connId, version, kernelVersion, turn } | null
+
+// Bridge-row traffic counters for the peer table.  webTransport owns
+// the actual ping/pong loop and RTT; it doesn't tally cumulative
+// counts, so we increment these off transport.onPingTraffic (filtered
+// to the bridge nodeId) and reset connectedAt whenever the bridge
+// transitions back to 'open'.  Mirrors the old bridge.pings/pongs/
+// connectedAt the peer table used to read.
+const bridgeTraffic = { pings: 0, pongs: 0, connectedAt: 0 };
 
 // Pull the kernel version this peer is running.  Imported via the
 // vendored kernel path so it's exactly the build we shipped, never
@@ -173,43 +169,15 @@ import { KERNEL_VERSION as PEER_KERNEL_VERSION } from '../vendor/axona-protocol/
 // welcome has arrived.  The bridge halves stay "—" until then — that
 // gap is itself useful UX since it signals "WS still negotiating."
 function renderVersion() {
-  const bridgeStr       = bridge.version       ? `v${bridge.version}`       : '—';
-  const bridgeKernelStr = bridge.kernelVersion ? `kernel v${bridge.kernelVersion}` : 'kernel —';
+  const bridgeStr       = bridgeWelcome?.version
+    ? `v${bridgeWelcome.version}` : '—';
+  const bridgeKernelStr = bridgeWelcome?.kernelVersion
+    ? `kernel v${bridgeWelcome.kernelVersion}` : 'kernel —';
   $version.textContent =
     `peer v${PEER_VERSION} · kernel v${PEER_KERNEL_VERSION} · ` +
     `bridge ${bridgeStr} (${bridgeKernelStr})`;
 }
 renderVersion();
-
-// ── Mesh manager ─────────────────────────────────────────────────────
-const mesh = new MeshManager({
-  sendSignal: (toPeerId, payload) => {
-    if (!bridge.ws || bridge.ws.readyState !== WebSocket.OPEN) {
-      appendLog('signal-drop-no-bridge', `to=${toPeerId}`, 'error');
-      return;
-    }
-    try {
-      bridge.ws.send(encode({
-        type: 'signal', to: toPeerId, payload,
-      }));
-    } catch (err) {
-      appendLog('signal-send-failed', err.message, 'error');
-    }
-  },
-  log: (event, extra) => {
-    const detail = extra && Object.keys(extra).length
-      ? Object.entries(extra).map(([k, v]) => `${k}=${v}`).join(' ')
-      : '';
-    appendLog(`mesh:${event}`, detail);
-    // No render() here — mesh state changes already trigger render via
-    // mesh.onChange().  Log-only events (ice-candidate-local, stats,
-    // pc-state transitions that don't change our `state` field) should
-    // not cause re-renders, since render() unnecessarily often makes
-    // the CSS blink animation invisible.
-  },
-});
-
-mesh.onChange(() => render());
 
 // Traffic-driven indicator pulse.  Every real ping-out / pong-in
 // briefly brightens that row's dot, which then fades back to its
@@ -235,7 +203,10 @@ function pulseIndicator(peerId) {
     refs.indicator.classList.remove('indicator--pulse');
   }, PULSE_HOLD_MS);
 }
-mesh.onPingTraffic((peerId, _kind) => pulseIndicator(peerId));
+// mesh + bridge ping-traffic → indicator pulse is wired in
+// bootAxonaNode() once `transport` exists: mesh rows pulse off
+// transport.mesh.onPingTraffic (string meshId), the bridge row off
+// transport.onPingTraffic filtered to the bridge's nodeId.
 
 // ── Event log ────────────────────────────────────────────────────────
 function appendLog(event, detail, kind) {
@@ -424,27 +395,40 @@ function updateRow(refs, data) {
   setText(refs.upText, fmtUptime(data.openedAt));
 }
 
-function render() {
-  // Build the desired ordered list of row data.
-  const peers = mesh.getPeers().sort((a, b) =>
-    a.peerId < b.peerId ? -1 : a.peerId > b.peerId ? 1 : 0);
+// Map webTransport's bridgeState vocabulary onto the INDICATOR_CLASS
+// states the peer table renders.  'open'/'stale'/'connecting'/
+// 'disconnected' pass through; 'upgrade-required' shows red ('failed').
+const BRIDGE_STATE_MAP = {
+  'open':             'open',
+  'stale':            'stale',
+  'connecting':       'connecting',
+  'disconnected':     'disconnected',
+  'upgrade-required': 'failed',
+};
 
-  const bridgeRtt = bridge.rttBuffer.at(-1) ?? null;
-  const bridgeAvg = bridge.rttBuffer.length
-    ? bridge.rttBuffer.reduce((a, b) => a + b, 0) / bridge.rttBuffer.length
-    : null;
+function render() {
+  // No transport yet (region picker still up) — render an empty table
+  // with just the placeholder bridge row so the UI isn't blank.
+  const peers = transport
+    ? transport.mesh.getPeers().sort((a, b) =>
+        a.peerId < b.peerId ? -1 : a.peerId > b.peerId ? 1 : 0)
+    : [];
+
+  const bridgeState = transport
+    ? (BRIDGE_STATE_MAP[transport.bridgeState] ?? 'disconnected')
+    : 'disconnected';
 
   const ordered = [
     {
       peerId:     BRIDGE_ROW_ID,
       label:      'bridge',
       kind:       'bridge',
-      state:      bridge.state,
-      rttLast:    bridgeRtt,
-      rttAvg:     bridgeAvg,
-      pings:      bridge.pings,
-      pongs:      bridge.pongs,
-      openedAt:   bridge.connectedAt,
+      state:      bridgeState,
+      rttLast:    transport ? transport.bridgeRtt : null,
+      rttAvg:     transport ? transport.bridgeRttAvg : null,
+      pings:      bridgeTraffic.pings,
+      pongs:      bridgeTraffic.pongs,
+      openedAt:   bridgeTraffic.connectedAt,
       // Bridge connection is plain WebSocket, no ICE involved.  Null
       // here means "no path badge, no tooltip" — bridges aren't relayed.
       localCand:  null,
@@ -501,200 +485,18 @@ function render() {
   // Header counts.
   const openPeers = peers.filter(p => p.state === 'open').length;
   $meshCount.textContent = `${openPeers} of ${peers.length}`;
-  $myId.textContent = bridge.myConnId ?? '—';
+  $myId.textContent = bridgeWelcome?.connId ?? '—';
 }
 
 // ── Bridge connection lifecycle ──────────────────────────────────────
+//
+// The WebSocket lifecycle (open, version-gate client-hello, bridge
+// hello/hello-ack, ping/pong, stale detection, reconnect/backoff) now
+// lives entirely inside webTransport().  The app subscribes to
+// transport.onBridgeState / onWelcome / onPingTraffic in bootAxonaNode()
+// and drives the version row, upgrade banner, and peer-table bridge row
+// from those callbacks.  Only the upgrade-banner renderer remains here.
 
-function setBridgeState(next) {
-  if (bridge.state === next) return;
-  bridge.state = next;
-  render();
-}
-
-function connectBridge() {
-  clearTimeout(bridge.reconnectTimer);
-  bridge.reconnectTimer = null;
-  setBridgeState('connecting');
-  appendLog('bridge:connecting', bridgeUrl);
-
-  try {
-    bridge.ws = new WebSocket(bridgeUrl);
-  } catch (err) {
-    appendLog('bridge:error', err.message, 'error');
-    scheduleBridgeReconnect();
-    return;
-  }
-
-  bridge.ws.addEventListener('open', onBridgeOpen);
-  bridge.ws.addEventListener('message', onBridgeMessage);
-  bridge.ws.addEventListener('close', onBridgeClose);
-  bridge.ws.addEventListener('error', onBridgeError);
-}
-
-function onBridgeOpen() {
-  appendLog('bridge:open', null, 'ok');
-  setBridgeState('connecting');     // green only after first pong
-
-  // Identify ourselves so the bridge's version gate can decide whether
-  // to admit us.  This MUST be the first message we send — the bridge
-  // drops anything else from un-admitted connections.  If we're too
-  // old (or this message is missing), the bridge closes with
-  // CLOSE_UPGRADE_REQUIRED (4426) and onBridgeClose surfaces a banner.
-  try {
-    bridge.ws.send(encode({ type: 'client-hello', version: PEER_VERSION }));
-  } catch (err) {
-    appendLog('bridge:client-hello-send-failed', err.message, 'error');
-  }
-
-  bridge.backoffMs = BACKOFF_INITIAL_MS;
-  bridge.pings = 0;
-  bridge.pongs = 0;
-  bridge.rttBuffer = [];
-  bridge.connectedAt = Date.now();
-  bridge.lastPongAt = 0;
-  startBridgePingLoop();
-  startBridgeStaleChecker();
-  startUptimeTicker();
-  render();
-}
-
-function onBridgeMessage(ev) {
-  let msg;
-  try { msg = decode(ev.data); }
-  catch { appendLog('bridge:bad-json', null, 'error'); return; }
-
-  switch (msg.type) {
-    case 'welcome':
-      bridge.myConnId      = msg.connId;
-      bridge.version       = msg.version ?? null;
-      bridge.kernelVersion = msg.kernelVersion ?? null;
-      mesh.setMyId(msg.connId);
-      // Hand any bridge-supplied TURN credential to the mesh BEFORE
-      // peer-list arrives.  peer-list will trigger _initiateTo, which
-      // builds RTCPeerConnections using mesh._iceConfig() — by then
-      // we want the TURN entry in place so the new PCs can relay.
-      mesh.setTurnConfig(msg.turn ?? null);
-      appendLog('bridge:welcome', `id=${msg.connId} v${msg.version ?? '?'}${msg.turn ? ' turn=on' : ''}`, 'ok');
-      renderVersion();
-      render();
-      break;
-
-    case 'peer-list':
-      appendLog('bridge:peer-list', `peers=${msg.peers.length}`);
-      mesh.onPeerList(msg.peers);
-      break;
-
-    case 'peer-joined':
-      appendLog('bridge:peer-joined', msg.peerId);
-      mesh.onPeerJoined(msg.peerId);
-      break;
-
-    case 'peer-left':
-      appendLog('bridge:peer-left', msg.peerId);
-      mesh.onPeerLeft(msg.peerId);
-      break;
-
-    case 'signal':
-      mesh.onSignal(msg.from, msg.payload);
-      break;
-
-    case 'pong': {
-      const rtt = Date.now() - msg.t;
-      bridge.pongs++;
-      bridge.rttBuffer.push(rtt);
-      if (bridge.rttBuffer.length > RTT_WINDOW) bridge.rttBuffer.shift();
-      bridge.lastPongAt = Date.now();
-      setBridgeState('open');
-      // Don't render every pong — wait for state-change paths to render
-      // OR for the uptime ticker to tick.  But we DO want RTT to update
-      // visibly, so render here too.
-      render();
-      pulseIndicator(BRIDGE_ROW_ID);
-      break;
-    }
-
-    case 'version-gate':
-      // The bridge announces the minimum peer version it'll admit
-      // BEFORE waiting for client-hello.  Pure informational here —
-      // our own version is fixed at PEER_VERSION; if we're below
-      // the gate, the bridge will close us with code 4426 next.
-      appendLog('bridge:version-gate', `min=${msg.minPeerVersion}`);
-      break;
-
-    case 'axona':
-      // Axona protocol frame (hello / hello-ack / req / res / ntf).
-      // Hand off to the AxonaNode's BridgeTransport.  Frames can arrive
-      // before bootAxonaNode() completes (the bridge's `hello` lands
-      // right after `welcome`); in that case the node-init path will
-      // pull the buffered frame out of `pendingAxonaFrames` below.
-      if (axonaNode) {
-        axonaNode.handleBridgeAxonaFrame(msg.payload);
-      } else {
-        pendingAxonaFrames.push(msg.payload);
-      }
-      break;
-
-    default:
-      // Unknown messages from a future bridge revision — just log.
-      appendLog('bridge:unknown', msg.type);
-  }
-}
-
-function onBridgeClose(ev) {
-  appendLog('bridge:close', `code=${ev.code}${ev.reason ? ' reason=' + ev.reason : ''}`);
-  cleanupBridgeTimers();
-  bridge.ws = null;
-  bridge.myConnId = null;
-  bridge.version  = null;
-  // Tell the AxonaNode the bridge channel is gone so its BridgeTransport
-  // unbinds the bridge peer + rejects any in-flight requests.  When the
-  // WebSocket reconnects, the new welcome → hello flow will re-admit
-  // the bridge as a fresh synapse via `bridge-handshake`.
-  if (axonaNode) {
-    try { axonaNode.handleBridgeClosed(); }
-    catch (err) { appendLog('axona:bridge-close-handler', err.message, 'error'); }
-  }
-  // Drop the cached TURN credential.  When we reconnect, the bridge
-  // hands us a fresh one in welcome — minted right then with a full
-  // 2h TTL.  Holding the old one risks racing the expiry boundary on
-  // a long-running tab that reconnects right before its credential
-  // would have expired.
-  mesh.setTurnConfig(null);
-  renderVersion();
-  // We deliberately do NOT tear down the mesh here.  Existing WebRTC
-  // DataChannels are peer-to-peer; the bridge is not in the data path
-  // for them once they're open.  If a peer dies, our PC's own
-  // connectionstatechange will tell us — we don't need the bridge to
-  // notify us via peer-left.  This lets the mesh survive a bridge
-  // outage: peers keep ping/pong'ing each other while we reconnect.
-  //
-  // When the bridge comes back, the new `peer-list` is purely
-  // additive: we initiate to any peers in it that we don't already
-  // have.  Stale entries in our mesh (peers that died during the
-  // outage) will already be cleaning themselves up via WebRTC's own
-  // health monitoring.
-  setBridgeState('disconnected');
-
-  // The bridge enforces a version gate.  If our peer build is below
-  // its minimum, it closes with CLOSE_UPGRADE_REQUIRED (4426) and a
-  // reason string.  Reconnecting would just fail again the same way,
-  // so we stop the retry loop and surface a banner instructing the
-  // user to hard-reload the page (Pages may need a cache-bust).
-  if (ev.code === 4426) {
-    showUpgradeBanner(ev.reason || 'Your client is out of date.');
-    return;
-  }
-
-  scheduleBridgeReconnect();
-}
-
-/**
- * Render a visible, persistent banner when the bridge rejects this
- * client as too old.  The user needs to hard-reload (or close & re-
- * open) to pick up the new peer build.  No automatic reload — that
- * could disrupt typing or in-flight work.
- */
 function showUpgradeBanner(reason) {
   if (document.getElementById('upgrade-banner')) return;   // idempotent
   const div = document.createElement('div');
@@ -709,98 +511,34 @@ function showUpgradeBanner(reason) {
   document.body.insertBefore(div, document.body.firstChild);
 }
 
-function onBridgeError() {
-  appendLog('bridge:ws-error', null, 'error');
-}
-
-function startBridgePingLoop() {
-  clearInterval(bridge.pingTimer);
-  bridge.pingTimer = setInterval(() => {
-    if (!bridge.ws || bridge.ws.readyState !== WebSocket.OPEN) return;
-    try {
-      bridge.ws.send(encode({ type: 'ping', t: Date.now() }));
-      bridge.pings++;
-      pulseIndicator(BRIDGE_ROW_ID);
-    } catch (err) {
-      appendLog('bridge:ping-send-failed', err.message, 'error');
-    }
-  }, BRIDGE_PING_INTERVAL_MS);
-}
-
-function startBridgeStaleChecker() {
-  clearInterval(bridge.staleTimer);
-  bridge.staleTimer = setInterval(() => {
-    if (bridge.state !== 'open' && bridge.state !== 'stale') return;
-    if (bridge.lastPongAt === 0) return;
-    const since = Date.now() - bridge.lastPongAt;
-    if (since > BRIDGE_STALE_PONG_MS && bridge.state !== 'stale') {
-      setBridgeState('stale');
-      appendLog('bridge:pong-stale', `${since}ms`, 'error');
-    } else if (since <= BRIDGE_STALE_PONG_MS && bridge.state === 'stale') {
-      setBridgeState('open');
-    }
-  }, 500);
-}
-
-function startUptimeTicker() {
-  clearInterval(bridge.uptimeTimer);
-  bridge.uptimeTimer = setInterval(() => render(), UPTIME_TICK_MS);
-}
-
-function cleanupBridgeTimers() {
-  clearInterval(bridge.pingTimer);    bridge.pingTimer = null;
-  clearInterval(bridge.staleTimer);   bridge.staleTimer = null;
-  clearInterval(bridge.uptimeTimer);  bridge.uptimeTimer = null;
-  bridge.connectedAt = 0;
-}
-
-function scheduleBridgeReconnect() {
-  appendLog('bridge:reconnect-in', `${bridge.backoffMs}ms`);
-  bridge.reconnectTimer = setTimeout(() => {
-    bridge.backoffMs = Math.min(bridge.backoffMs * 2, BACKOFF_MAX_MS);
-    connectBridge();
-  }, bridge.backoffMs);
-}
+// ── Uptime ticker ────────────────────────────────────────────────────
+// webTransport drives ping/pong + RTT internally, but the peer table's
+// uptime column counts wall-clock seconds, so we re-render on a 1 Hz
+// tick regardless of traffic.  Armed once at module load.
+setInterval(() => render(), UPTIME_TICK_MS);
 
 // ── Page-resume reset ────────────────────────────────────────────────
 //
 // When a phone backgrounds the tab (lock screen, app switcher) or the
 // laptop sleeps, mobile browsers heavily throttle our timers and the
 // OS often kills the WebSocket.  By the time we come back the remote
-// side has long since seen us peer-leave; our RTCPeerConnections are
-// zombie shells that won't recover on their own and the indicators
-// sit orange indefinitely.
+// side has long since seen us peer-leave; the bridge socket is a
+// zombie that won't recover on its own and the indicators sit orange
+// indefinitely.
 //
-// The simplest fix that always works: when the page becomes visible
-// again after a non-trivial absence, tear down every WebRTC peer and
-// force-reconnect the bridge.  The fresh peer-list rebuilds the mesh
-// from scratch.  Cheap and correct — there's no per-peer state worth
-// salvaging once the underlying transport has died.
+// webTransport().reconnectNow() is the fix: it closes the live socket
+// (or re-opens a dead one) with the backoff reset to zero, re-running
+// the version-gate + hello/hello-ack handshake.  The mesh re-fills
+// from the fresh peer-list the bridge sends on reconnect.  Cheap and
+// correct — there's no per-peer state worth salvaging once the
+// underlying transport has died.
 
 const RESUME_HIDDEN_THRESHOLD_MS = 5000;   // ignore brief tab switches
 let hiddenAt = 0;
 
 function resetMesh(reason) {
   appendLog('resume', reason, 'ok');
-  mesh.reset();
-  forceReconnectBridge();
-}
-
-function forceReconnectBridge() {
-  bridge.backoffMs = BACKOFF_INITIAL_MS;
-  clearTimeout(bridge.reconnectTimer);
-  bridge.reconnectTimer = null;
-  if (bridge.ws && bridge.ws.readyState !== WebSocket.CLOSED) {
-    // Closing here triggers onclose → scheduleBridgeReconnect, which
-    // honours the backoff we just reset.  No need to call connectBridge
-    // directly; that would race the close-handler's reconnect.
-    try { bridge.ws.close(1000, 'resume'); } catch {}
-  } else {
-    bridge.ws = null;
-    cleanupBridgeTimers();
-    setBridgeState('disconnected');
-    connectBridge();
-  }
+  transport?.reconnectNow();
 }
 
 document.addEventListener('visibilitychange', () => {
@@ -834,48 +572,23 @@ window.addEventListener('pageshow', (ev) => {
 $logClear.addEventListener('click', () => { $logList.innerHTML = ''; });
 
 window.addEventListener('beforeunload', () => {
-  mesh.dispose();
-  if (axonaNode) try { axonaNode.stop(); } catch {}
-  if (bridge.ws && bridge.ws.readyState === WebSocket.OPEN) {
-    try { bridge.ws.close(1000, 'page unload'); } catch {}
-  }
+  transport?.stop();
 });
 
 // ── Axona protocol layer (Phase 3) ──────────────────────────────────
 //
-// On boot: if a persisted identity exists, instantiate AxonaNode
-// immediately.  Otherwise show the region picker and wait for the
-// user to choose; on save, derive an identity and instantiate.
-
-let axonaNode = null;
-
-// Axona frames that arrive on the bridge WebSocket BEFORE the
-// AxonaNode is instantiated (e.g., the bridge's `hello` lands within
-// milliseconds of welcome, but bootAxonaNode is async because identity
-// derivation needs Web Crypto).  We buffer them here and drain into
-// the node as soon as it's ready, so the bridge-handshake completes on
-// the very first hello rather than waiting for a retry.
-const pendingAxonaFrames = [];
-
-// Bridge adapter shape consumed by AxonaNode → BridgeTransport.
-// Reads `bridge.ws` from the surrounding closure so the same adapter
-// keeps working across reconnects (we never replace the adapter, just
-// the underlying WebSocket).
-const bridgeAdapter = {
-  sendToBridge(msg) {
-    if (!bridge.ws || bridge.ws.readyState !== WebSocket.OPEN) return false;
-    try {
-      bridge.ws.send(encode(msg));
-      return true;
-    } catch (err) {
-      appendLog('axona:bridge-send-failed', err.message, 'error');
-      return false;
-    }
-  },
-  isBridgeOpen() {
-    return !!bridge.ws && bridge.ws.readyState === WebSocket.OPEN;
-  },
-};
+// On boot: if a persisted identity exists, instantiate the kernel peer
+// immediately.  Otherwise show the region picker and wait for the user
+// to choose; on save, derive an identity and instantiate.
+//
+// The kernel now owns the whole connection: webTransport() builds the
+// bridge WebSocket + WebRTC mesh and drives the version-gate +
+// hello/hello-ack handshake, NeuronNode holds the synaptome,
+// AxonaDomain is the routing domain, and AxonaPeer is the pub/sub +
+// lookup surface this UI talks to.
+let peer = null;        // AxonaPeer
+let transport = null;   // CompositeTransport from webTransport()
+let node = null;        // NeuronNode
 
 function populateRegionDropdown() {
   for (const r of REGIONS) {
@@ -916,14 +629,14 @@ const READY_TIMEOUT_MS    = 10_000;
 async function waitForMeshReady() {
   const t0 = Date.now();
   while (Date.now() - t0 < READY_TIMEOUT_MS) {
-    const size = axonaNode?.getSynaptome?.().length ?? 0;
+    const size = peer?.getSynaptome?.().length ?? 0;
     if (size >= READY_SYNAPSE_COUNT) {
       appendLog('mesh:ready', `synaptome=${size}`);
       return size;
     }
     await new Promise(r => setTimeout(r, 200));
   }
-  const size = axonaNode?.getSynaptome?.().length ?? 0;
+  const size = peer?.getSynaptome?.().length ?? 0;
   appendLog('mesh:ready-timeout', `synaptome=${size} (proceeding anyway)`);
   return size;
 }
@@ -936,27 +649,104 @@ async function bootAxonaNode(opts = {}) {
     ?? identity.region?.source
     ?? '—';
 
-  axonaNode = new AxonaNode({
-    identity,
-    log: (event, detail) => appendLog(`axona:${event}`, detail),
+  // ── Build the kernel stack ───────────────────────────────────────
+  //
+  // webTransport() validates `identity.id` as a 66-char hex string, but
+  // this repo's deriveIdentity returns `id` as a 264-bit BigInt with
+  // the hex form on `idHex`.  Hand the transport an identity whose
+  // `id` is the hex form (plus the kernel key fields so the bridge
+  // handshake's hello/hello-ack carry the right nodeId).  NeuronNode,
+  // by contrast, wants the BigInt id, and AxonaPeer wants the full
+  // kernel identity (privateKey + pubkeyHex) so peer.pub can sign.
+  transport = webTransport({
+    bridgeUrl,
+    identity: { ...identity, id: identity.idHex },
+    peerVersion: PEER_VERSION,
+    log: (e, d) => appendLog('tx:' + e, d),
+    reconnect: true,
   });
-  await axonaNode.start(mesh, bridgeAdapter);
+
+  node = new NeuronNode({
+    id:  identity.id,                 // BigInt (264-bit) — kernel form
+    lat: identity.region?.lat ?? 0,
+    lng: identity.region?.lng ?? 0,
+  });
+  node.transport = transport;
+
+  const domain = new AxonaDomain({ k: 20 });
+  peer = new AxonaPeer({ domain, node, identity, transport });
+
+  // ── Wire UI events BEFORE start so we don't miss the first welcome
+  //    / state transition that lands during the handshake. ──────────
+  const hex = (id) => typeof id === 'bigint'
+    ? id.toString(16).padStart(66, '0')
+    : String(id);
+
+  transport.onBridgeState((state, detail) => {
+    appendLog('bridge:state', `${state}${detail ? ' ' + detail : ''}`);
+    if (state === 'open') bridgeTraffic.connectedAt = Date.now();
+    if (state === 'connecting' || state === 'disconnected') {
+      bridgeTraffic.connectedAt = 0;
+    }
+    if (state === 'upgrade-required') {
+      showUpgradeBanner(transport.upgradeReason || 'Your client is out of date.');
+    }
+    renderVersion();
+    render();
+  });
+
+  transport.onWelcome((info) => {
+    bridgeWelcome = info;
+    appendLog('bridge:welcome',
+      `id=${info.connId ?? '?'} v${info.version ?? '?'}${info.turn ? ' turn=on' : ''}`, 'ok');
+    renderVersion();
+    render();
+  });
+
+  // Bridge ping/pong → pulse the bridge row + tally counts.  Mesh-peer
+  // ping traffic comes from the mesh layer's own onPingTraffic (string
+  // meshIds, wired below); transport.onPingTraffic reports BigInt
+  // nodeIds, of which only the bridge has a clean match here.
+  transport.onPingTraffic((peerIdBig, kind) => {
+    if (transport.bridgeNodeIdBig != null && peerIdBig === transport.bridgeNodeIdBig) {
+      if (kind === 'sent') bridgeTraffic.pings++;
+      else                 bridgeTraffic.pongs++;
+      pulseIndicator(BRIDGE_ROW_ID);
+    }
+  });
+
+  // WebRTC mesh rows pulse on their own ping/pong frames (string meshId).
+  transport.mesh.onPingTraffic((meshId, _kind) => pulseIndicator(meshId));
+
+  transport.onPeerBound(() => render());
+  transport.onPeerDied(() => render());
+  transport.mesh.onChange(() => render());
+
+  // ── Start the connection ─────────────────────────────────────────
+  // transport.start() drives the version-gate + bridge hello/hello-ack
+  // and resolves once the bridge handshake completes (or rejects on
+  // timeout / upgrade-required).  On failure we still leave the UI
+  // usable — the transport's own reconnect loop keeps retrying in the
+  // background, and onBridgeState will surface the upgrade banner if
+  // it's a version-gate rejection.
+  try {
+    await transport.start();
+  } catch (err) {
+    appendLog('bridge:start-failed', err.message ?? String(err), 'error');
+  }
+  await peer.start();
 
   // Debug surface for DevTools.  Exposed on window so operators can
   // introspect live state without rebuilding — `window.axona.synaptome()`,
   // `window.axona.subs()`, etc.  All read-only — no setters that could
   // accidentally tamper with running state.
-  const hex = (id) => typeof id === 'bigint'
-    ? id.toString(16).padStart(66, '0')
-    : String(id);
-
   window.axona = {
-    /** Raw node reference — for poking around when needed. */
-    node:        axonaNode,
+    /** Raw peer reference — for poking around when needed. */
+    node:        peer,
     /** Identity object (nodeId + region + geoBits). */
     identity,
     /** Snapshot of every Synapse currently in our routing table. */
-    synaptome:   () => axonaNode.getSynaptome().map(s => ({
+    synaptome:   () => peer.getSynaptome().map(s => ({
                    ...s,
                    peerId: hex(s.peerId),
                  })),
@@ -971,30 +761,18 @@ async function bootAxonaNode(opts = {}) {
     publishForms: () => publishForms.slice(),
     /** Live bridge connection state — useful when handshake stalls. */
     bridge:      () => ({
-                   state:    bridge.state,
-                   myConnId: bridge.myConnId,
-                   version:  bridge.version,
-                   url:      bridge.url,
-                   wsReady:  bridge.ws?.readyState,
+                   state:   transport.bridgeState,
+                   connId:  transport.bridgeInfo?.connId,
+                   version: transport.bridgeInfo?.version,
+                   wsReady: transport.socket?.readyState,
                  }),
     /** Mesh peers with their connection states (the ones reachable via WebRTC). */
-    mesh:        () => mesh.getPeers(),
+    mesh:        () => transport.mesh.getPeers(),
     /** Which peer nodeIds is the underlying transport bound to right now?
      *  This is the set of peers we can reach via sendDirect.  Useful when
      *  an axon supposedly has a subscriber in role.children but
      *  transport.notify silently drops because the binding doesn't exist. */
-    boundPeers:  () => {
-      const t = axonaNode._transport;
-      const out = [];
-      // CompositeTransport: walk each sub-transport's connId↔nodeId maps.
-      for (const sub of (t?._subs ?? [])) {
-        if (sub._meshIdByNodeId) {
-          for (const [nodeId] of sub._meshIdByNodeId) out.push({ via: 'mesh', nodeId: hex(nodeId) });
-        }
-        if (sub._bridgeNodeId) out.push({ via: 'bridge', nodeId: hex(sub._bridgeNodeId) });
-      }
-      return out;
-    },
+    boundPeers:  () => transport.boundPeers().map(hex),
     /** Resolve a (regionId, eventName) to its 264-bit hex topic ID
      *  (public-mode: '00' + sha256(`${regionId}/${eventName}`)). */
     topicKey: async (regionId, eventName) => {
@@ -1011,7 +789,7 @@ async function bootAxonaNode(opts = {}) {
      *  when subscribes and publishes seem to land on different roots. */
     findKClosest: async (topicHex, K = 5) => {
       const t = typeof topicHex === 'string' ? BigInt('0x' + topicHex.replace(/^0x/, '')) : topicHex;
-      const ids = await axonaNode._peer.findKClosest(t, K);
+      const ids = await peer.findKClosest(t, K);
       return ids.map(hex);
     },
     /** Topics we're an axon role-holder for, with our children (subscribers).
@@ -1019,7 +797,7 @@ async function bootAxonaNode(opts = {}) {
      *  propagate.  If a subscriber we expected to deliver to ISN'T listed
      *  here, they never subscribed at us. */
     axonRoles:   () => {
-      const am = axonaNode._peer?._axonaManager;
+      const am = peer._axonaManager;
       if (!am?.axonRoles) return [];
       return [...am.axonRoles.entries()].map(([topicId, role]) => ({
         topic:    hex(topicId),
@@ -1031,21 +809,11 @@ async function bootAxonaNode(opts = {}) {
     /** Topics we're subscribed to (from AxonaManager's POV, not just the
      *  UI's `subs()`).  Should match — if it doesn't, we have a sync bug. */
     mySubscriptions: () => {
-      const am = axonaNode._peer?._axonaManager;
+      const am = peer._axonaManager;
       if (!am?.mySubscriptions) return [];
       return [...am.mySubscriptions.keys()].map(hex);
     },
   };
-
-  // Drain any axona frames that arrived during the async boot.  The
-  // bridge sends `hello` right after `welcome`; identity derivation
-  // (post.js + Web Crypto) takes ~1 frame, so the hello almost always
-  // lands before this point in single-tab cold-loads.
-  while (pendingAxonaFrames.length) {
-    const payload = pendingAxonaFrames.shift();
-    try { axonaNode.handleBridgeAxonaFrame(payload); }
-    catch (err) { appendLog('axona:drain-failed', err.message, 'error'); }
-  }
 
   appendLog('axona:ready', { nodeId: fmtNodeId(identity.id) });
   $lookupGo.disabled = false;
@@ -1084,10 +852,10 @@ async function bootAxonaNode(opts = {}) {
 
   // Refresh synaptome counter on any mesh change (cheap proxy).
   const updateSynaptomeBadge = () => {
-    if (!axonaNode) return;
-    $synaptomeSize.textContent = String(axonaNode.getSynaptome().length);
+    if (!peer) return;
+    $synaptomeSize.textContent = String(peer.getSynaptome().length);
   };
-  mesh.onChange(updateSynaptomeBadge);
+  transport.mesh.onChange(updateSynaptomeBadge);
   setInterval(updateSynaptomeBadge, 1000);
 }
 
@@ -1100,7 +868,7 @@ async function bootAxonaNode(opts = {}) {
 //   ]
 //
 // `topic` is the public-mode topic string (`${regionId}/${eventName}`).
-// `handle` is the kernel Subscription returned by axonaNode.sub; it
+// `handle` is the kernel Subscription returned by peer.sub; it
 // exposes `.topicId` (66-char hex) for diagnostics and `.stop()` for
 // teardown.  `messages` is ephemeral — a fresh inbox on every reload.
 
@@ -1254,7 +1022,7 @@ function regionSynthPublisher(regionId) {
 }
 
 async function addSubscription(regionId, eventName) {
-  if (!axonaNode) throw new Error('axona node not started yet');
+  if (!peer) throw new Error('axona peer not started yet');
   if (!REGIONS.find(r => r.id === regionId)) {
     throw new Error('unknown region: ' + regionId);
   }
@@ -1281,7 +1049,7 @@ async function addSubscription(regionId, eventName) {
   // and never sees publishes that happened before its sub envelope
   // reached the K-closest axon.
   const publisher = regionSynthPublisher(regionId);
-  sub.handle = await axonaNode.sub(topic, (envelope) => {
+  sub.handle = await peer.sub(topic, (envelope) => {
     sub.messages.push({
       publisher: envelope.signerPubkey ?? null,
       msg:       envelope.message,
@@ -1309,7 +1077,7 @@ async function addSubscription(regionId, eventName) {
   // handler — the symptom users see as "publish to a topic I'm
   // subscribed to, message reaches everyone else but not me."
   // start() is idempotent; the timer won't double-arm.
-  axonaNode._peer?._axonaManager?.start?.();
+  peer._axonaManager?.start?.();
 
   persistSubscriptions();
   renderSubscriptions();
@@ -1390,7 +1158,7 @@ async function recomputeKeyLabel(form, $keyEl) {
 
 async function publishFromForm(form, $messageEl) {
   console.log('[axona] publishFromForm fired', { form, value: $messageEl?.value });
-  if (!axonaNode) { console.warn('[axona] publish aborted: axonaNode not ready'); return; }
+  if (!peer) { console.warn('[axona] publish aborted: peer not ready'); return; }
   const eventName = form.eventName.trim();
   const message   = $messageEl.value;
   if (!eventName) {
@@ -1418,7 +1186,7 @@ async function publishFromForm(form, $messageEl) {
     // envelope's signerPubkey is the real publisher's pubkey —
     // the synthetic ID only steers deriveTopicId's S2 prefix.
     const publisher = regionSynthPublisher(form.regionId);
-    const msgId = await axonaNode.pub(topic, message, { publisher });
+    const msgId = await peer.pub(topic, message, { publisher });
     console.log('[axona] published', { topic, msgId });
     appendLog('pubsub:published', `${form.regionId}/${eventName} → ${msgId}`);
     $messageEl.value = '';
@@ -1497,7 +1265,7 @@ function buildPublishCard(form) {
   $send.className = 'pubsub-send';
   $send.type = 'button';
   $send.textContent = 'send';
-  $send.disabled = !axonaNode;
+  $send.disabled = !peer;
   $send.addEventListener('click', () => publishFromForm(form, $message));
   $message.addEventListener('keydown', (ev) => {
     if (ev.key === 'Enter' && !ev.shiftKey) {
@@ -1533,7 +1301,7 @@ function renderPublishForms() {
 }
 
 function addPublishForm() {
-  const home = axonaNode?._identity?.region?.id ?? REGIONS[0].id;
+  const home = peer?._identity?.region?.id ?? REGIONS[0].id;
   publishForms.push(newPublishForm(home, ''));
   persistPublishForms();
   renderPublishForms();
@@ -1545,7 +1313,7 @@ function removePublishForm(id) {
   publishForms.splice(idx, 1);
   if (publishForms.length === 0) {
     // Keep at least one form on screen.
-    const home = axonaNode?._identity?.region?.id ?? REGIONS[0].id;
+    const home = peer?._identity?.region?.id ?? REGIONS[0].id;
     publishForms.push(newPublishForm(home, ''));
   }
   persistPublishForms();
@@ -1579,7 +1347,7 @@ $subEvent.addEventListener('keydown', (ev) => {
 
 // ── Lookup UI ────────────────────────────────────────────────────────
 $lookupGo.addEventListener('click', async () => {
-  if (!axonaNode) return;
+  if (!peer) return;
   const raw = $lookupTarget.value.trim().replace(/^0x/i, '');
   // v1.1: 264-bit node IDs are 66 hex chars; allow any prefix from
   // 1 char (handy for "find anything close to this S2 cell") up to
@@ -1592,7 +1360,7 @@ $lookupGo.addEventListener('click', async () => {
   $lookupResult.textContent = `looking up ${target.toString(16)}…`;
   $lookupGo.disabled = true;
   try {
-    const result = await axonaNode.lookup(target);
+    const result = await peer.lookup(target);
     $lookupResult.textContent = JSON.stringify({
       found:  result?.found,
       hops:   result?.hops,
@@ -1606,11 +1374,14 @@ $lookupGo.addEventListener('click', async () => {
 });
 
 // ── Go ───────────────────────────────────────────────────────────────
+//
+// The bridge WebSocket is no longer connected here — webTransport()
+// (built inside bootAxonaNode) owns the socket and its handshake.  Boot
+// the Axona layer: existing identity → use it; else show the region
+// picker and connect once the user chooses.
 appendLog('boot', `bridge=${bridgeUrl}`);
 render();
-connectBridge();
 
-// Boot the Axona layer: existing identity → use it; else show picker.
 (() => {
   const existing = getCurrentIdentity();
   if (existing) {

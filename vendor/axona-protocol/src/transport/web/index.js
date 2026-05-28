@@ -92,6 +92,15 @@ export { MeshManager, WebRTCTransport, BridgeTransport, CompositeTransport };
  */
 /** Bridge ping cadence — matches axona-peer's BRIDGE_PING_INTERVAL_MS. */
 const BRIDGE_PING_INTERVAL_MS = 1000;
+/** No pong within this window ⇒ bridge state goes 'stale'. */
+const BRIDGE_STALE_PONG_MS    = 3000;
+/** Reconnect backoff bounds (exponential, doubling per attempt). */
+const RECONNECT_BACKOFF_INITIAL_MS = 1000;
+const RECONNECT_BACKOFF_MAX_MS     = 16000;
+/** WebSocket close code the bridge uses for version-gate rejection. */
+const UPGRADE_CLOSE_CODE = 4426;
+/** Window of recent RTT samples kept for the average. */
+const RTT_WINDOW = 10;
 
 export function webTransport({
   bridgeUrl,
@@ -102,6 +111,15 @@ export function webTransport({
   peerVersion,
   handshakeTimeoutMs = 15000,
   pingIntervalMs = BRIDGE_PING_INTERVAL_MS,
+  // v2.1 — auto-reconnect with exponential backoff.  Only active when
+  // autoHandshake is true (reconnect re-runs the version-gate +
+  // hello/hello-ack the factory owns; an autoHandshake:false consumer
+  // drives its own socket lifecycle).  Triggers on socket *close*
+  // other than a 4426 version-gate rejection, so the first-attempt
+  // handshake-timeout contract (start() rejects) is unchanged.
+  reconnect = true,
+  reconnectInitialMs = RECONNECT_BACKOFF_INITIAL_MS,
+  reconnectMaxMs     = RECONNECT_BACKOFF_MAX_MS,
 } = {}) {
   if (typeof bridgeUrl !== 'string' || !/^wss?:\/\//.test(bridgeUrl)) {
     throw new TransportError(ErrorCodes.TRANSPORT_NOT_STARTED,
@@ -151,13 +169,51 @@ export function webTransport({
     socket.addEventListener('open', () => {
       socketOpen = true;
       log('bridge-socket-open', { bridgeUrl });
+      setBridgeState('connecting');
+      if (autoHandshake) {
+        // (a) WebSocket-level version gate: the bridge requires
+        // {type:'client-hello', version} as the FIRST raw frame, before
+        // any axona payloads.  Sent here on every (re)open so reconnect
+        // re-clears the gate without bespoke caller logic.
+        try {
+          socket.send(JSON.stringify({
+            type:    'client-hello',
+            version: peerVersion || KERNEL_VERSION,
+          }));
+        } catch (err) {
+          log('auto-handshake-client-hello-failed', { err: err.message });
+        }
+        // (c) Bridge ping/pong heartbeat + stale detection.
+        startBridgePingLoop();
+        startStaleChecker();
+      }
       for (const h of socketEvents.open) try { h(); } catch (e) { log('open-handler-threw', { err: e.message }); }
     });
-    socket.addEventListener('close', () => {
+    socket.addEventListener('close', (ev) => {
       socketOpen = false;
-      log('bridge-socket-close');
+      stopBridgePingLoop();
+      const code = ev && typeof ev.code === 'number' ? ev.code : null;
+      log('bridge-socket-close', { code });
       bridge.handleConnClosed();
-      for (const h of socketEvents.close) try { h(); } catch (e) { log('close-handler-threw', { err: e.message }); }
+      // Allow the persistent hello handler to re-bind on the next open.
+      bridgeNodeIdBig = null;
+      if (code === UPGRADE_CLOSE_CODE) {
+        // Version-gate rejection — reconnecting would just fail again.
+        stopped = true;
+        stopStaleChecker();
+        setBridgeState('upgrade-required', (ev && ev.reason) || 'client out of date');
+      } else if (!stopped && reconnect && autoHandshake) {
+        setBridgeState('disconnected');
+        scheduleReconnect();
+      } else {
+        stopStaleChecker();
+        setBridgeState('disconnected');
+      }
+      // Drop the dead socket reference so openSocket() (called by the
+      // reconnect path) can create a fresh one — its `if (socket) return`
+      // guard would otherwise block reconnection.
+      socket = null;
+      for (const h of socketEvents.close) try { h(ev); } catch (e) { log('close-handler-threw', { err: e.message }); }
     });
     socket.addEventListener('message', (ev) => {
       let frame;
@@ -232,6 +288,19 @@ export function webTransport({
             try { mesh.setTurnConfig(frame.turn ?? null); }
             catch (err) { log('turn-config-failed', { err: err.message }); }
           }
+          // Capture welcome for observability (consumers read it via
+          // transport.bridgeInfo + onWelcome) — connId, the bridge's
+          // package version, and its kernel version for the UI's
+          // version row.
+          bridgeInfo = {
+            connId:        frame.connId ?? null,
+            version:       frame.version ?? null,
+            kernelVersion: frame.kernelVersion ?? null,
+            turn:          !!frame.turn,
+          };
+          for (const h of welcomeHandlers) {
+            try { h(bridgeInfo); } catch (e) { log('welcome-handler-threw', { err: e.message }); }
+          }
           log('bridge-welcome', {
             connId:  frame.connId,
             version: frame.version,
@@ -260,6 +329,8 @@ export function webTransport({
           break;
         case 'pong':
           bridge._emitPingTraffic('recv');
+          // RTT + liveness: the bridge echoes the ping's `t` timestamp.
+          recordPong(frame.t);
           return;
         case 'version-gate':
           // Version-gate announcement — no action needed.
@@ -322,6 +393,81 @@ export function webTransport({
   // (autoHandshake === false → we resolve immediately below).
   bridgeReady.catch(() => {});
 
+  // ── Connection state machine (v2.1 — reconnect + observability) ──
+  //
+  // bridgeState transitions, surfaced via onBridgeState(cb):
+  //   'connecting'       socket opening / handshake in flight
+  //   'open'             handshake complete + pongs flowing
+  //   'stale'            open but no pong within BRIDGE_STALE_PONG_MS
+  //   'disconnected'     socket closed, reconnect pending
+  //   'upgrade-required' bridge rejected us with 4426 (no reconnect)
+  let bridgeState      = 'disconnected';
+  let bridgeInfo       = null;   // last welcome: { connId, version, kernelVersion, turn }
+  let upgradeReason    = null;   // set when state === 'upgrade-required'
+  let lastPongAt       = 0;
+  let lastRtt          = null;
+  const rttBuffer      = [];
+  let staleTimer       = null;
+  let reconnectTimer   = null;
+  let reconnectAttempt = 0;
+  let stopped          = false;  // composite.stop() sets this — suppresses reconnect
+  const stateHandlers   = new Set();
+  const welcomeHandlers = new Set();
+
+  function setBridgeState(next, detail) {
+    if (next === 'upgrade-required') upgradeReason = detail ?? upgradeReason;
+    if (bridgeState === next) return;
+    bridgeState = next;
+    for (const h of stateHandlers) {
+      try { h(next, detail); } catch (e) { log('bridge-state-handler-threw', { err: e.message }); }
+    }
+  }
+
+  function recordPong(t) {
+    lastPongAt = Date.now();
+    if (typeof t === 'number') {
+      lastRtt = Math.max(0, Date.now() - t);
+      rttBuffer.push(lastRtt);
+      if (rttBuffer.length > RTT_WINDOW) rttBuffer.shift();
+    }
+    if (bridgeState === 'stale') setBridgeState('open');
+  }
+
+  function startStaleChecker() {
+    if (staleTimer != null) return;
+    staleTimer = setInterval(() => {
+      if (bridgeState !== 'open' && bridgeState !== 'stale') return;
+      if (lastPongAt === 0) return;
+      const since = Date.now() - lastPongAt;
+      if (since > BRIDGE_STALE_PONG_MS && bridgeState === 'open') {
+        setBridgeState('stale');
+      }
+    }, 500);
+    if (typeof staleTimer?.unref === 'function') staleTimer.unref();
+  }
+  function stopStaleChecker() {
+    if (staleTimer != null) { clearInterval(staleTimer); staleTimer = null; }
+  }
+
+  function scheduleReconnect() {
+    if (stopped || !reconnect || !autoHandshake) return;
+    if (reconnectTimer != null) return;
+    const delay = Math.min(
+      reconnectInitialMs * (2 ** reconnectAttempt),
+      reconnectMaxMs,
+    );
+    reconnectAttempt++;
+    log('bridge-reconnect-scheduled', { delay, attempt: reconnectAttempt });
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      if (stopped) return;
+      setBridgeState('connecting');
+      openSocket();          // re-open; the 'open' handler re-runs client-hello,
+                             // the persistent hello handler re-binds the bridge.
+    }, delay);
+    if (typeof reconnectTimer?.unref === 'function') reconnectTimer.unref();
+  }
+
   if (!autoHandshake) {
     bridgeReadyResolve(null);
   } else {
@@ -351,7 +497,10 @@ export function webTransport({
         nodeId: localNodeIdHex,
       }).catch(err => log('auto-handshake-ack-failed', { err: err.message }));
       bridgeNodeIdBig = nodeIdBig;
+      reconnectAttempt = 0;          // good connection — reset backoff
+      lastPongAt = Date.now();
       log('auto-handshake-complete', { bridgeNodeId: body.nodeId });
+      setBridgeState('open');
       bridgeReadyResolve(nodeIdBig);
     });
     bridge.onNotification('hello-ack', (fromConnId, body) => {
@@ -367,7 +516,10 @@ export function webTransport({
         return;
       }
       bridgeNodeIdBig = nodeIdBig;
+      reconnectAttempt = 0;          // good connection — reset backoff
+      lastPongAt = Date.now();
       log('auto-handshake-complete', { bridgeNodeId: body.nodeId });
+      setBridgeState('open');
       bridgeReadyResolve(nodeIdBig);
     });
     socketEvents.close.add(() => {
@@ -478,18 +630,11 @@ export function webTransport({
     if (typeof mesh.setMyId === 'function') mesh.setMyId(localNodeIdHex);
     await origStart(localNodeIdBig);
 
+    // The socket 'open' handler already sent the client-hello version
+    // gate and armed the ping/pong + stale heartbeat (so reconnect
+    // re-runs them on every re-open).  start() just awaits the FIRST
+    // application-level hello / hello-ack to land.
     if (autoHandshake) {
-      // (a) WebSocket-level version gate: send the raw client-hello
-      // frame the bridge waits for.  Must precede any axona payloads.
-      try {
-        sendToBridge({
-          type:    'client-hello',
-          version: peerVersion || KERNEL_VERSION,
-        });
-      } catch (err) {
-        log('auto-handshake-client-hello-failed', { err: err.message });
-      }
-      // (b) Wait for the application-level hello / hello-ack to land.
       const timer = setTimeout(() => {
         if (bridgeNodeIdBig === null) {
           bridgeReadyReject(new UpgradeRequiredError(
@@ -502,15 +647,13 @@ export function webTransport({
       } finally {
         clearTimeout(timer);
       }
-
-      // (c) Start the bridge ping/pong heartbeat.  The live bridge
-      // closes idle sockets after ~15s without a ping; axona-peer
-      // sends one every 1s.  We do the same so apps stay connected.
-      startBridgePingLoop();
     }
   };
   const origStop = composite.stop.bind(composite);
   composite.stop = async () => {
+    stopped = true;                     // suppress any pending reconnect
+    if (reconnectTimer != null) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+    stopStaleChecker();
     stopBridgePingLoop();
     await origStop();
     if (socket) {
@@ -518,6 +661,7 @@ export function webTransport({
       socket = null;
       socketOpen = false;
     }
+    setBridgeState('disconnected');
     if (typeof mesh.dispose === 'function') mesh.dispose();
   };
 
@@ -539,6 +683,7 @@ export function webTransport({
         log('bridge-ping-send-failed', { err: err.message });
       }
     }, pingIntervalMs);
+    if (typeof pingTimer?.unref === 'function') pingTimer.unref();
   }
   function stopBridgePingLoop() {
     if (pingTimer != null) {
@@ -566,6 +711,52 @@ export function webTransport({
   Object.defineProperty(composite, 'bridgeNodeIdBig', {
     get() { return bridgeNodeIdBig; },
   });
+
+  // ── v2.1 observability surface ───────────────────────────────────
+  // Current bridge connection state (see setBridgeState transitions).
+  Object.defineProperty(composite, 'bridgeState', { get() { return bridgeState; } });
+  // Last `welcome` frame: { connId, version, kernelVersion, turn } or null.
+  Object.defineProperty(composite, 'bridgeInfo',  { get() { return bridgeInfo; } });
+  // Reason string when state === 'upgrade-required'.
+  Object.defineProperty(composite, 'upgradeReason', { get() { return upgradeReason; } });
+  // Most recent bridge ping→pong RTT in ms (null until first pong).
+  Object.defineProperty(composite, 'bridgeRtt',   { get() { return lastRtt; } });
+  // Mean of the recent RTT window, or null.
+  Object.defineProperty(composite, 'bridgeRttAvg', {
+    get() {
+      return rttBuffer.length
+        ? rttBuffer.reduce((a, b) => a + b, 0) / rttBuffer.length
+        : null;
+    },
+  });
+  /** Subscribe to bridge-state transitions.  cb(state, detail). Returns unsub. */
+  composite.onBridgeState = (cb) => {
+    if (typeof cb !== 'function') throw new TypeError('onBridgeState: cb must be a function');
+    stateHandlers.add(cb);
+    return () => stateHandlers.delete(cb);
+  };
+  /** Subscribe to bridge welcome frames.  cb({connId,version,kernelVersion,turn}). Returns unsub. */
+  composite.onWelcome = (cb) => {
+    if (typeof cb !== 'function') throw new TypeError('onWelcome: cb must be a function');
+    welcomeHandlers.add(cb);
+    // Replay the last welcome so late subscribers aren't left blank.
+    if (bridgeInfo) { try { cb(bridgeInfo); } catch { /* ignore */ } }
+    return () => welcomeHandlers.delete(cb);
+  };
+  /** Force an immediate reconnect now (e.g. on tab resume / network online).
+   *  No-op if stopped or reconnect disabled.  Closes the live socket so the
+   *  close handler's reconnect path runs with a reset backoff. */
+  composite.reconnectNow = () => {
+    if (stopped || !reconnect || !autoHandshake) return;
+    reconnectAttempt = 0;
+    if (reconnectTimer != null) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+    if (socket && socketOpen) {
+      try { socket.close(); } catch { /* close handler schedules reconnect */ }
+    } else if (!socket) {
+      setBridgeState('connecting');
+      openSocket();
+    }
+  };
 
   return composite;
 }
