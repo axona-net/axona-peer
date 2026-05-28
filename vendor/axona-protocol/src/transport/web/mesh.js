@@ -27,6 +27,18 @@
 
 const PING_INTERVAL_MS = 1000;
 const STALE_PONG_MS    = 3000;
+// No pong for this long ⇒ the channel is dead and the peer is evicted
+// (onPeerLost fires), even if dc.readyState still lies 'open'.  This is
+// the heartbeat-timeout the Transport contract requires; without it a
+// channel that goes silent (laptop sleep / screensaver, where Safari
+// keeps readyState 'open' on a dead dc) is stuck at 'stale' forever and
+// the mesh never heals.  Must be > STALE_PONG_MS so there's a visible
+// stale window first.
+const DEAD_PONG_MS     = 10000;
+// Consecutive dc.send() throws that mean "this channel is dead now" —
+// a throwing send is definitive proof the channel is gone even when
+// readyState lies 'open', so we don't wait the full DEAD_PONG_MS.
+const SEND_FAIL_LIMIT  = 3;
 const RTT_WINDOW       = 10;
 const DC_LABEL         = 'axona';
 const RETRY_AFTER_MS   = 5000;   // single retry after pc-failed (B10)
@@ -680,34 +692,68 @@ export class MeshManager {
 
   _startPingLoop(state) {
     if (state.pingTimer) clearInterval(state.pingTimer);
-    state.pingTimer = setInterval(() => {
-      if (state.dc?.readyState !== 'open') return;
-      try {
-        state.dc.send(JSON.stringify({ type: 'ping', t: Date.now() }));
-        state.pings++;
-        this._emitPingTraffic(state.peerId, 'sent');
-      } catch (err) {
-        this._log('ping-send-failed', {
-          peerId: state.peerId, err: err.message,
-        });
+    state.pingTimer = setInterval(() => this._pingTick(state), PING_INTERVAL_MS);
+  }
+
+  /** One heartbeat-ping send.  Extracted from the interval so the
+   *  send-failure eviction is unit-testable without a real timer.
+   *  Returns 'sent' | 'skip' | 'fail' | 'evicted'. */
+  _pingTick(state) {
+    if (state.dc?.readyState !== 'open') return 'skip';
+    try {
+      state.dc.send(JSON.stringify({ type: 'ping', t: Date.now() }));
+      state.pings++;
+      state.sendFailures = 0;          // a successful send clears the streak
+      this._emitPingTraffic(state.peerId, 'sent');
+      return 'sent';
+    } catch (err) {
+      this._log('ping-send-failed', {
+        peerId: state.peerId, err: err.message,
+      });
+      // A throwing send proves the channel is dead even though
+      // readyState still reads 'open' (Safari after sleep).  After a
+      // few consecutive throws, evict the peer so the mesh heals and
+      // the bridge's next peer-list rebuilds a fresh channel.
+      state.sendFailures = (state.sendFailures || 0) + 1;
+      if (state.sendFailures >= SEND_FAIL_LIMIT) {
+        this._teardown(state.peerId, 'send-failed');
+        return 'evicted';
       }
-    }, PING_INTERVAL_MS);
+      return 'fail';
+    }
   }
 
   _startStaleChecker(state) {
     if (state.staleTimer) clearInterval(state.staleTimer);
-    state.staleTimer = setInterval(() => {
-      if (state.state !== 'open' && state.state !== 'stale') return;
-      if (state.lastPongAt === 0) return;   // pre-first-pong
-      const since = Date.now() - state.lastPongAt;
-      if (since > STALE_PONG_MS && state.state !== 'stale') {
-        state.state = 'stale';
-        this._notify();
-      } else if (since <= STALE_PONG_MS && state.state === 'stale') {
-        state.state = 'open';
-        this._notify();
-      }
-    }, 500);
+    state.staleTimer = setInterval(() => this._staleCheckTick(state), 500);
+  }
+
+  /** One stale-checker evaluation.  Extracted from the interval so the
+   *  heartbeat-timeout eviction is unit-testable without waiting on a
+   *  real timer.  Returns 'evicted' | 'stale' | 'recovered' | 'none'. */
+  _staleCheckTick(state) {
+    if (state.state !== 'open' && state.state !== 'stale') return 'none';
+    if (state.lastPongAt === 0) return 'none';   // pre-first-pong
+    const since = Date.now() - state.lastPongAt;
+    if (since > DEAD_PONG_MS) {
+      // Heartbeat timeout: pongs stopped long enough that the channel
+      // is dead even if readyState lies 'open'.  Evict + fire
+      // onPeerLost (Transport-contract behaviour) so upper layers
+      // route around and the mesh rebuilds.  _teardown clears this
+      // very interval, so return immediately after.
+      this._teardown(state.peerId, 'pong-timeout');
+      return 'evicted';
+    }
+    if (since > STALE_PONG_MS && state.state !== 'stale') {
+      state.state = 'stale';
+      this._notify();
+      return 'stale';
+    } else if (since <= STALE_PONG_MS && state.state === 'stale') {
+      state.state = 'open';
+      this._notify();
+      return 'recovered';
+    }
+    return 'none';
   }
 
   _scheduleRetry(state) {

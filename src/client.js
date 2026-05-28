@@ -50,7 +50,7 @@ import { geoCellId }   from '../vendor/axona-protocol/src/utils/s2.js';
 // where the bfcache can serve a stale module set for ages).  The
 // bridge version arrives separately in its `welcome` message; the
 // "version" row in the me panel shows both side by side.
-const PEER_VERSION = '3.3.0';
+const PEER_VERSION = '3.4.0';
 
 // webTransport() now owns the bridge WebSocket lifecycle (ping cadence,
 // stale window, reconnect backoff, uptime), so those constants moved
@@ -538,7 +538,17 @@ let hiddenAt = 0;
 
 function resetMesh(reason) {
   appendLog('resume', reason, 'ok');
-  transport?.reconnectNow();
+  // Tear down every WebRTC peer outright: after a genuine resume (lid
+  // open, long tab-background) the channels are almost always dead, and
+  // mesh.reset() fires onPeerLost for each so the synaptome clears too.
+  // This restores the teardown the pre-v3.3.0 resume path did (the
+  // v3.3.0 rewrite dropped it).  The kernel's per-peer pong-timeout /
+  // send-failure eviction (mesh v2.1.1) is the backstop for the cases
+  // where these resume events don't fire at all — notably a macOS
+  // screensaver, where the tab never goes hidden and the network
+  // interface may not toggle.
+  try { transport?.mesh?.reset?.(); } catch { /* mesh may not exist yet */ }
+  transport?.reconnectNow();   // reconnect the bridge; fresh peer-list rebuilds the mesh
 }
 
 document.addEventListener('visibilitychange', () => {
