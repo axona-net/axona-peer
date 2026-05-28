@@ -47,7 +47,7 @@ import { encode, decode } from './wire.js';
 // where the bfcache can serve a stale module set for ages).  The
 // bridge version arrives separately in its `welcome` message; the
 // "version" row in the me panel shows both side by side.
-const PEER_VERSION = '3.0.0';
+const PEER_VERSION = '3.1.0';
 
 const BRIDGE_PING_INTERVAL_MS = 1000;
 const BRIDGE_STALE_PONG_MS    = 3000;
@@ -904,6 +904,30 @@ function fmtNodeId(id) {
   return id.toString(16).padStart(66, '0');
 }
 
+// Mesh-ready gate: wait until the synaptome holds at least a handful
+// of peers before treating "the mesh is wide enough to subscribe."
+// Mirrors the kernel demo's waitForMeshReady (READY_SYNAPSE_COUNT=4
+// is bridge + ~3 WebRTC peers).  Solo-tab runs that never find more
+// than the bridge fall through to subscribing after the timeout — UX
+// stays usable, the only risk is the stale-K-closest behaviour the
+// arming of _axonaManager.start() at sub time then papers over.
+const READY_SYNAPSE_COUNT = 4;
+const READY_TIMEOUT_MS    = 10_000;
+async function waitForMeshReady() {
+  const t0 = Date.now();
+  while (Date.now() - t0 < READY_TIMEOUT_MS) {
+    const size = axonaNode?.getSynaptome?.().length ?? 0;
+    if (size >= READY_SYNAPSE_COUNT) {
+      appendLog('mesh:ready', `synaptome=${size}`);
+      return size;
+    }
+    await new Promise(r => setTimeout(r, 200));
+  }
+  const size = axonaNode?.getSynaptome?.().length ?? 0;
+  appendLog('mesh:ready-timeout', `synaptome=${size} (proceeding anyway)`);
+  return size;
+}
+
 async function bootAxonaNode(opts = {}) {
   const identity = await deriveIdentity(opts);
   $axonaId.textContent     = fmtNodeId(identity.id);
@@ -995,9 +1019,9 @@ async function bootAxonaNode(opts = {}) {
      *  propagate.  If a subscriber we expected to deliver to ISN'T listed
      *  here, they never subscribed at us. */
     axonRoles:   () => {
-      const axon = axonaNode._axon;
-      if (!axon?.axonRoles) return [];
-      return [...axon.axonRoles.entries()].map(([topicId, role]) => ({
+      const am = axonaNode._peer?._axonaManager;
+      if (!am?.axonRoles) return [];
+      return [...am.axonRoles.entries()].map(([topicId, role]) => ({
         topic:    hex(topicId),
         isRoot:   role.isRoot,
         children: [...role.children.keys()].map(hex),
@@ -1007,9 +1031,9 @@ async function bootAxonaNode(opts = {}) {
     /** Topics we're subscribed to (from AxonaManager's POV, not just the
      *  UI's `subs()`).  Should match — if it doesn't, we have a sync bug. */
     mySubscriptions: () => {
-      const axon = axonaNode._axon;
-      if (!axon?.mySubscriptions) return [];
-      return [...axon.mySubscriptions.keys()].map(hex);
+      const am = axonaNode._peer?._axonaManager;
+      if (!am?.mySubscriptions) return [];
+      return [...am.mySubscriptions.keys()].map(hex);
     },
   };
 
@@ -1039,6 +1063,18 @@ async function bootAxonaNode(opts = {}) {
   renderPublishForms();
   $pubAdd.disabled = false;
   $subAdd.disabled = false;
+
+  // Wait for the mesh to stabilise before issuing any subscribes.
+  // Mirrors the kernel demo's pattern: subscribing while
+  // synaptome.size === 1 (just the bridge) anchors the subscription
+  // at a tiny K-closest set; when the mesh grows, publishes computed
+  // against the larger K-closest can miss the stale subscription —
+  // including the publisher's own self-subscription.  The kernel
+  // exposes findKClosest at the AxonaManager layer with a one-shot
+  // cache that's never invalidated, so the FIRST sub call locks the
+  // axon set forever.  Waiting until we know multiple peers makes
+  // that first cache populate with a wide, stable set.
+  await waitForMeshReady();
 
   const persisted = loadPersistedSubscriptions();
   for (const s of persisted) {
@@ -1257,6 +1293,23 @@ async function addSubscription(regionId, eventName) {
     }
     renderSubscriptions();
   }, { publisher, since: 'all' });
+
+  // Arm the kernel's AxonaManager periodic refresh timer.  This is
+  // exactly what the kernel's minimal-pubsub-browser demo does after
+  // peer.sub (see examples/minimal-pubsub-browser/index.html ~line
+  // 546).  By default AxonaPeer._buildDefaultAxonaManager() does NOT
+  // call am.start() — the assumption is that applications subscribe
+  // after the mesh has stabilised, so the initial K-closest set is
+  // already wide.  That's only true in static simulator runs, NOT in
+  // a browser mesh where WebRTC peers come and go on every page
+  // reload.  Without this arming, a subscription anchored at the
+  // initial K-closest set (just self + bridge at sub time) becomes
+  // stale as the mesh grows, and self-published messages routed
+  // through the same stale set silently drop on the publisher's own
+  // handler — the symptom users see as "publish to a topic I'm
+  // subscribed to, message reaches everyone else but not me."
+  // start() is idempotent; the timer won't double-arm.
+  axonaNode._peer?._axonaManager?.start?.();
 
   persistSubscriptions();
   renderSubscriptions();
