@@ -953,6 +953,20 @@ export class AxonaManager {
   async refreshTick() {
     const now = this._now();
 
+    // 0. Drop the K-closest cache so every re-subscribe / re-publish
+    //    below recomputes against the CURRENT synaptome.  The cache is
+    //    populated lazily on the first _findKClosest(topic) call and
+    //    keyed by an epoch that nothing else bumps — so without this,
+    //    a peer that first subscribed while its synaptome held only
+    //    the bridge stays pinned to that initial, narrow axon set
+    //    forever.  As the WebRTC mesh fills in, other peers compute a
+    //    wider (different) K-closest set and route publishes to axons
+    //    the stale subscriber never registered at — the message
+    //    reaches some peers but silently misses others.  Flushing here,
+    //    once per refresh interval (default 10 s), lets the re-subscribe
+    //    in step 5 re-anchor each subscription on the converged set.
+    this.invalidateKClosestCache();
+
     // 1. TTL sweep — drop stale children.
     for (const role of this.axonRoles.values()) {
       for (const [childId, entry] of role.children) {

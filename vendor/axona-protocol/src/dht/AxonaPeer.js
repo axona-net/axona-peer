@@ -266,6 +266,15 @@ export class AxonaPeer extends DHT {
             console.warn('AxonaPeer.onPeerBound: admission failed', err);
           }
         }
+        // The synaptome just changed — drop any cached K-closest set so
+        // the next pub/sub recomputes the topic's axon set against the
+        // newly-wider mesh.  Without this the relay set a peer chose
+        // while the mesh was sparse stays frozen, and publishes from
+        // peers that joined later route to axons this peer never
+        // registered at (the cross-app delivery asymmetry).  refreshTick
+        // also flushes on its 10 s cadence; this makes convergence
+        // immediate on each new binding.
+        this._axonaManager?.invalidateKClosestCache?.();
       });
     }
 
