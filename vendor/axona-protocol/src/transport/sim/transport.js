@@ -23,6 +23,9 @@
 import { AxonaError, TransportError, ErrorCodes } from '../../errors.js';
 import { toHex }                                  from '../../utils/hexid.js';
 import { Transport }                              from '../../contracts/Transport.js';
+import {
+  buildAuthHello, verifyAuthHello, makeNonce, cbvFromNonces,
+} from '../handshake-auth.js';
 
 const HEARTBEAT_MS      = 1000;
 const HEARTBEAT_TIMEOUT = 3000;
@@ -54,6 +57,15 @@ export class SimTransport extends Transport {
     heartbeatMs        = HEARTBEAT_MS,
     heartbeatTimeoutMs = HEARTBEAT_TIMEOUT,
     sendTimeoutMs      = SEND_TIMEOUT_MS,
+    // axona/4 — when true, openConnection runs the authenticated-
+    // identity handshake (pubkey + Ed25519 proof-of-possession over a
+    // per-link channel-binding value) and refuses peers that can't
+    // prove the nodeId they claim.  Opt-in so the existing synthetic-id
+    // test suite (which uses key-less BigInt ids) is unaffected; the
+    // simulator's production-shape runs (dht-sim, the auth smoke) turn
+    // it on so the lab exercises the same gate as the live network.
+    authenticate       = false,
+    onAuthReject       = null,
   } = {}) {
     super();
     if (!network) {
@@ -66,6 +78,8 @@ export class SimTransport extends Transport {
     this._heartbeatMs        = heartbeatMs;
     this._heartbeatTimeoutMs = heartbeatTimeoutMs;
     this._sendTimeoutMs      = sendTimeoutMs;
+    this._authenticate       = authenticate;
+    this._onAuthReject       = onAuthReject;
 
     /** @type {string|null} */
     this._localId = null;
@@ -152,6 +166,16 @@ export class SimTransport extends Transport {
     // Bilateral admission: ask target if it'll accept us.
     if (!target._acceptConnection(this._localId)) return false;
 
+    // axona/4 authenticated-identity gate.  Either endpoint can demand
+    // it; both must then prove the nodeId they claim, bound to this
+    // link.  A peer that registered under an id whose key it doesn't
+    // hold (impersonation / squatting) fails here and the channel is
+    // refused.
+    if (this._authenticate || target._authenticate) {
+      const ok = await this._mutualAuth(target, peerId);
+      if (!ok) return false;
+    }
+
     // Both sides record the channel.
     this._openTo.add(peerId);
     target._openTo.add(this._localId);
@@ -171,6 +195,55 @@ export class SimTransport extends Transport {
     if (!this._started) return;
     peerId = this._normPeerId(peerId);
     await this._closeChannel(peerId, /* notify */ true);
+  }
+
+  /**
+   * Run the mutual authenticated-identity handshake against `target`
+   * over a fresh per-link channel-binding value.  Returns true iff
+   * BOTH sides prove the nodeId they claim AND the proven id matches
+   * the id each side expected (self for the opener at the target,
+   * `peerId` for the target at the opener).
+   *
+   * In-process, so we drive both directions here rather than over a
+   * wire; the cryptographic check is identical to what the web / node
+   * transports do across a real channel.
+   *
+   * @param {SimTransport} target
+   * @param {string}       peerId  the id the opener believes target is
+   * @returns {Promise<boolean>}
+   */
+  async _mutualAuth(target, peerId) {
+    const reject = (reason) => {
+      try { this._onAuthReject?.({ peerId, reason }); } catch { /* swallow */ }
+      return false;
+    };
+    if (!this._identity?.sign || !target._identity?.sign) {
+      return reject('missing_identity');
+    }
+    // Fresh per-link CBV — both endpoints derive the same string.
+    const linkTag = [this._localId, peerId].sort().join('~');
+    const cbv = cbvFromNonces(makeNonce(), makeNonce(), linkTag);
+
+    let myHello, theirHello;
+    try {
+      myHello    = await buildAuthHello({ identity: this._identity,   cbv });
+      theirHello = await buildAuthHello({ identity: target._identity, cbv });
+    } catch (err) {
+      return reject('build_failed:' + (err?.message ?? 'unknown'));
+    }
+
+    // Target verifies the opener; opener verifies the target.
+    const atTarget = await verifyAuthHello(myHello,    { cbv });
+    const atOpener = await verifyAuthHello(theirHello, { cbv });
+
+    // Proof must succeed AND bind to the id each side expected.
+    if (!atTarget.ok || atTarget.nodeId !== this._localId) {
+      return reject('opener_auth_failed:' + (atTarget.reason ?? 'id_mismatch'));
+    }
+    if (!atOpener.ok || atOpener.nodeId !== peerId) {
+      return reject('target_auth_failed:' + (atOpener.reason ?? 'id_mismatch'));
+    }
+    return true;
   }
 
   isConnected(peerId) {

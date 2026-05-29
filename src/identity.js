@@ -240,6 +240,11 @@ export async function deriveIdentity(opts = {}) {
     pubkey:     kernel.pubkey,
     privateKey: kernel.privateKey,
     pubkeyHex:  kernel.pubkeyHex,
+    // axona/4: the authenticated handshake needs a signer.  webTransport's
+    // autoHandshake validates `identity.sign` (fn) + `identity.pubkeyHex`
+    // (64-hex) and signs the per-connection channel-binding transcript with
+    // it.  kernel.sign closes over privateKey via Web Crypto.
+    sign:       kernel.sign,
   };
 
   persist(identity);

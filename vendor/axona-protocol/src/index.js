@@ -183,3 +183,17 @@ export {
   S2_CELL_COUNT,
   S2_RESERVED_FROM,
 } from './utils/s2.js';
+
+// axona/4 authenticated-identity handshake.  Re-exported so consumers
+// that drive their own channel lifecycle (the bridge's embedded peer,
+// the node transport, custom transports) can build/verify authenticated
+// hellos with the same primitive the web transport uses.
+export {
+  buildAuthHello,
+  verifyAuthHello,
+  pubkeyMatchesNodeId,
+  makeNonce,
+  cbvFromNonces,
+  cbvFromFingerprints,
+  AUTH_PROTO,
+} from './transport/handshake-auth.js';
