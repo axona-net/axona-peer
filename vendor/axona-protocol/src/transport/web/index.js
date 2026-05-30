@@ -104,6 +104,10 @@ const RECONNECT_BACKOFF_MAX_MS     = 16000;
 const UPGRADE_CLOSE_CODE = 4426;
 /** Window of recent RTT samples kept for the average. */
 const RTT_WINDOW = 10;
+/** Symmetric domain-separation tag for the WebRTC-mesh axona/4 CBV.  Must
+ *  be a constant both endpoints share (see meshCbvFor for why a per-side
+ *  connId broke binding network-wide). */
+const MESH_CBV_TAG = 'mesh';
 
 export function webTransport({
   bridgeUrl,
@@ -597,9 +601,18 @@ export function webTransport({
     /** @type {Map<string, {myNonce:string, peerNonce?:string, peerNodeId?:string, peerPubkey?:string, pendingSig?:object, bound:boolean}>} */
     const meshAuth = new Map();
 
-    function meshCbvFor(st, meshId) {
+    function meshCbvFor(st, _meshId) {
       if (!st?.myNonce || !st?.peerNonce) return null;
-      return cbvFromNonces(st.myNonce, st.peerNonce, meshId);
+      // Domain-separation tag MUST be symmetric — both endpoints have to
+      // derive the identical CBV.  Do NOT use meshId here: meshId is each
+      // side's view of the *other* peer's bridge connId, which differs
+      // per side (A folds B's connId, B folds A's), so folding it in made
+      // the two CBVs disagree and EVERY mesh-auth signature failed — the
+      // WebRTC mesh never bound a single peer (all routing fell back to
+      // the bridge).  The fresh per-link nonce pair already makes the CBV
+      // unique to this connection; a constant tag only provides cross-
+      // transport separation (mesh vs 'bridge' vs 'ws' vs sim).
+      return cbvFromNonces(st.myNonce, st.peerNonce, MESH_CBV_TAG);
     }
 
     async function sendMeshHello(meshId, st) {
