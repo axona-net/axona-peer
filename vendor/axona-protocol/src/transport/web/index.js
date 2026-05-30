@@ -32,6 +32,7 @@
 // =====================================================================
 
 import { MeshManager }       from './mesh.js';
+import { MeshAuth }          from './mesh-auth.js';
 import { WebRTCTransport }   from './webrtc.js';
 import { BridgeTransport, BRIDGE_CONN_ID_EXPORT as BRIDGE_CONN_ID } from './bridge.js';
 import { CompositeTransport } from './composite.js';
@@ -39,7 +40,7 @@ import { isHexId, toHex, fromHex } from '../../utils/hexid.js';
 import { TransportError, ErrorCodes, UpgradeRequiredError } from '../../errors.js';
 import { KERNEL_VERSION }    from '../handshake.js';
 import {
-  buildAuthHello, verifyAuthHello, makeNonce, cbvFromNonces, AUTH_PROTO,
+  buildAuthHello, verifyAuthHello, cbvFromNonces, AUTH_PROTO,
 } from '../handshake-auth.js';
 
 export { MeshManager, WebRTCTransport, BridgeTransport, CompositeTransport };
@@ -104,10 +105,6 @@ const RECONNECT_BACKOFF_MAX_MS     = 16000;
 const UPGRADE_CLOSE_CODE = 4426;
 /** Window of recent RTT samples kept for the average. */
 const RTT_WINDOW = 10;
-/** Symmetric domain-separation tag for the WebRTC-mesh axona/4 CBV.  Must
- *  be a constant both endpoints share (see meshCbvFor for why a per-side
- *  connId broke binding network-wide). */
-const MESH_CBV_TAG = 'mesh';
 
 export function webTransport({
   bridgeUrl,
@@ -591,67 +588,17 @@ export function webTransport({
     });
 
     // ── Mesh (peer ↔ peer over WebRTC) ────────────────────────────
-    // Symmetric 3-message mutual-nonce handshake (each side: hello with
-    // a nonce, then hello-sig with the proof over CBV(both nonces)).
-    // A nonce pair is the portable channel-binding value; binding to the
-    // DTLS fingerprint (full MITM detection) is the tracked follow-up.
-    //
-    // Per-meshId auth state: our nonce, the peer's hello fields, and any
-    // hello-sig that arrived before we had the peer's nonce.
-    /** @type {Map<string, {myNonce:string, peerNonce?:string, peerNodeId?:string, peerPubkey?:string, pendingSig?:object, bound:boolean}>} */
-    const meshAuth = new Map();
-
-    function meshCbvFor(st, _meshId) {
-      if (!st?.myNonce || !st?.peerNonce) return null;
-      // Domain-separation tag MUST be symmetric — both endpoints have to
-      // derive the identical CBV.  Do NOT use meshId here: meshId is each
-      // side's view of the *other* peer's bridge connId, which differs
-      // per side (A folds B's connId, B folds A's), so folding it in made
-      // the two CBVs disagree and EVERY mesh-auth signature failed — the
-      // WebRTC mesh never bound a single peer (all routing fell back to
-      // the bridge).  The fresh per-link nonce pair already makes the CBV
-      // unique to this connection; a constant tag only provides cross-
-      // transport separation (mesh vs 'bridge' vs 'ws' vs sim).
-      return cbvFromNonces(st.myNonce, st.peerNonce, MESH_CBV_TAG);
-    }
-
-    async function sendMeshHello(meshId, st) {
-      try {
-        mesh.send(meshId, { k: 'ntf', type: 'hello', body: { proto: AUTH_PROTO, nonce: st.myNonce } });
-      } catch (err) { log('mesh-hello-send-failed', { meshId, err: err.message }); }
-    }
-
-    // Try to (a) send our proof once we know the peer's nonce, and
-    // (b) verify+bind once we have the peer's proof.  Idempotent.
-    async function meshMaybeProgress(meshId) {
-      const st = meshAuth.get(meshId);
-      if (!st || st.bound) return;
-      const cbv = meshCbvFor(st, meshId);
-      if (!cbv) return;                       // still missing a nonce
-
-      // (a) send our signed proof (once).
-      if (!st.sigSent) {
-        st.sigSent = true;
-        try {
-          const proof = await buildAuthHello({ identity, cbv });
-          mesh.send(meshId, { k: 'ntf', type: 'hello-sig', body: proof });
-        } catch (err) { log('mesh-sig-send-failed', { meshId, err: err.message }); }
-      }
-
-      // (b) if the peer's proof is in hand, verify + bind.
-      if (st.pendingSig) {
-        const res = await verifyAuthHello(st.pendingSig, { cbv });
-        if (!res.ok) { log('auth-mesh-rejected', { meshId, reason: res.reason }); return; }
-        if (st.peerNodeId && res.nodeId !== st.peerNodeId) {
-          log('auth-mesh-id-mismatch', { meshId }); return;
-        }
-        try {
-          webrtc.bindPeer(fromHex(res.nodeId), meshId);
-          st.bound = true;
-          log('auth-mesh-complete', { meshId, peer: res.nodeId });
-        } catch (err) { log('mesh-bind-failed', { meshId, err: err.message }); }
-      }
-    }
+    // Symmetric 3-message mutual-nonce handshake, owned by MeshAuth
+    // (mesh-auth.js) so the orchestration is unit-testable without real
+    // WebRTC.  A nonce pair is the portable channel-binding value;
+    // binding to the DTLS fingerprint (full MITM detection) is the
+    // tracked follow-up (security finding A-1).
+    const meshAuth = new MeshAuth({
+      identity,
+      send:     (meshId, frame)     => mesh.send(meshId, frame),
+      bindPeer: (nodeIdHex, meshId) => webrtc.bindPeer(fromHex(nodeIdHex), meshId),
+      log,
+    });
 
     if (typeof mesh.onChange === 'function') {
       mesh.onChange((peers) => {
@@ -659,43 +606,15 @@ export function webTransport({
         for (const p of list) {
           if (!p || p.state !== 'open') continue;
           const meshId = p.peerId ?? p.id;
-          if (typeof meshId !== 'string') continue;
-          if (meshAuth.has(meshId)) continue;
-          const st = { myNonce: makeNonce(), bound: false, sigSent: false };
-          meshAuth.set(meshId, st);
-          sendMeshHello(meshId, st);
+          if (typeof meshId === 'string') meshAuth.onChannelOpen(meshId);
         }
       });
     }
     if (typeof mesh.onPeerLost === 'function') {
-      mesh.onPeerLost((meshId) => meshAuth.delete(meshId));
+      mesh.onPeerLost((meshId) => meshAuth.onChannelLost(meshId));
     }
-
-    // Peer's hello: carries their nonce (no proof yet).  Record it; if
-    // we haven't announced our own nonce (their hello beat our onChange)
-    // do so now, then progress.
-    webrtc.onNotification('hello', async (fromConnId, body) => {
-      if (typeof fromConnId !== 'string') return;
-      const meshId = fromConnId;
-      if (!body || typeof body.nonce !== 'string') {
-        log('auth-mesh-bad-hello', { meshId }); return;
-      }
-      let st = meshAuth.get(meshId);
-      if (!st) { st = { myNonce: makeNonce(), bound: false, sigSent: false }; meshAuth.set(meshId, st); await sendMeshHello(meshId, st); }
-      st.peerNonce = body.nonce;
-      await meshMaybeProgress(meshId);
-    });
-
-    // Peer's proof: the authenticated hello {proto,nodeId,pubkey,sig}.
-    webrtc.onNotification('hello-sig', async (fromConnId, body) => {
-      if (typeof fromConnId !== 'string') return;
-      const meshId = fromConnId;
-      let st = meshAuth.get(meshId);
-      if (!st) { st = { myNonce: makeNonce(), bound: false, sigSent: false }; meshAuth.set(meshId, st); await sendMeshHello(meshId, st); }
-      st.pendingSig  = body;
-      st.peerNodeId  = (body && typeof body.nodeId === 'string') ? body.nodeId : st.peerNodeId;
-      await meshMaybeProgress(meshId);
-    });
+    webrtc.onNotification('hello',     (fromConnId, body) => meshAuth.onHello(fromConnId, body));
+    webrtc.onNotification('hello-sig', (fromConnId, body) => meshAuth.onHelloSig(fromConnId, body));
   }
 
   // Wire start() so calling composite.start() opens the socket and

@@ -99,6 +99,12 @@ header .subtitle {
   font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
   font-size: 12px;
 }
+/* Routing-truth warning: data channels open but unbound (no auth'd
+   routing).  Amber + bold so it can't be mistaken for a healthy count. */
+.me-value.mesh-degraded {
+  color: var(--orange);
+  font-weight: 600;
+}
 
 /* ── Share QR — floating launcher + modal overlay ──────────────── */
 

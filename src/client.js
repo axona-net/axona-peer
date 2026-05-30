@@ -50,7 +50,7 @@ import { geoCellId }   from '../vendor/axona-protocol/src/utils/s2.js';
 // where the bfcache can serve a stale module set for ages).  The
 // bridge version arrives separately in its `welcome` message; the
 // "version" row in the me panel shows both side by side.
-const PEER_VERSION = '3.7.0';
+const PEER_VERSION = '3.8.0';
 
 // webTransport() now owns the bridge WebSocket lifecycle (ping cadence,
 // stale window, reconnect backoff, uptime), so those constants moved
@@ -263,6 +263,10 @@ const INDICATOR_CLASS = {
 
 /** Cached row references — peerId → DOM nodes we update directly. */
 const rowElements = new Map();
+
+/** Tracks the last meshDegraded value so we log the transition once,
+ *  not on every render tick. */
+let _meshDegradedShown = false;
 
 function fmtUptime(openedAt) {
   if (!openedAt) return '—';
@@ -482,9 +486,33 @@ function render() {
     }
   }
 
-  // Header counts.
+  // Header counts.  Open data channels of known — PLUS the count that
+  // actually matters for routing: how many of those channels have
+  // completed the axona/4 handshake and bound into the synaptome.  The
+  // demo bug had every dot green while NOTHING was bound; surfacing the
+  // bound count here means the Peer UI can no longer hide that.
   const openPeers = peers.filter(p => p.state === 'open').length;
-  $meshCount.textContent = `${openPeers} of ${peers.length}`;
+  let boundLabel = '';
+  let degraded   = false;
+  try {
+    if (peer && typeof peer.health === 'function') {
+      const h  = peer.health();
+      const mb = h.transport?.meshBound;
+      if (typeof mb === 'number') boundLabel = ` · ${mb} bound`;
+      degraded = h.meshDegraded === true;
+    }
+  } catch { /* best-effort — never let diagnostics break render */ }
+  $meshCount.textContent = `${openPeers} of ${peers.length}${boundLabel}`;
+  $meshCount.classList.toggle('mesh-degraded', degraded);
+  $meshCount.title = degraded
+    ? 'Mesh degraded: data channels are open but the axona/4 handshake '
+      + 'has not bound them — no authenticated routing is flowing.'
+    : '';
+  if (degraded !== _meshDegradedShown) {
+    _meshDegradedShown = degraded;
+    if (degraded) appendLog('mesh:degraded', `${openPeers} open, only ${boundLabel.trim() || '0 bound'} — channels open but unbound`, 'warn');
+    else          appendLog('mesh:recovered', 'all open channels authenticated', 'info');
+  }
   $myId.textContent = bridgeWelcome?.connId ?? '—';
 }
 

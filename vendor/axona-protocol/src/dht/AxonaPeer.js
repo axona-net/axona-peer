@@ -1516,7 +1516,21 @@ export class AxonaPeer extends DHT {
    *     axonRoles:        Array<{topic, isRoot, children, cacheSize}>,
    *     wireVersion:      string | null,
    *     started:          boolean,
+   *     transport:        { boundCount, meshChannels, meshOpen,
+   *                         meshBound, bridgeState } | null,
+   *     meshDegraded:     boolean,
    *   }
+   *
+   * `transport` is populated only for transports that expose the web
+   * observability surface (boundPeers / .mesh / .webrtc); it is null
+   * for the sim/node transports.  `meshDegraded` is the routing-truth
+   * invariant: data channels are OPEN but the axona/4 handshake has not
+   * bound them into the synaptome — i.e. the mesh looks connected at the
+   * WebRTC layer while carrying no authenticated routing.  This is the
+   * exact condition the v2.4.0 demo bug hid behind a healthy-looking dot
+   * grid.  A single true tick can be a normal mid-handshake transient;
+   * consumers should treat a value that stays true across several polls
+   * as the real signal.
    *
    * Heavy implementations (per-replay-cache byte sizes, traffic
    * counters) can be added later.  This is intentionally cheap so
@@ -1542,6 +1556,45 @@ export class AxonaPeer extends DHT {
         }
       } catch { /* best-effort */ }
     }
+    // ── transport / routing-truth observability ──────────────────────
+    // Web transport exposes boundPeers() (authenticated nodeIds), .mesh
+    // (DC-level peer snapshot), and .webrtc (mesh-only bind set).  Sim
+    // and node transports lack these — `transport` stays null for them.
+    let transport = null;
+    let meshDegraded = false;
+    const t = this._transport;
+    if (t) {
+      let boundCount = null, meshChannels = null, meshOpen = null, meshBound = null;
+      try {
+        if (typeof t.boundPeers === 'function') boundCount = t.boundPeers().length;
+      } catch { /* best-effort */ }
+      try {
+        if (t.mesh && typeof t.mesh.getPeers === 'function') {
+          const mp = t.mesh.getPeers();
+          meshChannels = mp.length;
+          meshOpen     = mp.filter(p => p && p.state === 'open').length;
+        }
+      } catch { /* best-effort */ }
+      try {
+        if (t.webrtc && typeof t.webrtc.boundPeers === 'function') {
+          meshBound = t.webrtc.boundPeers().length;
+        }
+      } catch { /* best-effort */ }
+      if (meshChannels !== null || boundCount !== null) {
+        transport = {
+          boundCount, meshChannels, meshOpen, meshBound,
+          bridgeState: t.bridgeState ?? null,
+        };
+        // Open data channels with materially fewer authenticated binds
+        // ⇒ routing is not flowing despite a connected-looking mesh.
+        // Require a gap of ≥2 so a single in-flight handshake doesn't
+        // trip the flag.
+        if (meshOpen !== null && meshBound !== null) {
+          meshDegraded = meshOpen >= 2 && (meshOpen - meshBound) >= 2;
+        }
+      }
+    }
+
     return {
       nodeId:        this._nodeIdHex(),
       synaptomeSize: this._node?.synaptome?.size ?? 0,
@@ -1550,6 +1603,8 @@ export class AxonaPeer extends DHT {
       axonRoles,
       wireVersion:   this._transport?.wireVersion ?? null,
       started:       this._started === true,
+      transport,
+      meshDegraded,
     };
   }
 
