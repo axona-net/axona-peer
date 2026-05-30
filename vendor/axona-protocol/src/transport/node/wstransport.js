@@ -26,9 +26,22 @@
 import { Transport }                from '../../contracts/Transport.js';
 import { isHexId }                  from '../../utils/hexid.js';
 import { TransportError, ErrorCodes } from '../../errors.js';
+import {
+  buildAuthHello, verifyAuthHello, makeNonce, cbvFromNonces, AUTH_PROTO,
+} from '../handshake-auth.js';
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 5000;
 const MAX_REQ_ID                 = 0x7fffffff;
+
+// axona/4 — reserved notification types for the authenticated-identity
+// handshake.  Namespaced so they can't collide with an application's own
+// notification vocabulary.
+const AUTH_HELLO_TYPE = '__axona_auth_hello';   // { proto, nonce }
+const AUTH_SIG_TYPE   = '__axona_auth_sig';     // a buildAuthHello frame
+// Both endpoints fold the same constant into the CBV; the two per-side
+// nonces (sorted by cbvFromNonces) make it unique to this live link.
+const WS_CBV_TAG             = 'ws';
+const CLOSE_UPGRADE_REQUIRED = 4426;
 
 export class WebSocketTransport extends Transport {
   /**
@@ -45,6 +58,19 @@ export class WebSocketTransport extends Transport {
     isConnOpen,
     log = () => {},
     requestTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
+    // axona/4 — when true, a connection must complete the mutual
+    // authenticated-identity handshake (beginAuth) before the transport
+    // binds the peer; the peer is bound to the nodeId it *proves*, not
+    // one it asserts.  Opt-in so the existing orchestrator-driven binding
+    // (bindPeer called externally, e.g. by axona-bridge) is unaffected.
+    authenticate = false,
+    identity     = null,
+    // Hook to tear down a connection that fails the gate.  The
+    // orchestrator owns the socket, so it maps (connId, code, reason) to
+    // ws.close(code, reason).  4426 = Upgrade Required.
+    closeConn    = null,
+    onAuthReject = null,
+    onAuthBound  = null,
   } = {}) {
     super();
     if (typeof sendToConn !== 'function' || typeof isConnOpen !== 'function') {
@@ -53,12 +79,28 @@ export class WebSocketTransport extends Transport {
     if (localNodeId !== null && !isHexId(localNodeId)) {
       throw new TypeError(`WebSocketTransport: localNodeId must be 66-char hex, got ${typeof localNodeId}`);
     }
+    if (authenticate) {
+      if (!identity || typeof identity.id !== 'string'
+          || typeof identity.pubkeyHex !== 'string' || identity.pubkeyHex.length !== 64
+          || typeof identity.sign !== 'function') {
+        throw new TypeError('WebSocketTransport: authenticate mode requires identity with '
+          + '{id, pubkeyHex (64-hex), sign()}');
+      }
+    }
 
     this._localNodeId      = localNodeId;
     this._sendToConn       = sendToConn;
     this._isConnOpen       = isConnOpen;
     this._log              = log;
     this._requestTimeoutMs = requestTimeoutMs;
+    this._authenticate     = authenticate;
+    this._identity         = identity;
+    this._closeConn        = closeConn;
+    this._onAuthReject     = onAuthReject;
+    this._onAuthBound      = onAuthBound;
+
+    /** @type {Map<string, {myNonce, peerNonce, pendingSig, sigSent, bound, verifying, expectNodeId}>} */
+    this._authByConn = new Map();
 
     /** @type {Map<string, (fromId: string|null, payload: any) => Promise<any>>} */
     this._reqHandlers = new Map();
@@ -125,6 +167,131 @@ export class WebSocketTransport extends Transport {
 
   connIdFor(nodeId) { return this._connIdByNodeId.get(nodeId) ?? null; }
   nodeIdFor(connId) { return this._nodeIdByConnId.get(connId) ?? null; }
+
+  // ─── axona/4 authenticated-identity handshake ─────────────────────
+  //
+  // Symmetric, three-message, mutual: each side mints a nonce and sends
+  // an auth-hello; once both nonces are known each side derives the same
+  // per-link CBV (cbvFromNonces is order-independent), signs a transcript
+  // over it, and sends an auth-sig; each side verifies the peer's sig and
+  // binds the peer to the nodeId the signature *proves*.  Either side can
+  // start (beginAuth); the other lazily joins on first auth-hello.
+
+  /**
+   * Kick off (or resume) the authenticated handshake on a connection.
+   * Idempotent — safe to call from both the connection-open hook and the
+   * inbound auth-hello path.  Requires authenticate mode.
+   *
+   * @param {string} connId
+   * @param {object} [opts]
+   * @param {string|null} [opts.expectNodeId]  If set, the peer's proven
+   *        nodeId must equal this or the connection is rejected (used by
+   *        a client that already knows which server it dialed).
+   */
+  beginAuth(connId, { expectNodeId = null } = {}) {
+    if (!this._authenticate) {
+      throw new TransportError(ErrorCodes.TRANSPORT_NOT_STARTED,
+        'WebSocketTransport.beginAuth: transport not in authenticate mode');
+    }
+    if (typeof connId !== 'string') {
+      throw new TypeError('beginAuth: connId must be a string');
+    }
+    let st = this._authByConn.get(connId);
+    if (!st) {
+      st = { myNonce: null, peerNonce: null, pendingSig: null,
+             sigSent: false, bound: false, verifying: false, expectNodeId };
+      this._authByConn.set(connId, st);
+    } else if (expectNodeId != null) {
+      st.expectNodeId = expectNodeId;
+    }
+    if (!st.myNonce) {
+      st.myNonce = makeNonce();
+      try {
+        this._sendToConn(connId, { type: 'axona', payload: {
+          k: 'ntf', type: AUTH_HELLO_TYPE, body: { proto: AUTH_PROTO, nonce: st.myNonce },
+        } });
+      } catch (err) {
+        this._authReject(connId, 'hello_send_failed:' + (err?.message ?? 'unknown'));
+      }
+    }
+  }
+
+  /** Has this connection completed the authenticated handshake? */
+  isAuthenticated(connId) {
+    return this._authByConn.get(connId)?.bound === true;
+  }
+
+  _authReject(connId, reason) {
+    const st = this._authByConn.get(connId);
+    const expectNodeId = st?.expectNodeId ?? null;
+    this._authByConn.delete(connId);
+    this._log('auth-reject', { connId, reason });
+    try { this._onAuthReject?.({ connId, reason, expectNodeId }); } catch { /* swallow */ }
+    try {
+      this._closeConn?.(connId, CLOSE_UPGRADE_REQUIRED,
+        `upgrade required: this network speaks ${AUTH_PROTO} (${reason})`);
+    } catch { /* swallow */ }
+  }
+
+  _authOnHello(connId, body) {
+    if (!body || body.proto !== AUTH_PROTO || typeof body.nonce !== 'string') {
+      this._authReject(connId, 'bad_auth_hello');
+      return;
+    }
+    // Lazily join the handshake if the peer started first.
+    this.beginAuth(connId);
+    const st = this._authByConn.get(connId);
+    if (!st) return;                    // rejected during beginAuth
+    st.peerNonce = body.nonce;
+    void this._authMaybeProgress(connId);
+  }
+
+  _authOnSig(connId, body) {
+    // The peer can't sign until it has our nonce, so we've already begun;
+    // but tolerate races by ensuring state exists.
+    this.beginAuth(connId);
+    const st = this._authByConn.get(connId);
+    if (!st) return;
+    st.pendingSig = body;
+    void this._authMaybeProgress(connId);
+  }
+
+  async _authMaybeProgress(connId) {
+    const st = this._authByConn.get(connId);
+    if (!st || st.bound) return;
+    if (!st.myNonce || !st.peerNonce) return;     // need both nonces for the CBV
+    const cbv = cbvFromNonces(st.myNonce, st.peerNonce, WS_CBV_TAG);
+
+    // Send our signature once the CBV is computable.
+    if (!st.sigSent) {
+      st.sigSent = true;
+      let hello;
+      try { hello = await buildAuthHello({ identity: this._identity, cbv }); }
+      catch (err) { this._authReject(connId, 'build_failed:' + (err?.message ?? 'unknown')); return; }
+      if (!this._authByConn.has(connId)) return;   // rejected while awaiting
+      try {
+        this._sendToConn(connId, { type: 'axona', payload: {
+          k: 'ntf', type: AUTH_SIG_TYPE, body: hello,
+        } });
+      } catch (err) { this._authReject(connId, 'sig_send_failed:' + (err?.message ?? 'unknown')); return; }
+    }
+
+    // Verify the peer's signature once we have it.
+    if (st.pendingSig && !st.bound && !st.verifying) {
+      st.verifying = true;
+      const res = await verifyAuthHello(st.pendingSig, { cbv });
+      if (!this._authByConn.has(connId)) return;   // rejected while awaiting
+      if (!res.ok) { this._authReject(connId, 'peer_' + (res.reason ?? 'auth_failed')); return; }
+      if (st.expectNodeId != null && res.nodeId !== st.expectNodeId) {
+        this._authReject(connId, 'id_mismatch'); return;
+      }
+      st.bound = true;
+      this.bindPeer(res.nodeId, connId);
+      this._log('auth-bound', { connId, nodeId: res.nodeId });
+      try { this._onAuthBound?.({ connId, nodeId: res.nodeId, pubkey: res.pubkey }); }
+      catch { /* swallow */ }
+    }
+  }
 
   // ─── Channel pool ─────────────────────────────────────────────────
 
@@ -293,6 +460,16 @@ export class WebSocketTransport extends Transport {
   }
 
   _handleNotification(connId, fromNodeId, msg) {
+    // axona/4 control frames are handled internally and never surface to
+    // application notification handlers.
+    if (this._authenticate && msg.type === AUTH_HELLO_TYPE) {
+      this._authOnHello(connId, msg.body);
+      return;
+    }
+    if (this._authenticate && msg.type === AUTH_SIG_TYPE) {
+      this._authOnSig(connId, msg.body);
+      return;
+    }
     const handler = this._ntfHandlers.get(msg.type);
     if (!handler) return;
     try {
@@ -324,6 +501,7 @@ export class WebSocketTransport extends Transport {
       p.reject(new TransportError(ErrorCodes.TRANSPORT_PEER_UNREACHABLE,
         `peer ${nodeId} died`, { context: { nodeId } }));
     }
+    this._authByConn.delete(connId);
     this.unbindPeer(connId);
   }
 }

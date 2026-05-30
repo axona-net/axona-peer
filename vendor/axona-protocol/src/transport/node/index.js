@@ -58,6 +58,14 @@ export function serverTransport({
   isConnOpen,
   log = () => {},
   requestTimeoutMs,
+  // axona/4 — opt-in mutual authentication.  When true, every inbound
+  // connection must complete the handshake before it is bound; identity
+  // needs {id, pubkeyHex, sign}.  `closeConn(connId, code, reason)` lets
+  // the transport reject a legacy/forged peer (4426 Upgrade Required).
+  authenticate = false,
+  closeConn    = null,
+  onAuthReject = null,
+  onAuthBound  = null,
 } = {}) {
   if (!identity || !isHexId(identity.id)) {
     throw new TransportError(ErrorCodes.TRANSPORT_NOT_STARTED,
@@ -70,11 +78,18 @@ export function serverTransport({
     isConnOpen,
     log,
     requestTimeoutMs,
+    authenticate,
+    identity,
+    closeConn,
+    onAuthReject,
+    onAuthBound,
   });
 
   const attach = {
     added(connId) {
       log('ws-added', { connId });
+      // Open the authenticated handshake as soon as the socket is up.
+      if (authenticate) transport.beginAuth(connId);
     },
     message(connId, frame) {
       if (!frame || typeof frame !== 'object') return;
@@ -109,6 +124,13 @@ export function clientTransport({
   WebSocketImpl,
   log = () => {},
   requestTimeoutMs,
+  // axona/4 — opt-in mutual authentication against the server peer.
+  // `expectServerNodeId`, when set, asserts the server proved that exact
+  // nodeId (defends against a hostile relay swapping the far end).
+  authenticate       = false,
+  expectServerNodeId = null,
+  onAuthReject       = null,
+  onAuthBound        = null,
 } = {}) {
   if (!identity || !isHexId(identity.id)) {
     throw new TransportError(ErrorCodes.TRANSPORT_NOT_STARTED,
@@ -143,6 +165,12 @@ export function clientTransport({
   function isConnOpen(connId) {
     return connId === FIXED_CONN_ID && socketOpen;
   }
+  // On auth failure, close the single outbound socket with the code.
+  function closeConn(connId, code, reason) {
+    if (connId !== FIXED_CONN_ID || !socket) return;
+    try { socket.close(code, reason); }
+    catch { try { socket.close(); } catch { /* ignore */ } }
+  }
 
   const transport = new WebSocketTransport({
     localNodeId: identity.id,
@@ -150,6 +178,11 @@ export function clientTransport({
     isConnOpen,
     log,
     requestTimeoutMs,
+    authenticate,
+    identity,
+    closeConn:    authenticate ? closeConn : null,
+    onAuthReject,
+    onAuthBound,
   });
 
   // Override start/stop to manage the socket lifecycle.
@@ -189,6 +222,11 @@ export function clientTransport({
       });
     }
     await origStart(identity.id);
+    // Once the socket is up, open the authenticated handshake against
+    // the server peer.
+    if (authenticate) {
+      transport.beginAuth(FIXED_CONN_ID, { expectNodeId: expectServerNodeId });
+    }
   };
   const origStop = transport.stop.bind(transport);
   transport.stop = async () => {

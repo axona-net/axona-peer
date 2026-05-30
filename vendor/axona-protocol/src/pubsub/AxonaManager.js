@@ -124,6 +124,16 @@ export class AxonaManager {
     this._seenPublishCap = 4096;
     this._seenPublishTtlMs = 60_000;
 
+    // Exactly-once gate for delivery to the LOCAL application callback.
+    // Deliberately SEPARATE from `_seenPublishes`: that set means "this
+    // node has processed/relayed this publish in some role" and is marked
+    // even when the local app has never subscribed (lazy-axon relay).
+    // App delivery needs its own idempotency so self-replay on subscribe
+    // delivers genuine backlog exactly once without re-delivering it on
+    // every periodic resubscribe.  publishId(string) -> insertedAt (ms).
+    this._appDelivered    = new Map();
+    this._appDeliveredCap = 8192;
+
     // Per-AxonaManager findKClosest cache.  Keyed by a string computed
     // from the BigInt topicId — see _findKClosest for the format.
     this._kClosestCache = new Map();     // `${topicHex}_${K}` -> { epoch, value: bigint[] }
@@ -629,7 +639,7 @@ export class AxonaManager {
     const deadChildren = [];
     for (const [childId] of role.children) {
       if (childId === this.nodeId) {
-        if (this._deliveryCallback) this._deliveryCallback(topicId, json, publishId, publishTs);
+        this._deliverToApp(topicId, json, publishId, publishTs);
         if (postHash) this._bumpDelivery(topicId, postHash);
         continue;
       }
@@ -686,6 +696,34 @@ export class AxonaManager {
     return false;
   }
 
+  /**
+   * Deliver a publish to the local application callback EXACTLY ONCE.
+   * The single funnel for every delivery path (live deliver, self-as-child
+   * publish, routed publish, replay-batch, and self-replay-on-subscribe) so
+   * a publishId reaches the app at most once regardless of how many roles /
+   * resubscribes route it here.  Bounded LRU, same shape as _seenPublishes.
+   */
+  _deliverToApp(topicId, json, publishId, publishTs) {
+    if (!this._deliveryCallback) return;
+    if (publishId) {
+      if (this._appDelivered.has(publishId)) return;     // already delivered locally
+      this._appDelivered.set(publishId, this._now());
+      if (this._appDelivered.size > this._appDeliveredCap) {
+        const toDrop = this._appDeliveredCap / 2;
+        let i = 0;
+        for (const k of this._appDelivered.keys()) {
+          if (i++ >= toDrop) break;
+          this._appDelivered.delete(k);
+        }
+      }
+    }
+    try {
+      this._deliveryCallback(topicId, json, publishId, publishTs);
+    } catch (err) {
+      console.error('AxonaManager deliveryCallback threw:', err);
+    }
+  }
+
   async _onDeliver(payload, meta) {
     const topicId   = _wire(payload.topicId);
     const publisher = _wire(payload.publisher);
@@ -715,7 +753,7 @@ export class AxonaManager {
       }
     }
 
-    if (this._deliveryCallback) this._deliveryCallback(topicId, json, publishId, publishTs);
+    this._deliverToApp(topicId, json, publishId, publishTs);
   }
 
   async _onPromoteAxon(payload, meta) {
@@ -809,6 +847,16 @@ export class AxonaManager {
   async _onSubscribeDirect(payload, meta) {
     const topicId      = _wire(payload.topicId);
     const subscriberId = _wire(payload.subscriberId);
+    // C4 (reflection/amplification DRDoS): a direct subscribe registers
+    // `subscriberId` as a child this node will relay the topic's full feed
+    // to — sent directly, by nodeId.  If we trusted the payload we'd be an
+    // amplifier: an attacker names a victim and we fire the feed at them.
+    // axona/4 makes `meta.fromId` the *proven* channel peer, so require the
+    // subscriber to be the authenticated sender.  (Sub-axon delegation uses
+    // separate adopt/promote messages — never subscribe-k — so this is a
+    // strict equality with no legitimate exception on this path.)
+    const fromId = meta?.fromId == null ? null : _wire(meta.fromId);
+    if (fromId !== null && subscriberId !== fromId) return;   // spoofed → drop
     const peerRootsHex = payload.peerRoots;
     const { lastSeenTs } = payload;
     const peerRoots = Array.isArray(peerRootsHex)
@@ -850,16 +898,20 @@ export class AxonaManager {
     const cache = role.replayCache;
     if (!cache || cache.length === 0) return;
 
-    // Self-replay special case — see original comment for the
-    // two-issue rationale (lazy-axon promotion + lastSeenTs masking).
+    // Self-replay special case — a node that is both a root/axon AND a
+    // subscriber to this topic.  Delivers cached publishes to the LOCAL
+    // app callback (lazy-axon promotion + lastSeenTs masking rationale).
+    //
+    // This MUST dedup like every other delivery path: refreshTick
+    // re-issues subscribe-k to the K roots — including self — every
+    // refresh interval, so without the _alreadySeenPublish gate this
+    // branch re-fired the entire replay cache to the app every ~10 s
+    // (the "earlier messages keep reappearing" bug).  Gating here makes
+    // it idempotent: genuine backlog is delivered exactly once, and a
+    // periodic self-resubscribe replays nothing already seen.
     if (subscriberId === this.nodeId) {
-      if (!this._deliveryCallback) return;
       for (const m of cache) {
-        try {
-          this._deliveryCallback(topicId, m.json, m.publishId, m.publishTs);
-        } catch (err) {
-          console.error('AxonaManager self-replay deliveryCallback threw:', err);
-        }
+        this._deliverToApp(topicId, m.json, m.publishId, m.publishTs);
       }
       return;
     }
@@ -884,13 +936,18 @@ export class AxonaManager {
       this._recordReceived(topicId, publishId, publishTs);
       const role = this.axonRoles.get(topicId);
       if (role) this._addToReplayCache(role, { json, publishId, publishTs });
-      if (this._deliveryCallback) this._deliveryCallback(topicId, json, publishId, publishTs);
+      this._deliverToApp(topicId, json, publishId, publishTs);
     }
   }
 
   _onUnsubscribeDirect(payload, meta) {
     const topicId      = _wire(payload.topicId);
     const subscriberId = _wire(payload.subscriberId);
+    // C4 (companion): only the authenticated subscriber may remove its own
+    // subscription — otherwise an attacker could unsubscribe a victim
+    // (griefing).  Same proven-fromId equality as the subscribe path.
+    const fromId = meta?.fromId == null ? null : _wire(meta.fromId);
+    if (fromId !== null && subscriberId !== fromId) return;   // spoofed → drop
     const role = this.axonRoles.get(topicId);
     if (role && role.children.has(subscriberId)) {
       role.children.delete(subscriberId);
@@ -931,7 +988,7 @@ export class AxonaManager {
     const deadChildren = [];
     for (const [childId] of role.children) {
       if (childId === this.nodeId) {
-        if (this._deliveryCallback) this._deliveryCallback(topicId, json, publishId, publishTs);
+        this._deliverToApp(topicId, json, publishId, publishTs);
         if (postHash) this._bumpDelivery(topicId, postHash);
         continue;
       }

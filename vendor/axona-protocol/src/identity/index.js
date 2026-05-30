@@ -62,10 +62,16 @@ const ALGORITHM = { name: 'Ed25519' };
  * Create a fresh identity: generate a new Ed25519 keypair and derive
  * the 264-bit nodeId from the public key + region.
  *
- * @param {{lat: number, lng: number}} region
+ * @param {object} opts
+ * @param {number} opts.lat
+ * @param {number} opts.lng
+ * @param {boolean} [opts.extractable=true]  Whether the private key may be
+ *        exported.  Defaults to `true` because `dumpIdentity` (persistence)
+ *        needs it.  An ephemeral / browser identity that is never persisted
+ *        should pass `false` so XSS can't exfiltrate the signing key (H4).
  * @returns {Promise<Identity>}
  */
-export async function deriveIdentity({ lat, lng }) {
+export async function deriveIdentity({ lat, lng, extractable = true }) {
   if (typeof lat !== 'number' || typeof lng !== 'number') {
     throw new IdentityError(ErrorCodes.IDENTITY_INVALID_FORMAT,
       'deriveIdentity: region must be { lat: number, lng: number }');
@@ -73,7 +79,7 @@ export async function deriveIdentity({ lat, lng }) {
 
   let pair;
   try {
-    pair = await generateKeyPair();
+    pair = await generateKeyPair({ extractable });
   } catch (cause) {
     throw new IdentityError(ErrorCodes.IDENTITY_KEYGEN_FAILED,
       `deriveIdentity: Web Crypto Ed25519 generateKey failed (${cause.message})`,
@@ -171,6 +177,26 @@ export async function loadIdentity(envelope) {
   if (expected !== id) {
     throw new IdentityError(ErrorCodes.IDENTITY_INVALID_FORMAT,
       `loadIdentity: stored id ${id} does not match derived id ${expected}`);
+  }
+
+  // M5: verify the private key actually corresponds to the public key.
+  // The nodeId check above only proves pubkey↔region↔id consistency; a
+  // corrupted or mismatched `privkey` blob would otherwise load cleanly
+  // and then silently produce signatures that no one can verify.  A
+  // sign→verify round-trip over a fixed probe catches it at load time.
+  try {
+    const probe = new TextEncoder().encode('axona-identity-keypair-probe');
+    const probeSig = await sign(privateKey, probe);
+    const matches  = await verify(pubkeyBytes, probe, probeSig);
+    if (!matches) {
+      throw new IdentityError(ErrorCodes.IDENTITY_INVALID_FORMAT,
+        'loadIdentity: private key does not correspond to the stored public key');
+    }
+  } catch (cause) {
+    if (cause instanceof IdentityError) throw cause;
+    throw new IdentityError(ErrorCodes.IDENTITY_LOAD_FAILED,
+      `loadIdentity: private/public key correspondence check failed (${cause.message})`,
+      { cause });
   }
 
   return buildIdentity({

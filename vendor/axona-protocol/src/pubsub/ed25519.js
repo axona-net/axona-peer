@@ -22,21 +22,34 @@ const ALGORITHM = { name: 'Ed25519' };
 /**
  * Generate a fresh Ed25519 keypair.  Returns CryptoKey handles.
  *
- * Use {@link exportPublicKey} when you need the raw 32-byte public
- * key to embed as a peer identifier or share over the wire.  The
- * private key stays as a non-extractable CryptoKey so it can't leak
- * through JSON.stringify, error logging, etc.
+ * Security (finding H4): the private key can be made **non-extractable**
+ * so it cannot be exported (exfiltrated) by later XSS or a malicious
+ * dependency in the same context.  Web Crypto's `generateKey` sets
+ * extractability for *both* halves at once, and the public key must be
+ * extractable (we export it to raw bytes for the nodeId / wire), so when
+ * `extractable: false` we generate extractable, export the public half,
+ * then re-import the private half as non-extractable — leaving a private
+ * key handle that signs but never exports.
  *
+ * `extractable` defaults to `true` for backward compatibility: callers
+ * that persist the identity (`dumpIdentity` → PKCS#8) require it.  An
+ * ephemeral / browser identity that is never persisted should pass
+ * `{ extractable: false }` — the genuinely XSS-exposed surface.
+ *
+ * @param {object} [opts]
+ * @param {boolean} [opts.extractable=true]  Whether the PRIVATE key may
+ *        be exported.  The public key is always extractable.
  * @returns {Promise<{publicKey: CryptoKey, privateKey: CryptoKey}>}
  */
-export async function generateKeyPair() {
-  // `extractable: false` for the private key — locks it inside the
-  // browser's crypto subsystem.  Public key is extractable for sharing.
-  // (Web Crypto Ed25519 currently requires both halves of the pair to
-  // be generated together; we set false on the keypair and re-export
-  // only the public half.)
+export async function generateKeyPair({ extractable = true } = {}) {
   const pair = await crypto.subtle.generateKey(ALGORITHM, true, ['sign', 'verify']);
-  return pair;
+  if (extractable) return pair;
+
+  // Re-import the private key as non-extractable.  The public key keeps
+  // its extractable handle so exportPublicKey() still works.
+  const pkcs8 = await crypto.subtle.exportKey('pkcs8', pair.privateKey);
+  const privateKey = await crypto.subtle.importKey('pkcs8', pkcs8, ALGORITHM, false, ['sign']);
+  return { publicKey: pair.publicKey, privateKey };
 }
 
 /**

@@ -216,7 +216,14 @@ export async function deriveIdentity(opts = {}) {
   }
 
   const region = await resolveRegion(regionOpts);
-  const kernel = await kernelDeriveIdentity({ lat: region.lat, lng: region.lng });
+  // H4: the browser is the XSS-exposed surface, and this peer re-derives a
+  // fresh keypair every session (it never persists the private key via
+  // dumpIdentity), so make the signing key non-extractable — XSS or a
+  // malicious dependency can sign while the session lives but can never
+  // export/exfiltrate the key.
+  const kernel = await kernelDeriveIdentity({
+    lat: region.lat, lng: region.lng, extractable: false,
+  });
 
   // v1.1: full-width 264-bit node ID.  Previously this took the top
   // 64 bits of the kernel hex; peer addresses then lived in a 64-bit

@@ -278,12 +278,20 @@ export async function verifyTopicOwnership(post) {
 }
 
 /**
- * Verify an Ed25519 signature on a SignedPost.  Optional — if the
- * post's signature has the legacy `stub:` prefix, this is a no-op
- * pass-through that returns `true` (preserves the simulator's
- * unsigned mode).  For real signatures (`ed25519:<hex>`), call the
- * provided `verifier` with (publisherKeyBytes, canonicalBytes,
- * signatureBytes) — return true/false.
+ * Verify an Ed25519 signature on a SignedPost.  Answers exactly one
+ * question: "is this post's signature cryptographically valid?"
+ *
+ * An unsigned post (legacy `stub:` prefix) carries NO proof of origin,
+ * so it returns `false` — never `true`.  (Returning `true` here was a
+ * forgery hole: a `stub:<any-publisher>` placeholder would pass as
+ * authentic.  Security finding M4.)  Callers that legitimately accept
+ * unsigned posts in a trusted/sim context must check
+ * `post.signature.startsWith('stub:')` themselves and decide — this
+ * function does not conflate "unsigned" with "valid".
+ *
+ * For real signatures (`ed25519:<hex>`), call the provided `verifier`
+ * with (publisherKeyBytes, canonicalBytes, signatureBytes) — return
+ * true/false.
  *
  * The verifier function is the caller's responsibility because Ed25519
  * support differs between Web Crypto (Chrome 110+, Safari 17+,
@@ -299,7 +307,7 @@ export async function verifyTopicOwnership(post) {
  */
 export async function verifySignature(post, verifier, publisherKey) {
   if (!post?.signature || typeof post.signature !== 'string') return false;
-  if (post.signature.startsWith('stub:')) return true;   // simulator mode
+  if (post.signature.startsWith('stub:')) return false;  // unsigned ⇒ not authenticated (M4)
   if (!post.signature.startsWith('ed25519:')) return false;
   if (typeof verifier !== 'function') return false;
 
