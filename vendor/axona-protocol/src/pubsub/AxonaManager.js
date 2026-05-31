@@ -39,6 +39,7 @@
  */
 
 import { toHex, fromHex, isHexId } from '../utils/hexid.js';
+import { verifyEnvelope }          from './envelope.js';
 
 // ── Defaults (simulator-tuned; production would use much longer values) ────
 
@@ -49,6 +50,16 @@ const DEFAULT_MAX_SUBSCRIPTION_AGE_MS = 30_000;      // §5.7 — 3× refresh
 const DEFAULT_ROOT_GRACE_MS          = 60_000;       // §5.7 — 6× refresh
 const DEFAULT_ROOT_SET_SIZE          = 5;            // K in K-closest replication
 const DEFAULT_REPLAY_CACHE_SIZE      = 100;          // per-role bounded ring (§7.8 replay)
+
+// ── Inbound caps (D-1: bound attacker-controlled payloads) ─────────────────
+// A peer must not be able to make us allocate unbounded memory from a
+// single inbound message.  These cap the attacker-controlled arrays /
+// payload sizes on the network-facing handlers; legitimate traffic is
+// comfortably under each bound.
+const MAX_PUBLISH_BYTES        = 64 * 1024;          // per-publish `json` payload ceiling
+const MAX_SUBSCRIBER_BATCH     = 512;                // adopt-subscribers subscriberIds[] ceiling
+const MAX_PEER_ROOTS           = 32;                 // peerRoots[] ceiling (K is ~5)
+const MAX_REPLAY_BATCH         = DEFAULT_REPLAY_CACHE_SIZE; // replay-batch messages[] ceiling
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -417,6 +428,65 @@ export class AxonaManager {
     return this.rootSetSize > 0 && typeof this.dht.findKClosest === 'function';
   }
 
+  /**
+   * B-2 proximity gate — may this node legitimately HOST (become a
+   * root/axon for) `topicId`?  A node should only allocate a role +
+   * replay cache for a topic it is plausibly among the K-closest to.
+   * Without this, an attacker floods publishes for random topicIds and
+   * every node on the delivery path lazily promotes itself, allocating
+   * unbounded roles + caches → heap exhaustion / GC thrash (browser peers
+   * crash).
+   *
+   * Cheap + local: `dht.findKClosest` here is a synaptome distance scan
+   * (no network probe), so this is just "is self among the K ids I know
+   * closest to the topic."  Fails OPEN when there's no local distance
+   * view to consult (sim transports without findKClosest, an empty
+   * synaptome, or an error) — those cases can't host an attack and we
+   * must never let the gate drop legitimate delivery.
+   *
+   * @param {bigint} topicId
+   * @returns {Promise<boolean>}
+   */
+  async _mayHostTopic(topicId) {
+    if (!this._useKClosestMode()) return true;       // no local distance view → legacy behavior
+    try {
+      const closest = await this.dht.findKClosest(topicId, this.rootSetSize);
+      if (!Array.isArray(closest) || closest.length === 0) return true;
+      return closest.some(p => p === this.nodeId);
+    } catch {
+      return true;                                   // never let the gate break delivery
+    }
+  }
+
+  /**
+   * B-4 ingress signature check — may this publish be cached + fanned out?
+   * Run at a root axon (the topic's K-closest ingress) BEFORE caching or
+   * fan-out, so a flood of junk publishes carrying SPOOFED signatures is
+   * dropped at the edge instead of being amplified through the axonal tree
+   * (and replay cache) before the leaf nodes reject it.
+   *
+   * Only signed envelopes are gated: a payload that claims an Ed25519
+   * `signature` must verify (publisher pubkey ↔ signature over the signed
+   * core).  Unsigned/anonymous publishes and non-envelope/legacy payloads
+   * carry no signature to forge, so they pass here and are validated (if
+   * applicable) at the application edge as before.
+   *
+   * @param {string} json  serialized envelope (JSON.stringify of envelope)
+   * @returns {Promise<boolean>}
+   */
+  async _publishSignatureOk(json) {
+    if (typeof json !== 'string') return true;
+    let env;
+    try { env = JSON.parse(json); } catch { return true; }   // not an envelope → nothing to forge
+    if (!env || typeof env !== 'object' || typeof env.signature !== 'string') return true; // unsigned
+    try {
+      const res = await verifyEnvelope(env);
+      return res?.ok === true;
+    } catch {
+      return false;                                  // claims a signature but verification threw → drop
+    }
+  }
+
   onPubsubDelivery(callback) {
     this._deliveryCallback = callback;
   }
@@ -430,19 +500,34 @@ export class AxonaManager {
     const topicId      = _wire(payload.topicId);
     const subscriberId = _wire(payload.subscriberId);
     const { lastSeenTs } = payload;
+    // B-1 (routed reflection/amplification): enrolling `subscriberId` makes
+    // this node relay the topic's full feed — plus a ≤100-message replay
+    // blast — directly to that id by nodeId.  On the routed path `meta.fromId`
+    // is the axona/4-proven *previous hop*, which on a multi-hop route (or
+    // from an attacker) is NOT the named subscriber.  So enroll ONLY the
+    // authenticated channel peer — the same proven-fromId invariant the
+    // direct subscribe-k path enforces (C4).  An unvouched subscriberId is
+    // never seated: the message keeps routing and the genuine subscriber
+    // enrolls via its own origin-checked direct path (the primary path in
+    // K-closest mode; this routed path is only a no-roots fallback).
+    // fromId === null ⇒ locally originated ⇒ trusted, as on the direct path.
+    const fromId     = meta?.fromId == null ? null : _wire(meta.fromId);
+    const vouchedFor = fromId === null || subscriberId === fromId;
     const role = this.axonRoles.get(topicId);
     const now = this._now();
 
     if (role) {
       // Self-subscribe path: don't register self as own child; let walker continue.
       if (subscriberId === this.nodeId) return 'forward';
-      await this._addOrRecruitChild(topicId, role, subscriberId, _wire(meta.fromId));
+      if (!vouchedFor) return 'forward';   // can't vouch for this id → keep routing, don't enroll
+      await this._addOrRecruitChild(topicId, role, subscriberId, fromId);
       await this._maybeSendReplay(topicId, role, subscriberId, lastSeenTs);
       return 'consumed';
     }
 
-    if (meta.isTerminal) {
-      // Become the root for this topic.
+    if (meta.isTerminal && vouchedFor) {
+      // First subscriber creates the topic root — but only when its origin
+      // is vouched for, so a relay can't seed a root keyed to a victim.
       this.axonRoles.set(topicId, {
         parentId:       null,
         isRoot:         true,
@@ -612,6 +697,12 @@ export class AxonaManager {
   async _onUnsubscribe(payload, meta) {
     const topicId      = _wire(payload.topicId);
     const subscriberId = _wire(payload.subscriberId);
+    // B-1 companion: only the authenticated channel peer may remove its own
+    // subscription, else a relayed unsubscribe naming a victim silences that
+    // victim's delivery (griefing).  Same proven-fromId invariant as the
+    // routed subscribe + direct unsubscribe-k paths.
+    const fromId = meta?.fromId == null ? null : _wire(meta.fromId);
+    if (fromId !== null && subscriberId !== fromId) return 'forward';
     const role = this.axonRoles.get(topicId);
     if (role && role.children.has(subscriberId)) {
       role.children.delete(subscriberId);
@@ -629,6 +720,19 @@ export class AxonaManager {
     if (!role) return 'forward';
     if (!role.isRoot) return 'forward';
     if (this._alreadySeenPublish(publishId)) return 'consumed';
+    // D-1: bound the per-publish payload so an oversized `json` can't bloat
+    // the replay cache / fan-out buffers.
+    if (typeof json === 'string' && json.length > MAX_PUBLISH_BYTES) {
+      this._emitLog?.('debug', 'publish-oversize-dropped', { topicId: toHex(topicId), bytes: json.length });
+      return 'consumed';
+    }
+    // B-4: verify the publisher signature at root ingress, before caching
+    // or fan-out, so spoofed-signature spam is dropped here rather than
+    // amplified through the tree + replay cache.
+    if (!(await this._publishSignatureOk(json))) {
+      this._emitLog?.('debug', 'publish-bad-signature-dropped', { topicId: toHex(topicId) });
+      return 'consumed';
+    }
 
     this._addToReplayCache(role, { json, publishId, publishTs, postHash, publisher });
     this._recordReceived(topicId, publishId, publishTs);
@@ -788,7 +892,9 @@ export class AxonaManager {
     const topicId       = _wire(payload.topicId);
     const subscriberIdsHex = payload.subscriberIds;
     if (!Array.isArray(subscriberIdsHex) || subscriberIdsHex.length === 0) return;
-    const subscriberIds = subscriberIdsHex.map(h => _wire(h));
+    // D-1: cap the inbound batch so one adopt message can't make us
+    // allocate an unbounded child map.
+    const subscriberIds = subscriberIdsHex.slice(0, MAX_SUBSCRIBER_BATCH).map(h => _wire(h));
     const now = this._now();
 
     let role = this.axonRoles.get(topicId);
@@ -811,6 +917,12 @@ export class AxonaManager {
         role.children.get(subId).lastRenewed = now;
         continue;
       }
+      // D-1: adoption must respect maxDirectSubs — it previously added
+      // children unconditionally, bypassing the cap the subscribe paths
+      // enforce, so a parent (or attacker posing as one) could overfill
+      // this node's child map.  Renewals of existing children above are
+      // still allowed; only NEW children are capped.
+      if (role.children.size >= this.maxDirectSubs) break;
       role.children.set(subId, { createdAt: now, lastRenewed: now, isSubaxon: false });
     }
 
@@ -859,8 +971,9 @@ export class AxonaManager {
     if (fromId !== null && subscriberId !== fromId) return;   // spoofed → drop
     const peerRootsHex = payload.peerRoots;
     const { lastSeenTs } = payload;
+    // D-1: cap peerRoots[] (K is ~5; anything beyond MAX_PEER_ROOTS is abuse).
     const peerRoots = Array.isArray(peerRootsHex)
-      ? peerRootsHex.map(h => _wire(h)).filter(p => p !== this.nodeId)
+      ? peerRootsHex.slice(0, MAX_PEER_ROOTS).map(h => _wire(h)).filter(p => p !== this.nodeId)
       : [];
     const now = this._now();
 
@@ -930,7 +1043,9 @@ export class AxonaManager {
     const topicId = _wire(payload.topicId);
     const { messages } = payload;
     if (!Array.isArray(messages) || messages.length === 0) return;
-    for (const msg of messages) {
+    // D-1: cap the inbound replay batch (a legit batch is ≤ replay cache).
+    const batch = messages.slice(0, MAX_REPLAY_BATCH);
+    for (const msg of batch) {
       const { json, publishId, publishTs } = msg;
       if (this._alreadySeenPublish(publishId)) continue;
       this._recordReceived(topicId, publishId, publishTs);
@@ -960,8 +1075,30 @@ export class AxonaManager {
     const publisher = _wire(payload.publisher);
     const { json, publishId, publishTs, postHash } = payload;
     if (this._alreadySeenPublish(publishId)) return;
+    // D-1: bound the per-publish payload (see _onPublish).
+    if (typeof json === 'string' && json.length > MAX_PUBLISH_BYTES) {
+      this._emitLog?.('debug', 'publish-oversize-dropped', { topicId: toHex(topicId), bytes: json.length });
+      return;
+    }
+    // B-4: verify the publisher signature at root ingress (this is a
+    // K-closest root for the topic), before promotion, caching, or
+    // fan-out — so spoofed-signature spam is dropped at the edge.
+    if (!(await this._publishSignatureOk(json))) {
+      this._emitLog?.('debug', 'publish-bad-signature-dropped', { topicId: toHex(topicId) });
+      return;
+    }
     let role = this.axonRoles.get(topicId);
     if (!role) {
+      // B-2: lazy-axon promotion (allocate a role + replay cache for a
+      // topic we don't yet host) is gated on proximity — only promote if
+      // we're plausibly in this topic's K-closest set.  A flood of
+      // publishes for random topicIds therefore can't make us allocate
+      // unbounded roles/caches.  publishId is already marked seen above,
+      // so dropping here won't be reprocessed on resend.
+      if (!(await this._mayHostTopic(topicId))) {
+        this._emitLog?.('debug', 'lazy-axon-promotion-rejected', { topicId: toHex(topicId) });
+        return;
+      }
       // Lazy-axon promotion — see original docstring.
       const now = this._now();
       role = {

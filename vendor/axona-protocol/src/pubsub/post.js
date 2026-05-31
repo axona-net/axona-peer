@@ -41,15 +41,60 @@
 //   fallback — see signPost / verifySignature for the contract.
 // =====================================================================
 
-/** Stable JSON encoding: object keys sorted at every level so two
- *  semantically-identical posts hash to the same value across runs. */
+/**
+ * Stable, total, JSON-valid canonical encoding (finding C-1).
+ *
+ * Object keys are sorted at every level so two semantically-identical
+ * values hash/sign to the same bytes across runs and implementations.
+ * The value semantics match `JSON.stringify` EXACTLY — which is also
+ * what the wire does to every frame — so a value canonicalized at the
+ * signer and the same value canonicalized at the verifier (after a
+ * JSON round-trip on the wire) always agree:
+ *
+ *   - undefined / function / symbol as an OBJECT VALUE  → key omitted
+ *   - undefined / function / symbol as an ARRAY ELEMENT → `null`
+ *   - NaN / ±Infinity                                   → `null`
+ *   - -0                                                → `0`
+ *
+ * The previous implementation recursed into object values unconditionally,
+ * so an `undefined`-valued key emitted the literal token `undefined` —
+ * invalid JSON, and a signer/verifier mismatch (the wire drops such keys),
+ * meaning any message containing one silently failed verification. This
+ * version omits them exactly as `JSON.stringify` does, so output is always
+ * valid JSON and identical to the wire-observed shape. Output is unchanged
+ * for every value that does not contain `undefined`/function/symbol — i.e.
+ * for everything that verified before — so this is not a wire/flag-day
+ * change.
+ *
+ * Note: special numerics (NaN/Infinity) follow JSON's `null` coercion on
+ * both the signing and wire paths; applications that must preserve them
+ * should encode them as strings.
+ */
 export function canonical(value) {
-  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (value === null || typeof value !== 'object') {
+    // Primitives: defer to JSON.stringify (string, finite number → as-is;
+    // NaN/±Infinity → "null"; -0 → "0").  A bare undefined/function/symbol
+    // has no JSON form (JSON.stringify returns the JS value `undefined`);
+    // emit a valid-JSON "null" so the function is total and never yields
+    // the literal token `undefined`.
+    const s = JSON.stringify(value);
+    return s === undefined ? 'null' : s;
+  }
   if (Array.isArray(value)) {
+    // canonical() already maps undefined/function/symbol elements to the
+    // string "null" (via the primitive branch), matching JSON.stringify.
     return '[' + value.map(canonical).join(',') + ']';
   }
   const keys = Object.keys(value).sort();
-  return '{' + keys.map(k => JSON.stringify(k) + ':' + canonical(value[k])).join(',') + '}';
+  const parts = [];
+  for (const k of keys) {
+    const v  = value[k];
+    const tv = typeof v;
+    // Omit keys with no JSON form, exactly as JSON.stringify does.
+    if (v === undefined || tv === 'function' || tv === 'symbol') continue;
+    parts.push(JSON.stringify(k) + ':' + canonical(v));
+  }
+  return '{' + parts.join(',') + '}';
 }
 
 const _enc = new TextEncoder();
