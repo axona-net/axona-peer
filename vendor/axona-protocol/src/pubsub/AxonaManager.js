@@ -40,6 +40,9 @@
 
 import { toHex, fromHex, isHexId } from '../utils/hexid.js';
 import { verifyEnvelope, checkFreshness, MAX_PUBLISH_SKEW_MS } from './envelope.js';
+import { verifyKill } from './kill.js';
+import { verifyUnpub } from './unpub.js';
+import { deriveTopicId, sha256Hex } from './post.js';
 
 // ── Defaults (simulator-tuned; production would use much longer values) ────
 
@@ -77,6 +80,23 @@ const MAX_REPLAY_BATCH         = DEFAULT_REPLAY_CACHE_SIZE; // replay-batch mess
 // a slower path arrives with a slightly lower seq and is still accepted);
 // far tighter than the freshness window so the two gates reinforce.
 const SEQ_REORDER_TOLERANCE_MS = 60_000;
+
+// Phase A #2 (kill): how long a root axon keeps a tombstone for a killed
+// msgId, so a lagging/rejoining replica can't resurrect the message by
+// re-gossiping it after the kill.  Sized to the default message hold (24 h);
+// once per-message TTL lands (#5) this aligns to the message's own remaining
+// hold.  Bounded by MAX_TOMBSTONES (LRU) so it can't grow without limit.
+const TOMBSTONE_TTL_MS = 24 * 60 * 60 * 1000;
+const MAX_TOMBSTONES   = 4096;
+
+// Phase A #5: message hold time.  A message expires (is swept from replay
+// caches and no longer served/pulled) at its (signed, freshness-clamped)
+// timestamp + the hold.  DEFAULT_HOLD_MS is the ownerless/default; MAX_HOLD_MS
+// is the absolute ceiling no sliding-pull (#6) may extend past.  Owner-set
+// per-topic holds (≤ MAX_HOLD_MS) arrive with the config object (Phase B);
+// role.maxHoldMs is the hook.
+const DEFAULT_HOLD_MS = 24 * 60 * 60 * 1000;   // 24h
+const MAX_HOLD_MS      = 48 * 60 * 60 * 1000;   // 48h ceiling
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -162,6 +182,12 @@ export class AxonaManager {
     this._publisherSeq    = new Map();   // signerPubkey(hex) -> highestSeq (number)
     this._publisherSeqCap = 4096;
 
+    // Phase A #2 (kill): tombstones for retracted messages + a dedup set for
+    // kill objects we've already processed (keyed by the kill's signature).
+    this._tombstones  = new Map();       // msgId(hex) -> expiresAt (ms)
+    this._seenKills   = new Map();       // kill.signature -> insertedAt (ms)
+    this._seenKillCap = 4096;
+
     // Exactly-once gate for delivery to the LOCAL application callback.
     // Deliberately SEPARATE from `_seenPublishes`: that set means "this
     // node has processed/relayed this publish in some role" and is marked
@@ -213,6 +239,10 @@ export class AxonaManager {
     dht.onRoutedMessage('pubsub:subscribe',    (p, m) => this._onSubscribe(p, m));
     dht.onRoutedMessage('pubsub:unsubscribe',  (p, m) => this._onUnsubscribe(p, m));
     dht.onRoutedMessage('pubsub:publish',      (p, m) => this._onPublish(p, m));
+    dht.onRoutedMessage('pubsub:kill',         (p, m) => this._onKill(p, m));
+    dht.onDirectMessage('pubsub:kill-k',       (p, m) => this._onKillDirect(p, m));
+    dht.onRoutedMessage('pubsub:unpub',        (p, m) => this._onUnpub(p, m));
+    dht.onDirectMessage('pubsub:unpub-k',      (p, m) => this._onUnpubDirect(p, m));
     dht.onDirectMessage('pubsub:deliver',      (p, m) => this._onDeliver(p, m));
     dht.onDirectMessage('pubsub:promote-axon',     (p, m) => this._onPromoteAxon(p, m));
     dht.onDirectMessage('pubsub:adopt-subscribers',(p, m) => this._onAdoptSubscribers(p, m));
@@ -279,6 +309,8 @@ export class AxonaManager {
     this._receivedPublishIds.clear();
     this._seenPublishes.clear();
     this._publisherSeq.clear();
+    this._tombstones.clear();
+    this._seenKills.clear();
     this._kClosestCache.clear();
     this._kClosestEpoch = 0;
     this._deliveryCallback = null;
@@ -306,6 +338,70 @@ export class AxonaManager {
     this._asyncPublish(topicId, json, publishId, publishTs, meta)
       .catch(err => console.error('AxonaManager: publish failed:', err));
     return publishId;
+  }
+
+  /**
+   * Retract a message (Phase A #2).  Routes the signed `kill` object to the
+   * topic's K-closest root axons, which authorize it (signer must match the
+   * killed message's signer), drop it from their replay caches, tombstone
+   * the msgId, and purge subscribers.  Fire-and-forget, same as publish.
+   *
+   * @param {bigint} topicId   BigInt 264-bit topic id (kernel-canonical).
+   * @param {object} kill      signed kill object (see pubsub/kill.js).
+   */
+  pubsubKill(topicId, kill) {
+    if (typeof topicId !== 'bigint') {
+      throw new TypeError(`AxonaManager.pubsubKill: topicId must be bigint, got ${typeof topicId}`);
+    }
+    this._asyncKill(topicId, kill)
+      .catch(err => console.error('AxonaManager: kill failed:', err));
+  }
+
+  /** @private — route the kill to K-closest roots (mirrors _asyncPublish). */
+  async _asyncKill(topicId, kill) {
+    const topicIdHex = toHex(topicId);
+    const payload = { topicId: topicIdHex, kill };
+    if (this._useKClosestMode()) {
+      const roots = await this._findKClosest(topicId, this.rootSetSize);
+      if (roots.length > 0) {
+        for (const target of roots) this.dht.sendDirect(target, 'pubsub:kill-k', payload);
+        // Also apply locally if we're one of the roots (sendDirect to self
+        // may be a no-op on some transports).
+        if (roots.includes(this.nodeId)) this._handleKill(topicId, kill);
+        return;
+      }
+    }
+    // Axonal/routed fallback.
+    this.dht.routeMessage(topicId, 'pubsub:kill', payload);
+  }
+
+  /**
+   * Remove a topic's message queue (Phase A #3) — owner-only.  Routes the
+   * signed `unpub` to the topic's K-closest roots.  Fire-and-forget.
+   *
+   * @param {bigint} topicId
+   * @param {object} unpub   signed unpub object (see pubsub/unpub.js).
+   */
+  pubsubUnpub(topicId, unpub) {
+    if (typeof topicId !== 'bigint') {
+      throw new TypeError(`AxonaManager.pubsubUnpub: topicId must be bigint, got ${typeof topicId}`);
+    }
+    this._asyncUnpub(topicId, unpub)
+      .catch(err => console.error('AxonaManager: unpub failed:', err));
+  }
+
+  /** @private — route the unpub to K-closest roots (mirrors _asyncKill). */
+  async _asyncUnpub(topicId, unpub) {
+    const payload = { topicId: toHex(topicId), unpub };
+    if (this._useKClosestMode()) {
+      const roots = await this._findKClosest(topicId, this.rootSetSize);
+      if (roots.length > 0) {
+        for (const target of roots) this.dht.sendDirect(target, 'pubsub:unpub-k', payload);
+        if (roots.includes(this.nodeId)) await this._handleUnpub(topicId, unpub);
+        return;
+      }
+    }
+    this.dht.routeMessage(topicId, 'pubsub:unpub', payload);
   }
 
   /**
@@ -574,6 +670,194 @@ export class AxonaManager {
     return { ok: true };
   }
 
+  // ── Kill (creator-only retraction, Phase A #2) ─────────────────────────
+
+  /** Routed kill ingress.  Returns a routing verdict ('consumed'|'forward'). */
+  async _onKill(payload, meta) {
+    return this._handleKill(_wire(payload.topicId), payload?.kill);
+  }
+
+  /** Direct (K-closest) kill ingress.  We're a targeted root; verdict unused. */
+  async _onKillDirect(payload, meta) {
+    await this._handleKill(_wire(payload.topicId), payload?.kill);
+  }
+
+  /**
+   * Core kill handler (shared by routed + direct paths).  Verifies the kill
+   * signature + freshness, dedups, then — if we host the topic and hold the
+   * target message — checks the kill signer matches the MESSAGE signer
+   * (creator-only), drops it from the replay cache, tombstones the msgId so
+   * a lagging replica can't resurrect it, and delivers a delete marker to
+   * subscribers.  Self-authenticating: authority to kill IS authorship.
+   *
+   * @returns {Promise<'consumed'|'forward'>}
+   */
+  async _handleKill(topicId, kill) {
+    // 1. signature.
+    let v;
+    try { v = await verifyKill(kill); } catch { v = { ok: false }; }
+    if (!v.ok) { this._emitLog?.('debug', 'kill-bad-signature-dropped', {}); return 'consumed'; }
+    // 2. freshness on the kill's OWN ts (anti-replay of the kill).
+    if (!checkFreshness(kill, { now: this._now() }).ok) {
+      this._emitLog?.('debug', 'kill-stale-dropped', {}); return 'consumed';
+    }
+    // 3. dedup by kill signature.
+    if (this._seenKills.has(kill.signature)) return 'consumed';
+    this._seenKills.set(kill.signature, this._now());
+    if (this._seenKills.size > this._seenKillCap) {
+      const toDrop = this._seenKillCap / 2; let i = 0;
+      for (const k of this._seenKills.keys()) { if (i++ >= toDrop) break; this._seenKills.delete(k); }
+    }
+    // 4. do we host the topic?
+    const role = this.axonRoles.get(topicId);
+    if (!role) return 'forward';                       // not hosting → route onward to a root
+    // 5. find the target message in our replay cache.
+    const cache = role.replayCache || [];
+    const idx   = cache.findIndex(e => e.postHash === kill.msgId);
+    if (idx === -1) return 'forward';                  // not here (yet/anymore) → let a root with it act
+    // 6. authorize: the kill signer MUST be the message signer (creator-only).
+    let env = null;
+    try { env = JSON.parse(cache[idx].json); } catch { /* unparseable */ }
+    const msgSigner = (env && typeof env.signerPubkey === 'string') ? env.signerPubkey : null;
+    if (!msgSigner || msgSigner !== kill.signerPubkey) {
+      this._emitLog?.('debug', 'kill-unauthorized-dropped', { msgId: kill.msgId });
+      return 'consumed';                               // wrong signer (or unsigned msg) → reject, handled
+    }
+    // 7. retract: drop from cache + tombstone so it can't be resurrected.
+    const topicName = (env && typeof env.topic === 'string') ? env.topic : null;
+    cache.splice(idx, 1);
+    this._addTombstone(kill.msgId);
+    // 8. purge subscribers — delete-marked delivery on their sub() handler.
+    const deleteJson = JSON.stringify({ deleted: true, msgId: kill.msgId, topic: topicName });
+    const deliveryId = `kill:${kill.msgId}`;
+    const topicIdHex = toHex(topicId);
+    const now = this._now();
+    const dead = [];
+    for (const [childId] of role.children) {
+      if (childId === this.nodeId) { this._deliverToApp(topicId, deleteJson, deliveryId, now); continue; }
+      const ok = await this.dht.sendDirect(childId, 'pubsub:deliver', {
+        topicId: topicIdHex, json: deleteJson, publishId: deliveryId, publishTs: now, postHash: kill.msgId,
+      });
+      if (!ok) dead.push(childId);
+    }
+    for (const d of dead) role.children.delete(d);
+    this._emitLog?.('debug', 'kill-applied', { topicId: topicIdHex, msgId: kill.msgId });
+    return 'consumed';
+  }
+
+  /** Record a tombstone for a killed msgId (bounded LRU). */
+  _addTombstone(msgId) {
+    if (!msgId) return;
+    this._tombstones.set(msgId, this._now() + TOMBSTONE_TTL_MS);
+    if (this._tombstones.size > MAX_TOMBSTONES) {
+      const toDrop = MAX_TOMBSTONES / 2; let i = 0;
+      for (const k of this._tombstones.keys()) { if (i++ >= toDrop) break; this._tombstones.delete(k); }
+    }
+  }
+
+  /** Is `msgId` tombstoned (killed, still within the tombstone window)? */
+  _isTombstoned(msgId) {
+    if (!msgId) return false;
+    const exp = this._tombstones.get(msgId);
+    if (exp === undefined) return false;
+    if (this._now() > exp) { this._tombstones.delete(msgId); return false; }
+    return true;
+  }
+
+  // ── Hold time / expiry (Phase A #5) ────────────────────────────────────
+
+  /** Has this cache entry passed its hold-time expiry? */
+  _isExpired(entry, now = this._now()) {
+    return typeof entry?.expiresAt === 'number' && now > entry.expiresAt;
+  }
+
+  /** Drop expired entries from one role's replay cache (in place). */
+  _sweepRole(role, now = this._now()) {
+    const cache = role?.replayCache;
+    if (!cache || cache.length === 0) return;
+    for (let i = cache.length - 1; i >= 0; i--) {
+      if (this._isExpired(cache[i], now)) cache.splice(i, 1);
+    }
+  }
+
+  /** Sweep expired messages from every hosted topic (called on refreshTick). */
+  _sweepExpired(now = this._now()) {
+    for (const role of this.axonRoles.values()) this._sweepRole(role, now);
+  }
+
+  // ── Unpub (owner-only queue removal, Phase A #3) ───────────────────────
+
+  /** Routed unpub ingress.  Returns a routing verdict. */
+  async _onUnpub(payload, meta) {
+    return this._handleUnpub(_wire(payload.topicId), payload?.unpub);
+  }
+
+  /** Direct (K-closest) unpub ingress.  Verdict unused. */
+  async _onUnpubDirect(payload, meta) {
+    await this._handleUnpub(_wire(payload.topicId), payload?.unpub);
+  }
+
+  /**
+   * Core unpub handler.  Verifies the unpub signature + freshness, dedups,
+   * then authorizes it as coming from the topic OWNER — self-authenticatingly,
+   * with no registry:
+   *   (1) sha256(signerPubkey) === ownerNodeId[8:]   (pubkey ↔ nodeId bind;
+   *       the 8-bit geo prefix is the owner's own choice, so only the suffix
+   *       is checked), and
+   *   (2) deriveTopicId(ownerNodeId, topicName) === topicId.
+   * Only the genuine owner satisfies both.  On success: drop the whole
+   * replay cache (tombstoning each msgId so it can't be resurrected) and,
+   * when `destroy`, delete the hosting role entirely.
+   *
+   * @returns {Promise<'consumed'|'forward'>}
+   */
+  async _handleUnpub(topicId, unpub) {
+    // 1. signature.
+    let v;
+    try { v = await verifyUnpub(unpub); } catch { v = { ok: false }; }
+    if (!v.ok) { this._emitLog?.('debug', 'unpub-bad-signature-dropped', {}); return 'consumed'; }
+    // 2. freshness on the unpub's own ts.
+    if (!checkFreshness(unpub, { now: this._now() }).ok) {
+      this._emitLog?.('debug', 'unpub-stale-dropped', {}); return 'consumed';
+    }
+    // 3. dedup (shares the kill seen-set; signatures are unique).
+    if (this._seenKills.has(unpub.signature)) return 'consumed';
+    this._seenKills.set(unpub.signature, this._now());
+    // 4. owner authorization — fully self-authenticating.
+    let pubSuffix = null;
+    try {
+      const pkBytes = new Uint8Array((unpub.signerPubkey.match(/../g) || []).map(h => parseInt(h, 16)));
+      pubSuffix = await sha256Hex(pkBytes);
+    } catch { /* malformed pubkey */ }
+    const ownerNodeId = typeof unpub.ownerNodeId === 'string' ? unpub.ownerNodeId : '';
+    if (!pubSuffix || pubSuffix !== ownerNodeId.slice(2).toLowerCase()) {
+      this._emitLog?.('debug', 'unpub-pubkey-not-owner', {});
+      return 'consumed';                               // pubkey doesn't own the claimed nodeId
+    }
+    let derivedTopicId = null;
+    try { derivedTopicId = await deriveTopicId(ownerNodeId, unpub.topicName); } catch { /* bad inputs */ }
+    if (!derivedTopicId || derivedTopicId.toLowerCase() !== toHex(topicId).toLowerCase()) {
+      this._emitLog?.('debug', 'unpub-topic-not-owned', {});
+      return 'consumed';                               // owner didn't create this topic
+    }
+    // 5. authorized — find the role.
+    const role = this.axonRoles.get(topicId);
+    if (!role) return 'forward';                       // not hosting → route onward to a root
+    // 6. drop the queue + tombstone every msgId so it can't be resurrected.
+    const cache = role.replayCache || [];
+    for (const e of cache) this._addTombstone(e.postHash);
+    role.replayCache = [];
+    // 7. destroy → remove the hosting role state entirely (Phase A: no
+    //    separate config/ACL objects yet; this clears all topic state we hold).
+    if (unpub.destroy === true) {
+      this.axonRoles.delete(topicId);
+      this._receivedPublishIds.delete(topicId);
+      this._lastSeenTsByTopic.delete(topicId);
+    }
+    this._emitLog?.('debug', 'unpub-applied', { topicId: toHex(topicId), destroy: unpub.destroy === true });
+    return 'consumed';
+  }
+
   onPubsubDelivery(callback) {
     this._deliveryCallback = callback;
   }
@@ -829,8 +1113,15 @@ export class AxonaManager {
       this._emitLog?.('debug', 'publish-stale-dropped', { topicId: toHex(topicId), reason: fo.reason });
       return 'consumed';
     }
+    // Phase A #2: a killed message must not be resurrected by a lagging
+    // replica re-gossiping it.
+    if (this._isTombstoned(postHash)) {
+      this._emitLog?.('debug', 'publish-tombstoned-dropped', { topicId: toHex(topicId), msgId: postHash });
+      return 'consumed';
+    }
 
-    this._addToReplayCache(role, { json, publishId, publishTs, postHash, publisher });
+    const quotaPerPublisher = await this._openTopicQuota(role, json, topicId);
+    this._addToReplayCache(role, { json, publishId, publishTs, postHash, publisher }, { quotaPerPublisher });
     this._recordReceived(topicId, publishId, publishTs);
 
     const topicIdHex  = toHex(topicId);
@@ -858,10 +1149,102 @@ export class AxonaManager {
     return 'consumed';
   }
 
-  _addToReplayCache(role, entry) {
+  /**
+   * Add a message to a role's replay cache with a BOUNDED size and
+   * DETERMINISTIC eviction (Phase A #4).
+   *
+   * Eviction order is the signed (seq, ts, msgId) tuple — derived entirely
+   * from fields under the publisher's signature — so every replica evicts
+   * the SAME message and the caches converge.  At maxMessages = 1 this is a
+   * retained / latest-value slot (a new publish, higher seq, replaces the
+   * prior one).
+   *
+   * `opts.quotaPerPublisher` (set only for OPEN/Model-1 topics — see
+   * _openTopicQuota) caps how many of the queue's slots one `signerPubkey`
+   * may hold, so a single anonymous publisher can't flood the topic and
+   * evict everyone else.  Owned topics pass no quota (the owner-signed
+   * publish ACL governs them — and the owner shouldn't be limited in their
+   * own topic).
+   */
+  _addToReplayCache(role, entry, opts = {}) {
     if (!role.replayCache) role.replayCache = [];
-    role.replayCache.push(entry);
-    while (role.replayCache.length > this.replayCacheSize) role.replayCache.shift();
+    // Enrich with the ordering key (parse once from the signed envelope).
+    if (entry.seq === undefined) {
+      let env = null;
+      try { env = JSON.parse(entry.json); } catch { /* non-envelope */ }
+      entry.seq          = (env && typeof env.seq === 'number') ? env.seq : 0;
+      entry.ts           = (env && typeof env.ts  === 'number') ? env.ts  : (entry.publishTs || 0);
+      entry.signerPubkey = (env && typeof env.signerPubkey === 'string') ? env.signerPubkey : null;
+    }
+    // Hold time (Phase A #5): absolute expiry off the message ts, CLAMPED to
+    // receive-time.  Real (signed) traffic is within the C-2 freshness window
+    // so its ts ≈ now and is used directly; an out-of-window ts (unsigned/
+    // legacy toy timestamps, or a spoofed far-future value) falls back to the
+    // receiver's clock, so hold time can't be gamed and "held for N hours"
+    // means N hours from when this replica received it.  ceilingAt is the
+    // hard 48h cap a sliding pull (#6) can't extend past.
+    if (entry.expiresAt === undefined) {
+      const now    = this._now();
+      const baseTs = (typeof entry.ts === 'number' && Math.abs(now - entry.ts) <= MAX_HOLD_MS) ? entry.ts : now;
+      const holdMs = Math.min(role.maxHoldMs || DEFAULT_HOLD_MS, MAX_HOLD_MS);
+      entry.ceilingAt = baseTs + MAX_HOLD_MS;
+      entry.expiresAt = Math.min(baseTs + holdMs, entry.ceilingAt);
+    }
+    const cache = role.replayCache;
+    cache.push(entry);
+    const max = role.maxMessages || this.replayCacheSize;
+
+    // Per-publisher quota (open topics): evict THIS publisher's own
+    // lowest-ordered entries first, so flooding self-limits.
+    const quota = opts.quotaPerPublisher;
+    if (quota && entry.signerPubkey) {
+      let mine = cache.filter(e => e.signerPubkey === entry.signerPubkey);
+      while (mine.length > quota) {
+        const victim = this._lowestOrdered(mine);
+        cache.splice(cache.indexOf(victim), 1);
+        mine = mine.filter(e => e !== victim);
+      }
+    }
+    // Global bound: evict the lowest-ordered until within maxMessages.
+    while (cache.length > max) {
+      const victim = this._lowestOrdered(cache);
+      cache.splice(cache.indexOf(victim), 1);
+    }
+  }
+
+  /** The lowest-ordered (oldest) cache entry by (seq, ts, msgId). */
+  _lowestOrdered(entries) {
+    return entries.reduce((a, b) => (this._orderLt(a, b) ? a : b));
+  }
+
+  /** True iff entry `a` is strictly lower-ordered (older) than `b`. */
+  _orderLt(a, b) {
+    const sa = a.seq ?? 0, sb = b.seq ?? 0;
+    if (sa !== sb) return sa < sb;
+    const ta = a.ts ?? 0, tb = b.ts ?? 0;
+    if (ta !== tb) return ta < tb;
+    return String(a.postHash ?? '') < String(b.postHash ?? '');
+  }
+
+  /**
+   * Per-publisher quota for an OPEN (Model 1 / public) topic, else null.
+   * A topic is open iff its id is the public-mode derivation of its name —
+   * `deriveTopicId(null, env.topic) === topicId` — which is verifiable from
+   * the SIGNED `topic` field and can't be spoofed by the unsigned wire
+   * `publisher` field.  Owned (publisher-keyed) topics return null.
+   */
+  async _openTopicQuota(role, json, topicId) {
+    try {
+      const env = JSON.parse(json);
+      if (env && typeof env.topic === 'string') {
+        const publicId = await deriveTopicId(null, env.topic);
+        if (publicId === toHex(topicId)) {
+          const max = role.maxMessages || this.replayCacheSize;
+          return Math.max(1, Math.ceil(max / 4));
+        }
+      }
+    } catch { /* non-envelope */ }
+    return null;
   }
 
   /** Record reception of a publishId + timestamp for this topic.  Topic
@@ -1104,6 +1487,8 @@ export class AxonaManager {
    */
   async _maybeSendReplay(topicId, role, subscriberId, lastSeenTs) {
     if (!subscriberId) return;
+    // Phase A #5: never replay expired messages; sweep them first.
+    this._sweepRole(role, this._now());
     const cache = role.replayCache;
     if (!cache || cache.length === 0) return;
 
@@ -1191,6 +1576,10 @@ export class AxonaManager {
       this._emitLog?.('debug', 'publish-stale-dropped', { topicId: toHex(topicId), reason: fo.reason });
       return;
     }
+    if (this._isTombstoned(postHash)) {
+      this._emitLog?.('debug', 'publish-tombstoned-dropped', { topicId: toHex(topicId), msgId: postHash });
+      return;
+    }
     let role = this.axonRoles.get(topicId);
     if (!role) {
       // B-2: lazy-axon promotion (allocate a role + replay cache for a
@@ -1220,7 +1609,8 @@ export class AxonaManager {
       this.axonRoles.set(topicId, role);
     }
 
-    this._addToReplayCache(role, { json, publishId, publishTs, postHash, publisher });
+    const quotaPerPublisher = await this._openTopicQuota(role, json, topicId);
+    this._addToReplayCache(role, { json, publishId, publishTs, postHash, publisher }, { quotaPerPublisher });
     this._recordReceived(topicId, publishId, publishTs);
 
     const topicIdHex   = toHex(topicId);
@@ -1250,6 +1640,10 @@ export class AxonaManager {
 
   async refreshTick() {
     const now = this._now();
+
+    // Phase A #5: drop messages past their hold-time expiry from every
+    // hosted topic before the rest of the refresh runs.
+    this._sweepExpired(now);
 
     // 0. Drop the K-closest cache so every re-subscribe / re-publish
     //    below recomputes against the CURRENT synaptome.  The cache is
@@ -1415,10 +1809,31 @@ export class AxonaManager {
   _findInReplayCache(role, postHash) {
     const cache = role?.replayCache;
     if (!cache) return null;
+    const now = this._now();
     for (let i = cache.length - 1; i >= 0; i--) {
-      if (cache[i].postHash === postHash) return cache[i];
+      if (cache[i].postHash !== postHash) continue;
+      // Phase A #5: an expired message is gone — drop it and report a miss.
+      if (this._isExpired(cache[i], now)) { cache.splice(i, 1); return null; }
+      return cache[i];
     }
     return null;
+  }
+
+  /**
+   * The most-recent LIVE message in a role's replay cache — highest-ordered
+   * by the signed (seq, ts, msgId) tuple (Phase A #6, `pull` with no msgId).
+   * Returns null if the cache is empty or all entries are expired.
+   */
+  _latestInReplayCache(role) {
+    const cache = role?.replayCache;
+    if (!cache || cache.length === 0) return null;
+    const now = this._now();
+    let best = null;
+    for (const e of cache) {
+      if (this._isExpired(e, now)) continue;
+      if (best === null || this._orderLt(best, e)) best = e;
+    }
+    return best;
   }
 
   /**
@@ -1515,16 +1930,27 @@ export class AxonaManager {
     const role = this.axonRoles.get(topicId);
     if (!role) return 'forward';
 
-    const cached = this._findInReplayCache(role, postHash);
+    // Phase A #6: a null/absent postHash means "give me the latest" — the
+    // highest-ordered (by signed seq, ts, msgId) live message in the topic.
+    const cached = postHash
+      ? this._findInReplayCache(role, postHash)
+      : this._latestInReplayCache(role);
     if (cached) {
+      // Sliding hold (Phase A #6): a pull extends the message's life to
+      // now + hold, BOUNDED by its absolute ceiling (it can never live past
+      // ceilingAt).  Local to this replica — a read is not fanned as a write.
+      if (typeof cached.ceilingAt === 'number') {
+        const holdMs = Math.min(role.maxHoldMs || DEFAULT_HOLD_MS, MAX_HOLD_MS);
+        cached.expiresAt = Math.min(this._now() + holdMs, cached.ceilingAt);
+      }
       this.dht.sendDirect(requesterId, 'pubsub:pullResp', {
         requestId,
-        postHash,
+        postHash:    cached.postHash,         // the actual msgId served (latest may differ from request)
         status:      'FOUND',
         post:        cached.json,
         responderId: toHex(this.nodeId),
       });
-      this._bumpPull(topicId, postHash);
+      this._bumpPull(topicId, cached.postHash);
       return 'consumed';
     }
     if (role.isRoot) {
