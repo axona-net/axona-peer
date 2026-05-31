@@ -56,7 +56,7 @@ const DEFAULT_REPLAY_CACHE_SIZE      = 100;          // per-role bounded ring (Â
 // single inbound message.  These cap the attacker-controlled arrays /
 // payload sizes on the network-facing handlers; legitimate traffic is
 // comfortably under each bound.
-const MAX_PUBLISH_BYTES        = 256 * 1024;         // per-publish `json` payload ceiling (chars; see note)
+export const MAX_PUBLISH_BYTES = 256 * 1024;         // per-publish `json` payload ceiling (chars; see note)
 // NOTE: this is the small/medium-message lane, not a blob channel. Large
 // binary content (images/documents) should ride a content-reference manifest
 // + out-of-band transfer (Tier 2: a DHT content store keyed by content hash),

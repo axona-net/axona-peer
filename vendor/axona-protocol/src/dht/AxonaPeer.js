@@ -43,7 +43,7 @@ import { Subscription }   from './Subscription.js';
 import { clz264, toHex, fromHex, isHexId } from '../utils/hexid.js';
 import { deriveTopicId, deriveTopicIdBig } from '../pubsub/post.js';
 import { buildEnvelope }  from '../pubsub/envelope.js';
-import { AxonaManager }    from '../pubsub/AxonaManager.js';
+import { AxonaManager, MAX_PUBLISH_BYTES } from '../pubsub/AxonaManager.js';
 import { PublishError, SubscribeError, PullError, MetricsError, ErrorCodes } from '../errors.js';
 
 // ── B-3 (eclipse prevention) tunables ───────────────────────────────
@@ -1180,9 +1180,18 @@ export class AxonaPeer extends DHT {
     let json;
     try { json = JSON.stringify(envelope); }
     catch (cause) {
-      throw new PublishError(ErrorCodes.PUBLISH_PAYLOAD_TOO_LARGE,
-        `peer.pub: envelope not JSON-serializable (${cause.message})`,
+      throw new PublishError(ErrorCodes.PUBLISH_INVALID_MESSAGE,
+        `peer.pub: message is not JSON-serializable (${cause.message})`,
         { cause, context: { topic } });
+    }
+    // Fail fast on oversize — same 256 KiB cap the root axon enforces at
+    // ingress (MAX_PUBLISH_BYTES), but checked here so the publisher gets a
+    // clear error instead of a message that's silently dropped network-side.
+    if (json.length > MAX_PUBLISH_BYTES) {
+      throw new PublishError(ErrorCodes.PUBLISH_PAYLOAD_TOO_LARGE,
+        `peer.pub: message too large — ${json.length} chars > ${MAX_PUBLISH_BYTES} cap. ` +
+        `Use a content reference + out-of-band transfer for large content.`,
+        { context: { topic, size: json.length, max: MAX_PUBLISH_BYTES } });
     }
 
     // AxonaManager generates its own publishId for network routing/
