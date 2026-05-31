@@ -43,6 +43,23 @@ const RTT_WINDOW       = 10;
 const DC_LABEL         = 'axona';
 const RETRY_AFTER_MS   = 5000;   // single retry after pc-failed (B10)
 
+/**
+ * Pull the DTLS certificate fingerprint out of an SDP blob.  WebRTC SDP
+ * carries `a=fingerprint:<hash-alg> <HEX:HEX:…>` (session- or media-level);
+ * this is the value the DTLS handshake actually authenticates the channel
+ * with.  Returns a normalized `"<alg> <hexnocolons>"` string (alg + bytes,
+ * lowercased, colons stripped) so it can be folded into the axona/4 CBV —
+ * a bridge that terminates DTLS to MITM the mesh must present a DIFFERENT
+ * cert on each leg, so the two endpoints derive divergent fingerprints and
+ * the mutual signature fails.  Returns null if no fingerprint is present.
+ */
+function extractFingerprint(sdp) {
+  if (typeof sdp !== 'string') return null;
+  const m = sdp.match(/^a=fingerprint:(\S+)\s+([0-9A-Fa-f:]+)\s*$/m);
+  if (!m) return null;
+  return `${m[1].toLowerCase()} ${m[2].replace(/:/g, '').toLowerCase()}`;
+}
+
 // BigInt-aware JSON codec — shared by every channel so the wire
 // format stays consistent across WebRTC data channels and the bridge
 // WebSocket.
@@ -289,6 +306,25 @@ export class MeshManager {
       localCand:  p.localCand,
       remoteCand: p.remoteCand,
     }));
+  }
+
+  /**
+   * DTLS fingerprints for the link to `peerId`, parsed from the local
+   * and remote session descriptions.  Returns `{ local, remote }`
+   * (normalized `"<alg> <hex>"` strings) once both descriptions are in
+   * place — which, by the time any data-channel frame can arrive, they
+   * always are (the DTLS handshake that opened the channel consumed
+   * them).  Returns null before then, or if a fingerprint line is
+   * missing.  The mesh axona/4 handshake folds these into its CBV so the
+   * signed transcript is bound to the actual DTLS channel (finding A-1).
+   */
+  fingerprintsFor(peerId) {
+    const st = this._peers.get(peerId);
+    if (!st || !st.pc) return null;
+    const local  = extractFingerprint(st.pc.localDescription?.sdp);
+    const remote = extractFingerprint(st.pc.remoteDescription?.sdp);
+    if (!local || !remote) return null;
+    return { local, remote };
   }
 
   /** Disconnect from everyone and stop all timers. */

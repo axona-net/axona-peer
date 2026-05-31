@@ -9,23 +9,41 @@
 //     A ──hello-sig{proof over CBV}──► B   (and vice-versa)
 //     each side verifies the other's proof, then bindPeer()s it.
 //
-// The channel-binding value (CBV) is cbvFromNonces(myNonce, peerNonce,
-// MESH_CBV_TAG).  cbvFromNonces sorts the nonce pair, so the nonces are
-// symmetric — and the TAG MUST be a constant too.  An earlier version
-// folded the peer's bridge connId in as the tag; that connId differs per
-// side (each holds the OTHER peer's), so the two endpoints derived
-// different CBVs and EVERY signature failed → the mesh never bound a
-// single peer.  The fresh per-link nonce pair already makes the CBV
-// unique to this connection; the constant tag only provides cross-
-// transport domain separation (mesh vs 'bridge' vs 'ws' vs sim).
+// The channel-binding value (CBV) has two parts:
 //
-// Transport-agnostic by construction: it receives `send` / `bindPeer`
-// callbacks and is driven by onChannelOpen / onHello / onHelloSig /
-// onChannelLost.  webTransport wires those to the MeshManager; a test
-// wires two instances to each other over an in-memory loopback.
+//   (1) a fresh per-link nonce pair — cbvFromNonces(myNonce, peerNonce,
+//       MESH_CBV_TAG).  Provides freshness/replay-resistance.  The nonce
+//       pair is sorted (order-independent) and the TAG MUST be a constant
+//       both sides share — an earlier version folded the peer's bridge
+//       connId in as the tag, but that connId differs per side (each holds
+//       the OTHER peer's), so the two endpoints derived different CBVs and
+//       EVERY signature failed → the mesh never bound a single peer.  The
+//       constant tag now only provides cross-transport domain separation
+//       (mesh vs 'bridge' vs 'ws' vs sim).
+//
+//   (2) the DTLS channel fingerprints — cbvFromFingerprints(localFp,
+//       remoteFp), folded in when a `fingerprints(meshId)` callback is
+//       supplied (the real WebRTC mesh).  This is finding A-1: nonces
+//       alone travel as cleartext through the bridge-relayed signaling,
+//       so a malicious bridge could terminate DTLS on both legs, forward
+//       the nonce/proof frames verbatim, and MITM "direct" peer traffic
+//       while both signatures still verified.  Binding the CBV to each
+//       side's actual DTLS cert means a fingerprint-rewriting bridge
+//       produces divergent CBVs and the mutual signature fails — the
+//       untrusted-bridge premise is restored.
+//
+// When no `fingerprints` callback is provided (sim transport, unit-test
+// loopback) the CBV is nonce-only — those paths have no DTLS channel to
+// bind to.  Callback presence is a local, non-negotiated decision, so a
+// peer can't be downgraded to nonce-only by a remote attacker.
+//
+// Transport-agnostic by construction: it receives `send` / `bindPeer` /
+// `fingerprints` callbacks and is driven by onChannelOpen / onHello /
+// onHelloSig / onChannelLost.  webTransport wires those to the
+// MeshManager; a test wires two instances over an in-memory loopback.
 // =====================================================================
 
-import { buildAuthHello, verifyAuthHello, makeNonce, cbvFromNonces, AUTH_PROTO } from '../handshake-auth.js';
+import { buildAuthHello, verifyAuthHello, makeNonce, cbvFromNonces, cbvFromFingerprints, AUTH_PROTO } from '../handshake-auth.js';
 
 /** Symmetric domain-separation tag for the WebRTC-mesh CBV.  MUST be a
  *  constant both endpoints share (see header). */
@@ -40,19 +58,27 @@ export class MeshAuth {
    * @param {(nodeIdHex: string, meshId: string) => void} opts.bindPeer
    *        Called once, after the peer's proof verifies, with the proven
    *        nodeId (hex) and the meshId it authenticated on.
+   * @param {(meshId: string) => ({local:string, remote:string}|null)} [opts.fingerprints]
+   *        Optional.  Returns the DTLS fingerprints for the link, folded
+   *        into the CBV for channel binding (finding A-1).  When omitted
+   *        the CBV is nonce-only (sim / unit-test paths with no DTLS).
    * @param {(event: string, data?: object) => void} [opts.log]
    */
-  constructor({ identity, send, bindPeer, log = () => {} }) {
+  constructor({ identity, send, bindPeer, fingerprints = null, log = () => {} }) {
     if (!identity || typeof identity.sign !== 'function') {
       throw new TypeError('MeshAuth: identity with sign() required');
     }
     if (typeof send !== 'function' || typeof bindPeer !== 'function') {
       throw new TypeError('MeshAuth: send + bindPeer callbacks required');
     }
-    this._identity = identity;
-    this._send     = send;
-    this._bindPeer = bindPeer;
-    this._log      = log;
+    if (fingerprints !== null && typeof fingerprints !== 'function') {
+      throw new TypeError('MeshAuth: fingerprints must be a function or null');
+    }
+    this._identity     = identity;
+    this._send         = send;
+    this._bindPeer     = bindPeer;
+    this._fingerprints = fingerprints;
+    this._log          = log;
     /** @type {Map<string, {myNonce:string, peerNonce?:string, peerNodeId?:string, pendingSig?:object, sigSent:boolean, bound:boolean}>} */
     this._state = new Map();
   }
@@ -77,9 +103,23 @@ export class MeshAuth {
     return st;
   }
 
-  _cbv(st) {
+  _cbv(meshId, st) {
     if (!st?.myNonce || !st?.peerNonce) return null;
-    return cbvFromNonces(st.myNonce, st.peerNonce, MESH_CBV_TAG);
+    const nonceCbv = cbvFromNonces(st.myNonce, st.peerNonce, MESH_CBV_TAG);
+    // No fingerprints callback (sim / unit-test) ⇒ nonce-only CBV.
+    if (!this._fingerprints) return nonceCbv;
+    // Real mesh: bind to the DTLS channel.  Fail CLOSED — if the
+    // fingerprints aren't available yet, return null so _progress defers
+    // rather than silently downgrading to nonce-only (which a MITM could
+    // otherwise rely on).  In practice both descriptions are always in
+    // place by the time a data-channel frame arrives, so this only
+    // defers across a transient.
+    const fp = this._fingerprints(meshId);
+    if (!fp || typeof fp.local !== 'string' || typeof fp.remote !== 'string') {
+      this._log('auth-mesh-awaiting-fingerprints', { meshId });
+      return null;
+    }
+    return `${nonceCbv}|${cbvFromFingerprints(fp.local, fp.remote)}`;
   }
 
   _sendHello(meshId, st) {
@@ -121,8 +161,8 @@ export class MeshAuth {
   async _progress(meshId) {
     const st = this._state.get(meshId);
     if (!st || st.bound) return;
-    const cbv = this._cbv(st);
-    if (!cbv) return;                         // still missing a nonce
+    const cbv = this._cbv(meshId, st);
+    if (!cbv) return;                         // missing a nonce or fingerprints
 
     if (!st.sigSent) {
       st.sigSent = true;

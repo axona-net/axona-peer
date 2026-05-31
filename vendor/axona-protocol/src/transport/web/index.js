@@ -588,15 +588,18 @@ export function webTransport({
     });
 
     // ── Mesh (peer ↔ peer over WebRTC) ────────────────────────────
-    // Symmetric 3-message mutual-nonce handshake, owned by MeshAuth
+    // Symmetric 3-message mutual handshake, owned by MeshAuth
     // (mesh-auth.js) so the orchestration is unit-testable without real
-    // WebRTC.  A nonce pair is the portable channel-binding value;
-    // binding to the DTLS fingerprint (full MITM detection) is the
-    // tracked follow-up (security finding A-1).
+    // WebRTC.  The CBV folds a fresh nonce pair (freshness) AND each
+    // side's DTLS certificate fingerprint (channel binding, finding A-1):
+    // a bridge that terminates DTLS to MITM the mesh must present a
+    // different cert on each leg, so the two endpoints derive divergent
+    // fingerprints and the mutual signature fails.
     const meshAuth = new MeshAuth({
       identity,
-      send:     (meshId, frame)     => mesh.send(meshId, frame),
-      bindPeer: (nodeIdHex, meshId) => webrtc.bindPeer(fromHex(nodeIdHex), meshId),
+      send:         (meshId, frame)     => mesh.send(meshId, frame),
+      bindPeer:     (nodeIdHex, meshId) => webrtc.bindPeer(fromHex(nodeIdHex), meshId),
+      fingerprints: (meshId)            => mesh.fingerprintsFor(meshId),
       log,
     });
 
