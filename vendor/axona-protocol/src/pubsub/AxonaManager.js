@@ -56,7 +56,15 @@ const DEFAULT_REPLAY_CACHE_SIZE      = 100;          // per-role bounded ring (Â
 // single inbound message.  These cap the attacker-controlled arrays /
 // payload sizes on the network-facing handlers; legitimate traffic is
 // comfortably under each bound.
-const MAX_PUBLISH_BYTES        = 64 * 1024;          // per-publish `json` payload ceiling
+const MAX_PUBLISH_BYTES        = 256 * 1024;         // per-publish `json` payload ceiling (chars; see note)
+// NOTE: this is the small/medium-message lane, not a blob channel. Large
+// binary content (images/documents) should ride a content-reference manifest
+// + out-of-band transfer (Tier 2: a DHT content store keyed by content hash),
+// NOT the broadcast path â€” every publish is replicated to K root axons,
+// cached in their replay rings, and fanned to all subscribers, so big blobs
+// here amplify badly. Measured against json.length (UTF-16 code units), so
+// heavily multi-byte payloads can exceed 256 KiB on the wire; a single
+// message must still fit the WebRTC data-channel max-message size downstream.
 const MAX_SUBSCRIBER_BATCH     = 512;                // adopt-subscribers subscriberIds[] ceiling
 const MAX_PEER_ROOTS           = 32;                 // peerRoots[] ceiling (K is ~5)
 const MAX_REPLAY_BATCH         = DEFAULT_REPLAY_CACHE_SIZE; // replay-batch messages[] ceiling
