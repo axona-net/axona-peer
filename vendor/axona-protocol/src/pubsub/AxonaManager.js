@@ -39,7 +39,7 @@
  */
 
 import { toHex, fromHex, isHexId } from '../utils/hexid.js';
-import { verifyEnvelope }          from './envelope.js';
+import { verifyEnvelope, checkFreshness, MAX_PUBLISH_SKEW_MS } from './envelope.js';
 
 // ── Defaults (simulator-tuned; production would use much longer values) ────
 
@@ -68,6 +68,15 @@ export const MAX_PUBLISH_BYTES = 256 * 1024;         // per-publish `json` paylo
 const MAX_SUBSCRIBER_BATCH     = 512;                // adopt-subscribers subscriberIds[] ceiling
 const MAX_PEER_ROOTS           = 32;                 // peerRoots[] ceiling (K is ~5)
 const MAX_REPLAY_BATCH         = DEFAULT_REPLAY_CACHE_SIZE; // replay-batch messages[] ceiling
+
+// C-2: per-publisher seq reorder tolerance.  seq is wall-clock-seeded
+// (~ms units; see AxonaPeer._nextPubSeq), so this is effectively "reject a
+// signed envelope whose seq is more than this many ms behind the
+// publisher's high-water mark" — a captured-and-replayed envelope.  Wide
+// enough to absorb benign in-flight reordering (a live message that takes
+// a slower path arrives with a slightly lower seq and is still accepted);
+// far tighter than the freshness window so the two gates reinforce.
+const SEQ_REORDER_TOLERANCE_MS = 60_000;
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -142,6 +151,16 @@ export class AxonaManager {
     this._seenPublishes = new Map();     // publishId(string) -> insertedAt (ms)
     this._seenPublishCap = 4096;
     this._seenPublishTtlMs = 60_000;
+
+    // C-2: per-publisher monotonic-seq high-water marks, keyed by the
+    // signed `signerPubkey` (64-char hex).  Bounded LRU.  Used at live
+    // ingress to reject a captured envelope replayed with a seq well
+    // behind the publisher's current stream.  Soft state — fail-open on a
+    // cold entry (a freshly-promoted root axon learns the high-water from
+    // the first message it sees; the freshness window still bounds replays
+    // in that gap).
+    this._publisherSeq    = new Map();   // signerPubkey(hex) -> highestSeq (number)
+    this._publisherSeqCap = 4096;
 
     // Exactly-once gate for delivery to the LOCAL application callback.
     // Deliberately SEPARATE from `_seenPublishes`: that set means "this
@@ -259,6 +278,7 @@ export class AxonaManager {
     this._lastSeenTsByTopic.clear();
     this._receivedPublishIds.clear();
     this._seenPublishes.clear();
+    this._publisherSeq.clear();
     this._kClosestCache.clear();
     this._kClosestEpoch = 0;
     this._deliveryCallback = null;
@@ -493,6 +513,65 @@ export class AxonaManager {
     } catch {
       return false;                                  // claims a signature but verification threw → drop
     }
+  }
+
+  /**
+   * C-2 ingress freshness + per-publisher monotonic-seq gate.  Run at a
+   * root axon on the LIVE-publish path ONLY (never on the replay path,
+   * which deliberately serves cached history older than the freshness
+   * window to late subscribers).  Call AFTER `_publishSignatureOk` so the
+   * signed `ts`/`seq` are known genuine before they are trusted.
+   *
+   * Two reinforcing checks, both keyed off SIGNED fields (the unsigned wire
+   * `publishTs` is attacker-controlled on a replay and is never consulted):
+   *   1. Freshness — reject if the signed `ts` is outside ±MAX_PUBLISH_SKEW_MS
+   *      of local time.  Kills re-injection of a captured envelope once it
+   *      ages past the window.
+   *   2. Monotonic seq — reject a signed envelope whose `seq` is more than
+   *      SEQ_REORDER_TOLERANCE_MS behind the publisher's high-water mark
+   *      (a replay from earlier in the stream).  Advance the high-water on
+   *      accept.  Fail-open on a cold entry.
+   *
+   * Only signed envelopes are gated.  Unsigned/anonymous and non-envelope
+   * payloads carry no attacker-immutable ts/seq, so freshness/ordering are
+   * not meaningful for them (they have no replay protection by nature);
+   * they pass here exactly as before.
+   *
+   * @param {string} json  serialized envelope
+   * @param {number} now   local time (ms)
+   * @returns {{ok: boolean, reason?: string}}
+   */
+  _publishFreshAndOrdered(json, now) {
+    if (typeof json !== 'string') return { ok: true };
+    let env;
+    try { env = JSON.parse(json); } catch { return { ok: true }; }
+    if (!env || typeof env !== 'object' || typeof env.signature !== 'string') {
+      return { ok: true };                           // unsigned / non-envelope → not gated
+    }
+    // 1. Freshness window on the signed ts.
+    const fresh = checkFreshness(env, { now, maxSkewMs: MAX_PUBLISH_SKEW_MS });
+    if (!fresh.ok) return { ok: false, reason: fresh.reason };
+    // 2. Per-publisher monotonic seq.
+    const key = env.signerPubkey;
+    if (typeof key === 'string' && typeof env.seq === 'number') {
+      const hw = this._publisherSeq.get(key);
+      if (hw !== undefined && env.seq <= hw - SEQ_REORDER_TOLERANCE_MS) {
+        return { ok: false, reason: 'replay_seq' };
+      }
+      if (hw === undefined || env.seq > hw) {
+        this._publisherSeq.set(key, env.seq);
+        if (this._publisherSeq.size > this._publisherSeqCap) {
+          // Evict oldest-inserted half (Map preserves insertion order).
+          const toDrop = this._publisherSeqCap / 2;
+          let i = 0;
+          for (const k of this._publisherSeq.keys()) {
+            if (i++ >= toDrop) break;
+            this._publisherSeq.delete(k);
+          }
+        }
+      }
+    }
+    return { ok: true };
   }
 
   onPubsubDelivery(callback) {
@@ -739,6 +818,15 @@ export class AxonaManager {
     // amplified through the tree + replay cache.
     if (!(await this._publishSignatureOk(json))) {
       this._emitLog?.('debug', 'publish-bad-signature-dropped', { topicId: toHex(topicId) });
+      return 'consumed';
+    }
+    // C-2: freshness + per-publisher monotonic seq on the live path. A
+    // replayed/stale signed envelope is dropped here before it is cached
+    // or fanned out (publishId already marked seen above, so a resend of
+    // the drop is a no-op).
+    const fo = this._publishFreshAndOrdered(json, this._now());
+    if (!fo.ok) {
+      this._emitLog?.('debug', 'publish-stale-dropped', { topicId: toHex(topicId), reason: fo.reason });
       return 'consumed';
     }
 
@@ -1093,6 +1181,14 @@ export class AxonaManager {
     // fan-out — so spoofed-signature spam is dropped at the edge.
     if (!(await this._publishSignatureOk(json))) {
       this._emitLog?.('debug', 'publish-bad-signature-dropped', { topicId: toHex(topicId) });
+      return;
+    }
+    // C-2: freshness + per-publisher monotonic seq (live path; see
+    // _onPublish).  Drop a stale/replayed signed envelope before it can
+    // trigger lazy promotion, caching, or fan-out.
+    const fo = this._publishFreshAndOrdered(json, this._now());
+    if (!fo.ok) {
+      this._emitLog?.('debug', 'publish-stale-dropped', { topicId: toHex(topicId), reason: fo.reason });
       return;
     }
     let role = this.axonRoles.get(topicId);

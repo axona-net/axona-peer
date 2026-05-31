@@ -1122,6 +1122,25 @@ export class AxonaPeer extends DHT {
   // is wired through pub().
 
   /**
+   * Next per-publisher monotonic sequence number (finding C-2).
+   *
+   * Seeded from the wall clock and never decreasing, so the publisher's
+   * stream stays monotonic ACROSS process restarts without persisting a
+   * counter: after a restart, `Date.now()` is already past every seq this
+   * identity emitted before (assuming the clock didn't move backwards), so
+   * root axons' per-publisher high-water marks still advance.  The
+   * `+1`/`Math.max` guarantees strict monotonicity even for multiple
+   * publishes within the same millisecond.
+   *
+   * @returns {number}
+   */
+  _nextPubSeq() {
+    const next = Math.max((this._pubSeq || 0) + 1, Date.now());
+    this._pubSeq = next;
+    return next;
+  }
+
+  /**
    * Publish a message on `topic`.  Resolves with the content-derived
    * msgId once the publish has been handed to the K-closest replica
    * set (today's AxonaManager semantics).
@@ -1168,6 +1187,7 @@ export class AxonaPeer extends DHT {
     try {
       envelope = await buildEnvelope({
         topic, message,
+        seq: this._nextPubSeq(),
         identity: this._identity,
         sign,
       });

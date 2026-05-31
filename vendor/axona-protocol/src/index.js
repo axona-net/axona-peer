@@ -112,6 +112,9 @@ export {
   buildEnvelope,
   verifyEnvelope,
   computeMsgId,
+  checkFreshness,
+  ENVELOPE_DOMAIN,
+  MAX_PUBLISH_SKEW_MS,
 } from './pubsub/envelope.js';
 
 // ── Ed25519 helpers (Web Crypto wrapper) ─────────────────────────
