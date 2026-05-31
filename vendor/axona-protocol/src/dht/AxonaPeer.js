@@ -46,6 +46,15 @@ import { buildEnvelope }  from '../pubsub/envelope.js';
 import { AxonaManager }    from '../pubsub/AxonaManager.js';
 import { PublishError, SubscribeError, PullError, MetricsError, ErrorCodes } from '../errors.js';
 
+// ── B-3 (eclipse prevention) tunables ───────────────────────────────
+// Max concurrent verification probes triggered by gossip introductions —
+// bounds the connection load a flood of triadic/hop_cache/lateral_spread
+// notifications can induce.
+const MAX_VERIFY_PROBES = 8;
+// Max peers disclosed by a single local_probe reply (D-4): enough for an
+// honest annealing/dead-replace pick, too few to cheaply map the mesh.
+const LOCAL_PROBE_MAX   = 8;
+
 export class AxonaPeer extends DHT {
   /**
    * @param {object} opts
@@ -361,6 +370,17 @@ export class AxonaPeer extends DHT {
     transport.onNotification('reinforce', (_fromId, payload) => {
       const syn = node.synaptome.get(payload.synapsePeerId);
       if (!syn) return;
+      // B-3: on identity-binding transports, only reinforce a synapse whose
+      // peer is currently bound (identity-verified).  Otherwise an
+      // unauthenticated `reinforce` could refresh the eviction-protection
+      // (inertia) of a stale / unverified entry to keep it pinned in the
+      // table (eclipse persistence).  Weight itself is already clamped to
+      // ≤1.0 in Synapse.reinforce, so inertia is the only lever to gate.
+      if (typeof transport.boundPeers === 'function') {
+        let bound = false;
+        try { bound = transport.boundPeers().some(p => p === payload.synapsePeerId); } catch { /* ignore */ }
+        if (!bound) return;
+      }
       // INERTIA_DURATION lives on the engine in the simulator path;
       // the kernel uses simEpoch alone (Synapse.reinforce reads
       // currentEpoch + inertiaDuration to set syn.inertia).  Pass
@@ -370,29 +390,19 @@ export class AxonaPeer extends DHT {
       syn.useCount = (syn.useCount ?? 0) + 1;
     });
 
-    // ── triadic_introduce — observer-driven new synapse ─────────────
+    // ── triadic_introduce — observer-driven candidate ──────────────
+    // B-3: an introduced peer is a *candidate*, not a table entry.  On
+    // identity-binding transports it is admitted only after first-party
+    // verification (see _considerCandidate); a forged introduction can no
+    // longer poison the synaptome.
     transport.onNotification('triadic_introduce', async (_fromId, payload) => {
-      if (node.synaptome.has(payload.peerId)) return;
-      const stratum = this._clz(node.id ^ payload.peerId);
-      const syn = new Synapse({ peerId: payload.peerId, latencyMs: 0, stratum });
-      syn.weight   = 0.5;
-      syn.inertia  = domain.simEpoch;
-      syn._addedBy = 'triadic';
-      await this._addByVitality(syn);
+      await this._considerCandidate(payload.peerId, 'triadic');
     });
 
-    // ── hop_cache + lateral_spread — install direct cache synapse ──
+    // ── hop_cache + lateral_spread — observed-path candidates ──────
     const hopCacheHandler = async (_fromId, payload) => {
-      const targetId = payload.target;
-      const depth    = payload.depth ?? 0;
-      if (node.synaptome.has(targetId)) return;
-      if (targetId === node.id) return;
-      const stratum = this._clz(node.id ^ targetId);
-      const syn = new Synapse({ peerId: targetId, latencyMs: 0, stratum });
-      syn.weight   = 0.5;
-      syn.inertia  = domain.simEpoch;
-      syn._addedBy = depth === 0 ? 'hopCache' : 'lateralSpread';
-      await this._addByVitality(syn);
+      const source = (payload.depth ?? 0) === 0 ? 'hopCache' : 'lateralSpread';
+      await this._considerCandidate(payload.target, source);
     };
     transport.onNotification('hop_cache',      hopCacheHandler);
     transport.onNotification('lateral_spread', hopCacheHandler);
@@ -412,6 +422,17 @@ export class AxonaPeer extends DHT {
       const peerIds = [];
       for (const syn of node.synaptome.values()) {
         if (syn.peerId !== fromBig) peerIds.push(syn.peerId);
+      }
+      // B-3/D-4: don't hand the full synaptome to an arbitrary caller —
+      // that's a cheap map of our neighbourhood for eclipse targeting.
+      // Return a bounded sample, closest-to-caller (the useful subset for
+      // an honest annealing / dead-peer-replacement pick).
+      if (peerIds.length > LOCAL_PROBE_MAX) {
+        peerIds.sort((a, b) => {
+          const da = a ^ fromBig, db = b ^ fromBig;
+          return da < db ? -1 : da > db ? 1 : 0;
+        });
+        peerIds.length = LOCAL_PROBE_MAX;
       }
       return peerIds;
     });
@@ -2287,6 +2308,61 @@ export class AxonaPeer extends DHT {
   // `this.X` (engine config) → `this._engine.X`, `this._vitality(node, s)`
   // → `this._vitality(s)` (peer's own method).  The engine retains
   // 1-line delegators for backward compat with internal callers.
+
+  /**
+   * B-3: route a gossip-introduced peer through FIRST-PARTY verification
+   * before it can become a synapse.
+   *
+   * On identity-binding transports (web/node: boundPeers + onPeerBound +
+   * openConnection) a peer named in triadic_introduce / hop_cache /
+   * lateral_spread is NOT inserted from the message.  If we already hold an
+   * authenticated channel to it, we admit it via the verified path; else we
+   * open a connection (budgeted) and let the axona/4 handshake bind its
+   * identity — `onPeerBound` then admits it.  A peer that can't prove the
+   * claimed nodeId never binds and is never admitted, so forged gossip
+   * cannot poison the routing table (eclipse).
+   *
+   * On transports without an identity-binding layer (the in-process sim /
+   * benchmark engine) the prior vitality-based direct admission is preserved
+   * unchanged — those environments have no identity to verify and are not a
+   * security boundary.
+   *
+   * @param {bigint} peerId
+   * @param {string} source  provenance tag ('triadic'|'hopCache'|'lateralSpread')
+   */
+  async _considerCandidate(peerId, source) {
+    const node = this._node;
+    if (!node?.synaptome || typeof peerId !== 'bigint') return;
+    if (peerId === node.id || node.synaptome.has(peerId)) return;
+    const t = node.transport;
+    const bindingCapable = t
+      && typeof t.onPeerBound   === 'function'
+      && typeof t.boundPeers    === 'function'
+      && typeof t.openConnection === 'function';
+
+    if (bindingCapable) {
+      // Already authenticated? admit through the verified path immediately.
+      let bound = false;
+      try { bound = t.boundPeers().some(p => p === peerId); } catch { /* ignore */ }
+      if (bound) { this._seedSynaptomeWithSponsor(peerId); return; }
+      // Budgeted probe: trigger a connection; the handshake binds identity
+      // and onPeerBound admits on success. Never binds ⇒ never admitted.
+      if ((this._verifyProbes ?? 0) >= MAX_VERIFY_PROBES) return;
+      this._verifyProbes = (this._verifyProbes ?? 0) + 1;
+      try { await t.openConnection(peerId); }
+      catch { /* unverifiable → not admitted */ }
+      finally { this._verifyProbes = Math.max(0, (this._verifyProbes ?? 1) - 1); }
+      return;
+    }
+
+    // Non-binding transport: preserve prior vitality-based direct admit.
+    const stratum = this._clz(node.id ^ peerId);
+    const syn = new Synapse({ peerId, latencyMs: 0, stratum });
+    syn.weight   = 0.5;
+    syn.inertia  = this._domain.simEpoch;
+    syn._addedBy = source;
+    await this._addByVitality(syn);
+  }
 
   /** Admission gate.  Same logic as engine._addByVitality verbatim. */
   async _addByVitality(newSyn) {
