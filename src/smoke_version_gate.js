@@ -43,6 +43,13 @@ function startBridge(env = {}) {
       BRIDGE_REGION_LABEL: 'London',
       LOG_LEVEL: 'info',
       MIN_PEER_VERSION: '0.14.0',
+      // This test exercises the MIN_PEER_VERSION mechanic in isolation with
+      // low (0.x) probe versions.  The bridge also enforces namespace-aware
+      // flag-day floors (MIN_KERNEL_VERSION / MIN_PEER_APP_VERSION, default
+      // 2.9.0 / 3.14.0 for the v2.9.0 envelope); neutralize them here so they
+      // don't reject the 0.x probes before MIN_PEER_VERSION is even consulted.
+      MIN_KERNEL_VERSION: '0.0.0',
+      MIN_PEER_APP_VERSION: '0.0.0',
       HELLO_TIMEOUT_MS: '500',
       ...env,
     },

@@ -183,7 +183,12 @@ export class MeshAuth {
         this._log('auth-mesh-id-mismatch', { meshId }); return;
       }
       try {
-        this._bindPeer(res.nodeId, meshId);
+        // Symmetric per-channel key = the sorted nonce pair.  Both endpoints
+        // hold the same two nonces, so this string is IDENTICAL on each side
+        // of a given channel — letting the transport deterministically pick
+        // the same survivor when deduping a duplicate channel to one peer.
+        const channelKey = [st.myNonce, st.peerNonce].sort().join(':');
+        this._bindPeer(res.nodeId, meshId, channelKey);
         st.bound = true;
         this._log('auth-mesh-complete', { meshId, peer: res.nodeId });
       } catch (err) { this._log('mesh-bind-failed', { meshId, err: err.message }); }

@@ -112,6 +112,10 @@ export class WebRTCTransport extends Transport {
     this._meshIdByNodeId = new Map();
     /** @type {Map<string, bigint>} meshId → nodeId(BigInt) */
     this._nodeIdByMeshId = new Map();
+    /** @type {Map<string, string>} meshId → symmetric channelKey.
+     *  Used to deterministically pick the survivor when two channels bind
+     *  the same nodeId (glare / reconnect-churn duplicate). */
+    this._channelKeyByMeshId = new Map();
 
     this._started       = false;
     this._unsubMessage  = null;
@@ -175,17 +179,61 @@ export class WebRTCTransport extends Transport {
   // send/notify by nodeId routes via the mesh.
 
   /**
-   * @param {bigint} nodeId  264-bit BigInt
+   * @param {bigint} nodeId      264-bit BigInt
    * @param {string} meshId
+   * @param {string} [channelKey]  Symmetric per-channel identifier (the
+   *        sorted axona/4 nonce pair) — IDENTICAL on both endpoints of a
+   *        given channel.  Used to deterministically resolve a duplicate
+   *        channel to an already-bound identity (see below).  Optional;
+   *        when absent the dedup falls back to "keep the existing binding".
    */
-  bindPeer(nodeId, meshId) {
+  bindPeer(nodeId, meshId, channelKey = null) {
     if (typeof nodeId !== 'bigint') {
       throw new TypeError(`bindPeer: nodeId must be bigint, got ${typeof nodeId}`);
     }
     if (typeof meshId !== 'string') {
       throw new TypeError(`bindPeer: meshId must be string, got ${typeof meshId}`);
     }
-    const isNew = !this._meshIdByNodeId.has(nodeId);
+    if (channelKey != null) this._channelKeyByMeshId.set(meshId, channelKey);
+
+    const prevMeshId = this._meshIdByNodeId.get(nodeId);
+
+    // ── Duplicate-identity dedup ──────────────────────────────────────
+    // Two distinct channels are bound to the SAME peer identity.  This
+    // happens on WebRTC "glare" (both sides dialed each other) and after a
+    // bridge/signaling restart (the surviving peer-to-peer channel plus a
+    // fresh post-reconnect channel both live).  Keep exactly one and tear
+    // the other down, so the mesh shows one channel per peer.
+    //
+    // Survivor selection is by the SYMMETRIC channelKey (sorted nonce pair),
+    // which is identical on both endpoints — so both sides pick the SAME
+    // survivor without any coordinating message, and can't each kill a
+    // different channel (which would drop the peer entirely).  Smaller key
+    // wins.  Even one-sided dedup is safe: closing a channel closes it for
+    // both ends, and the other end simply keeps the same survivor.
+    if (prevMeshId !== undefined && prevMeshId !== meshId) {
+      const prevKey = this._channelKeyByMeshId.get(prevMeshId);
+      const newWins = (channelKey != null && prevKey != null)
+        ? String(channelKey) < String(prevKey)
+        : false;                       // no keys → prefer the existing binding
+      const winnerMeshId = newWins ? meshId : prevMeshId;
+      const loserMeshId  = newWins ? prevMeshId : meshId;
+      this._log('mesh-duplicate-deduped', {
+        nodeId: String(nodeId), winnerMeshId, loserMeshId,
+      });
+      // Point the binding at the winner and drop the loser's reverse
+      // mapping BEFORE teardown, so the loser's onPeerLost can't unbind the
+      // surviving winner or report a spurious peer-died for this identity.
+      this._meshIdByNodeId.set(nodeId, winnerMeshId);
+      this._nodeIdByMeshId.set(winnerMeshId, nodeId);
+      this._nodeIdByMeshId.delete(loserMeshId);
+      this._channelKeyByMeshId.delete(loserMeshId);
+      try { this._mesh?.disconnect?.(loserMeshId, 'duplicate-nodeId'); }
+      catch (err) { this._log('mesh-dedup-disconnect-threw', { loserMeshId, err: err.message }); }
+      return;   // identity was already bound — not a new peer, no onPeerBound
+    }
+
+    const isNew = prevMeshId === undefined;
     this._meshIdByNodeId.set(nodeId, meshId);
     this._nodeIdByMeshId.set(meshId, nodeId);
     this._log('bindPeer', { nodeId: String(nodeId), meshId });
@@ -199,8 +247,14 @@ export class WebRTCTransport extends Transport {
 
   unbindPeer(meshId) {
     const nodeId = this._nodeIdByMeshId.get(meshId);
-    if (nodeId !== undefined) this._meshIdByNodeId.delete(nodeId);
     this._nodeIdByMeshId.delete(meshId);
+    this._channelKeyByMeshId.delete(meshId);
+    // Only clear the forward mapping if THIS meshId is still the active
+    // route for the nodeId.  A deduped-duplicate loser must not unbind the
+    // surviving winner (which now owns the nodeId under a different meshId).
+    if (nodeId !== undefined && this._meshIdByNodeId.get(nodeId) === meshId) {
+      this._meshIdByNodeId.delete(nodeId);
+    }
   }
 
   /**
@@ -479,23 +533,33 @@ export class WebRTCTransport extends Transport {
 
   _onPeerLost(meshId) {
     const nodeId = this._nodeIdByMeshId.get(meshId);
-    // Fan out to peer-died subscribers (translate to BigInt nodeId if bound).
-    const reportedId = nodeId ?? meshId;
-    for (const h of this._peerDiedHandlers) {
-      try { h(reportedId); }
-      catch (err) {
-        this._log('peer-died-handler-threw', { reportedId: String(reportedId), err: err.message });
+    // Only fire peer-died when this channel is the ACTIVE route for its
+    // identity.  A deduped-duplicate loser had its reverse mapping cleared
+    // before teardown (so nodeId is undefined here), and a channel whose
+    // identity is now served by a different meshId is likewise not a death
+    // of the peer — only the closure of a redundant channel.  Suppressing
+    // those keeps the synaptome from dropping a peer that's still reachable.
+    const isActiveRoute = nodeId !== undefined && this._meshIdByNodeId.get(nodeId) === meshId;
+    if (isActiveRoute) {
+      for (const h of this._peerDiedHandlers) {
+        try { h(nodeId); }
+        catch (err) {
+          this._log('peer-died-handler-threw', { reportedId: String(nodeId), err: err.message });
+        }
       }
+      // Reject every pending request to this peer.
+      for (const [id, p] of this._pending.entries()) {
+        if (p.nodeId !== nodeId) continue;
+        clearTimeout(p.timer);
+        this._pending.delete(id);
+        p.reject(new TransportError(ErrorCodes.TRANSPORT_PEER_UNREACHABLE,
+          `peer ${String(nodeId)} died`, { context: { nodeId: String(nodeId) } }));
+      }
+    } else {
+      this._log('peer-lost-redundant-channel', { meshId, nodeId: nodeId === undefined ? null : String(nodeId) });
     }
-    // Reject every pending request to this peer.
-    for (const [id, p] of this._pending.entries()) {
-      if (p.nodeId !== nodeId) continue;
-      clearTimeout(p.timer);
-      this._pending.delete(id);
-      p.reject(new TransportError(ErrorCodes.TRANSPORT_PEER_UNREACHABLE,
-        `peer ${String(nodeId)} died`, { context: { nodeId: String(nodeId) } }));
-    }
-    // Unbind the dead peer last so further sends fail fast.
+    // Unbind last so further sends fail fast (meshId-aware: won't touch the
+    // winner's mapping).
     this.unbindPeer(meshId);
   }
 }

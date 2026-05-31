@@ -598,7 +598,7 @@ export function webTransport({
     const meshAuth = new MeshAuth({
       identity,
       send:         (meshId, frame)     => mesh.send(meshId, frame),
-      bindPeer:     (nodeIdHex, meshId) => webrtc.bindPeer(fromHex(nodeIdHex), meshId),
+      bindPeer:     (nodeIdHex, meshId, channelKey) => webrtc.bindPeer(fromHex(nodeIdHex), meshId, channelKey),
       fingerprints: (meshId)            => mesh.fingerprintsFor(meshId),
       log,
     });

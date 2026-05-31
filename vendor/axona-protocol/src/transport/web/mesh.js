@@ -350,6 +350,22 @@ export class MeshManager {
     this._notify();
   }
 
+  /**
+   * Public: tear down a single channel by meshId.  Used to close a
+   * REDUNDANT channel to a peer we're already connected to under a
+   * different meshId (duplicate-identity dedup after glare / reconnect
+   * churn — see WebRTCTransport.bindPeer).  Fires the normal onPeerLost
+   * path for that meshId and re-renders.  No-op if the meshId is unknown.
+   *
+   * @param {string} meshId
+   * @param {string} [reason]
+   */
+  disconnect(meshId, reason = 'disconnect') {
+    if (!this._peers.has(meshId)) return;
+    this._teardown(meshId, reason);
+    this._notify();
+  }
+
   _notify() {
     const snap = this.getPeers();
     for (const cb of this._listeners) {
