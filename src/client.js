@@ -50,7 +50,7 @@ import { geoCellId }   from '../vendor/axona-protocol/src/utils/s2.js';
 // where the bfcache can serve a stale module set for ages).  The
 // bridge version arrives separately in its `welcome` message; the
 // "version" row in the me panel shows both side by side.
-const PEER_VERSION = '3.16.0';
+const PEER_VERSION = '3.17.0';
 
 // webTransport() now owns the bridge WebSocket lifecycle (ping cadence,
 // stale window, reconnect backoff, uptime), so those constants moved
@@ -565,7 +565,9 @@ const RESUME_HIDDEN_THRESHOLD_MS = 5000;   // ignore brief tab switches
 let hiddenAt = 0;
 
 function resetMesh(reason) {
-  appendLog('resume', reason, 'ok');
+  appendLog('resume', `${reason} — re-establishing mesh + bridge; any ` +
+    `RTCDataChannel/WebSocket errors in the browser console just now are ` +
+    `expected (zombie channels after sleep) and self-heal`, 'ok');
   // Tear down every WebRTC peer outright: after a genuine resume (lid
   // open, long tab-background) the channels are almost always dead, and
   // mesh.reset() fires onPeerLost for each so the synaptome clears too.
