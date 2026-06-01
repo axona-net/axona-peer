@@ -50,7 +50,7 @@ import { geoCellId }   from '../vendor/axona-protocol/src/utils/s2.js';
 // where the bfcache can serve a stale module set for ages).  The
 // bridge version arrives separately in its `welcome` message; the
 // "version" row in the me panel shows both side by side.
-const PEER_VERSION = '3.17.0';
+const PEER_VERSION = '3.18.0';
 
 // webTransport() now owns the bridge WebSocket lifecycle (ping cadence,
 // stale window, reconnect backoff, uptime), so those constants moved
@@ -564,7 +564,25 @@ setInterval(() => render(), UPTIME_TICK_MS);
 const RESUME_HIDDEN_THRESHOLD_MS = 5000;   // ignore brief tab switches
 let hiddenAt = 0;
 
+// Coalesce reset storms.  A genuine resume fires several events almost at
+// once (visibilitychange→visible + online + pageshow), and a *flapping*
+// network (spotty mobile, Wi-Fi roaming) fires `online` repeatedly within
+// seconds.  Each resetMesh() blows away the whole synaptome and forces a
+// full bridge reconnect + mesh rebuild, so firing it back-to-back amplifies
+// disruption on exactly the links that can least afford it.  Collapse any
+// resets within this window into the first one; the first reset already
+// re-runs the handshake and refills the mesh, so the rest are redundant.
+const RESET_MIN_INTERVAL_MS = 5000;
+let lastResetAt = 0;
+
 function resetMesh(reason) {
+  const sinceLast = Date.now() - lastResetAt;
+  if (lastResetAt && sinceLast < RESET_MIN_INTERVAL_MS) {
+    appendLog('resume', `${reason} — coalesced (mesh reset ` +
+      `${(sinceLast / 1000).toFixed(1)}s ago; skipping redundant teardown)`, 'ok');
+    return;
+  }
+  lastResetAt = Date.now();
   appendLog('resume', `${reason} — re-establishing mesh + bridge; any ` +
     `RTCDataChannel/WebSocket errors in the browser console just now are ` +
     `expected (zombie channels after sleep) and self-heal`, 'ok');
