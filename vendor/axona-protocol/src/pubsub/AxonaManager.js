@@ -1806,6 +1806,21 @@ export class AxonaManager {
     c.last_updated = this._now();
   }
 
+  /**
+   * Count the LIVE (non-expired) messages currently retained in a role's
+   * replay cache — the number of published events presently held in this
+   * relay's slice of the topic tree.  Killed messages are already removed
+   * from the cache, and expired ones are excluded here, so this is the
+   * "current count" surfaced by peer.metrics (current_count).
+   */
+  _liveCacheCount(role, now = this._now()) {
+    const cache = role?.replayCache;
+    if (!cache || cache.length === 0) return 0;
+    let n = 0;
+    for (const e of cache) if (!this._isExpired(e, now)) n++;
+    return n;
+  }
+
   _findInReplayCache(role, postHash) {
     const cache = role?.replayCache;
     if (!cache) return null;
@@ -1862,6 +1877,8 @@ export class AxonaManager {
       requestId,
       responderId: toHex(this.nodeId),
       entries,
+      current_count: this._liveCacheCount(role),
+      subscribers:   role.children?.size ?? 0,
       timestamp: this._now(),
     });
     return true;
@@ -1915,10 +1932,10 @@ export class AxonaManager {
   }
 
   _onMetricsResp(payload, meta) {
-    const { requestId, responderId, entries } = payload;
+    const { requestId, responderId, entries, current_count } = payload;
     const pending = this._pendingMetricsReqs.get(requestId);
     if (!pending) return;
-    pending.accumulated.push({ responderId, entries });
+    pending.accumulated.push({ responderId, entries, current_count });
   }
 
   // ── Pull (on-demand fetch by post_hash) ─────────────────────────────

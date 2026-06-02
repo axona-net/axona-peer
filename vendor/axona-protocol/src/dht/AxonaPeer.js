@@ -1565,7 +1565,12 @@ export class AxonaPeer extends DHT {
    * @param {object} opts
    * @param {string} opts.publisher  66-char hex node ID of the topic owner
    * @param {number} [opts.timeoutMs=500]
-   * @returns {Promise<{ publishes: number, subscribers: number, deliveries: number, pulls: number, reshares: number, relayCount: number }>}
+   * @returns {Promise<{ publishes: number, current_count: number, subscribers: number, deliveries: number, pulls: number, reshares: number, relayCount: number }>}
+   *   `current_count` is the number of published events currently retained
+   *   (live, non-expired, non-killed) in the topic's tree — the max reported
+   *   across responding root relays.  `subscribers` is the max direct-child
+   *   count reported by any single responding relay — exact for an unsplit
+   *   topic (single root), a lower bound once the tree has split into sub-axons.
    */
   async metrics(topic, { publisher, timeoutMs = 500 } = {}) {
     if (typeof topic !== 'string' || topic.length === 0) {
@@ -1590,7 +1595,7 @@ export class AxonaPeer extends DHT {
     const responses = await am.requestMetrics(topicIdBig, null, { timeoutMs });
 
     let deliveries = 0, pulls = 0, reshares = 0, publishes = 0;
-    let subscribers = 0;
+    let subscribers = 0, current_count = 0;
     const relayIds = new Set();
     for (const resp of (responses ?? [])) {
       if (resp?.responderId) relayIds.add(resp.responderId);
@@ -1604,9 +1609,16 @@ export class AxonaPeer extends DHT {
       if (typeof resp?.subscribers === 'number') {
         subscribers = Math.max(subscribers, resp.subscribers);
       }
+      // current_count: live (non-expired, non-killed) messages a relay is
+      // holding for this topic right now.  Each root replica holds the same
+      // queue, so the max across responders is the tree's current count.
+      if (typeof resp?.current_count === 'number') {
+        current_count = Math.max(current_count, resp.current_count);
+      }
     }
     return {
       publishes,
+      current_count,
       subscribers,
       deliveries,
       pulls,
