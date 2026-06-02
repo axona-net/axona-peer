@@ -1859,9 +1859,19 @@ export class AxonaManager {
   _maybeRespondMetrics(payload, role, topicIdBig) {
     const { postHashes, requesterId, requestId } = payload;
     const requesterBig = _wire(requesterId);
-    // §4.7 self-authenticating ownership check.
+    // Ownership gate. A topic is "owned" only when it is anchored at a real
+    // identity — a publisher nodeId whose low 256 bits are the SHA-256 of a
+    // pubkey. Two anchor shapes are therefore UNOWNED, and their metrics are
+    // readable by anyone:
+    //   · public topics      — null publisher (top byte 0x00, no anchor);
+    //   · synthetic regional  — `prefix || 0^256` (e.g. region-keyed topics).
+    //     No key can hash to all-zero, so no node can ever own or unpub them.
+    // Owned topics stay owner-only (self-authenticating: only the node whose
+    // id IS the publisher anchor may read their metrics).
     const samplePost = role.replayCache?.[0];
-    if (samplePost && samplePost.publisher && samplePost.publisher !== requesterBig) {
+    const anchor = samplePost?.publisher ?? null;          // BigInt | null
+    const owned  = anchor !== null && (anchor & ((1n << 256n) - 1n)) !== 0n;
+    if (owned && anchor !== requesterBig) {
       return false;
     }
     const byTopic = this._counters.get(topicIdBig) || new Map();
