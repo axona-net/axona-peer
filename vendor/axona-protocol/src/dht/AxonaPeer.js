@@ -409,6 +409,53 @@ export class AxonaPeer extends DHT {
     transport.onNotification('hop_cache',      hopCacheHandler);
     transport.onNotification('lateral_spread', hopCacheHandler);
 
+    // ── peer-leaving — graceful-departure fast path ─────────────────
+    // A peer (e.g. the bridge on a `systemctl restart`) announces that
+    // it is shutting down cleanly.  Today recovery from any departure is
+    // purely *reactive*: the transport close is detected, the synapse is
+    // evicted, the K-closest cache is invalidated — but existing
+    // subscriptions only re-anchor on the next refreshTick (≤10 s).  For
+    // a super-central node like the bridge (in every synaptome, root for
+    // every us-east/* topic) that 10 s window is when pub/sub visibly
+    // stalls across the mesh.
+    //
+    // Acting on the announcement turns that into a *proactive* sub-second
+    // handoff: drop the departing peer now and immediately re-anchor our
+    // subscriptions/roles onto the converged set that excludes it, a beat
+    // before its socket actually closes.
+    //
+    // Security: the subject of the eviction is `fromId` — the
+    // transport-AUTHENTICATED origin of the notification (the bridge
+    // transport delivers its bound nodeId; mesh delivers the bound peer
+    // id).  A peer can therefore only announce *its own* departure; it
+    // cannot spoof `peer-leaving` for a third party to force-evict it
+    // (payload.from is advisory and deliberately ignored).  The handler
+    // is also idempotent — once the subject is gone the repeat path
+    // early-returns before re-anchoring, so it can't be used as a
+    // refreshTick-amplification lever.  Additive + backward-compatible:
+    // peers that never receive this behave exactly as before.
+    transport.onNotification('peer-leaving', (fromId, _payload) => {
+      try {
+        let leaving =
+          (typeof fromId === 'bigint')                  ? fromId :
+          (typeof fromId === 'string' && isHexId(fromId)) ? fromHex(fromId) : null;
+        if (leaving === null && typeof transport.nodeIdFor === 'function') {
+          try { const r = transport.nodeIdFor(fromId); if (typeof r === 'bigint') leaving = r; }
+          catch { /* unresolved channel → ignore */ }
+        }
+        if (leaving === null) return;                 // can't authenticate subject
+        const node = this._node;
+        if (!node?.synaptome?.has(leaving)) return;   // not (or no longer) our peer
+        node.synaptome.delete(leaving);
+        node.connections?.delete(leaving);
+        try { node.transport?.closeConnection?.(leaving); } catch { /* dying channel */ }
+        this._emitLog?.('info', 'peer-leaving', { from: toHex(leaving) });
+        // Re-anchor now rather than waiting for the 10 s refreshTick.
+        this._axonaManager?.invalidateKClosestCache?.();
+        Promise.resolve(this._axonaManager?.refreshTick?.()).catch(() => {});
+      } catch { /* best-effort resilience path */ }
+    });
+
     // ── Phase 7 handlers ────────────────────────────────────────────
 
     // ── local_probe — 2-hop neighbourhood for anneal / dead-replace ─
@@ -661,8 +708,15 @@ export class AxonaPeer extends DHT {
     if (!this._started) return;
     const selfId = this._nodeIdHex();
 
-    // (1) notify peers (fire-and-forget, bounded by drain window)
-    if (notify && this._transport && typeof this._transport.notify === 'function') {
+    // (1) notify peers (fire-and-forget, bounded by drain window).
+    // Resolve the transport the same way the routing path does: prefer
+    // the constructor-supplied transport, else node.transport.  Hosts
+    // like the bridge wire their transport onto node.transport (not the
+    // constructor opt), so without this fallback leave() would silently
+    // skip the announcement and the graceful-departure handoff would
+    // never fire on a bridge restart.
+    const announceVia = this._transport ?? this._node?.transport;
+    if (notify && announceVia && typeof announceVia.notify === 'function') {
       // peers() returns hex (display); convert to BigInt for the
       // transport contract.  The wire `from` field stays hex.
       const peers = this.peers();
@@ -671,7 +725,7 @@ export class AxonaPeer extends DHT {
         // don't tunnel through 'axona:direct'; this is a transport-
         // level signal, not an application message.
         try {
-          await this._transport.notify(fromHex(peerHex), 'peer-leaving', { from: selfId });
+          await announceVia.notify(fromHex(peerHex), 'peer-leaving', { from: selfId });
         } catch { /* swallow — best-effort */ }
       }
     }
