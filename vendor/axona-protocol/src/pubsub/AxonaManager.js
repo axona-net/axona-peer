@@ -254,6 +254,7 @@ export class AxonaManager {
     dht.onDirectMessage('pubsub:unsubscribe-k',(p, m) => this._onUnsubscribeDirect(p, m));
     // ── Post-level metrics.
     dht.onRoutedMessage('pubsub:metricsReq',       (p, m) => this._onMetricsReq(p, m));
+    dht.onDirectMessage('pubsub:metricsReq-k',     (p, m) => this._onMetricsReqDirect(p, m));
     dht.onDirectMessage('pubsub:metricsBroadcast', (p, m) => this._onMetricsBroadcast(p, m));
     dht.onDirectMessage('pubsub:metricsResp',      (p, m) => this._onMetricsResp(p, m));
     // ── Pull (on-demand fetch by post_hash) and reshare notifications.
@@ -1856,8 +1857,14 @@ export class AxonaManager {
    * Wire fields are hex; payload comes in raw and we don't pre-convert
    * here (we only need topicId BigInt for the counter lookup).
    */
-  _maybeRespondMetrics(payload, role, topicIdBig) {
-    const { postHashes, requesterId, requestId } = payload;
+  /**
+   * Build this relay's metrics response for a request, or null if the
+   * access gate denies it.  Pure (no I/O) so the requester can also call
+   * it locally when it is itself one of the K roots, instead of routing a
+   * response to itself.
+   */
+  _buildMetricsResp(payload, role, topicIdBig) {
+    const { postHashes, requesterId } = payload;
     const requesterBig = _wire(requesterId);
     // Ownership gate. A topic is "owned" only when it is anchored at a real
     // identity — a publisher nodeId whose low 256 bits are the SHA-256 of a
@@ -1872,7 +1879,7 @@ export class AxonaManager {
     const anchor = samplePost?.publisher ?? null;          // BigInt | null
     const owned  = anchor !== null && (anchor & ((1n << 256n) - 1n)) !== 0n;
     if (owned && anchor !== requesterBig) {
-      return false;
+      return null;
     }
     const byTopic = this._counters.get(topicIdBig) || new Map();
     const wantedHashes = (postHashes && postHashes.length > 0)
@@ -1883,14 +1890,20 @@ export class AxonaManager {
       const c = byTopic.get(h);
       if (c) entries.push({ ...c });
     }
-    this.dht.sendDirect(requesterBig, 'pubsub:metricsResp', {
-      requestId,
-      responderId: toHex(this.nodeId),
+    return {
+      requestId:     payload.requestId,
+      responderId:   toHex(this.nodeId),
       entries,
       current_count: this._liveCacheCount(role),
       subscribers:   role.children?.size ?? 0,
-      timestamp: this._now(),
-    });
+      timestamp:     this._now(),
+    };
+  }
+
+  _maybeRespondMetrics(payload, role, topicIdBig) {
+    const resp = this._buildMetricsResp(payload, role, topicIdBig);
+    if (!resp) return false;
+    this.dht.sendDirect(_wire(payload.requesterId), 'pubsub:metricsResp', resp);
     return true;
   }
 
@@ -1924,6 +1937,26 @@ export class AxonaManager {
     return 'consumed';
   }
 
+  /**
+   * Direct metricsReq from a requester that fanned out to the whole
+   * K-closest root set (pubsub:metricsReq-k), mirroring how publishes
+   * replicate.  Same response + child-broadcast as the routed handler,
+   * deduped by requestId so a root that also receives the routed walk or
+   * a sibling's broadcast answers exactly once.
+   */
+  _onMetricsReqDirect(payload, meta) {
+    const topicId = _wire(payload.topicId);
+    const { requestId } = payload;
+    const role = this.axonRoles.get(topicId);
+    if (!role) return;
+    if (this._markMetricsReqSeen(requestId)) return;
+    if (!this._maybeRespondMetrics(payload, role, topicId)) return;
+    for (const [childId] of role.children) {
+      if (childId === this.nodeId) continue;
+      this.dht.sendDirect(childId, 'pubsub:metricsBroadcast', payload);
+    }
+  }
+
   _onMetricsBroadcast(payload, meta) {
     const topicId = _wire(payload.topicId);
     const { requestId } = payload;
@@ -1942,10 +1975,10 @@ export class AxonaManager {
   }
 
   _onMetricsResp(payload, meta) {
-    const { requestId, responderId, entries, current_count } = payload;
+    const { requestId, responderId, entries, current_count, subscribers } = payload;
     const pending = this._pendingMetricsReqs.get(requestId);
     if (!pending) return;
-    pending.accumulated.push({ responderId, entries, current_count });
+    pending.accumulated.push({ responderId, entries, current_count, subscribers });
   }
 
   // ── Pull (on-demand fetch by post_hash) ─────────────────────────────
@@ -2048,20 +2081,64 @@ export class AxonaManager {
    * Publisher-side: issue a MetricsRequest.
    * @param {bigint} topicId
    */
-  requestMetrics(topicId, postHashes, { timeoutMs = 500 } = {}) {
+  async requestMetrics(topicId, postHashes, { timeoutMs = 500 } = {}) {
     if (typeof topicId !== 'bigint') {
       throw new TypeError(`AxonaManager.requestMetrics: topicId must be bigint, got ${typeof topicId}`);
     }
-    const requestId = `${this.nodeId}:m${++this._metricsCounter}`;
+    const requestId  = `${this.nodeId}:m${++this._metricsCounter}`;
+    const reqPayload = {
+      topicId:     toHex(topicId),
+      postHashes:  postHashes ?? null,
+      requesterId: toHex(this.nodeId),
+      requestId,
+    };
+    const pending = { accumulated: [] };
+    this._pendingMetricsReqs.set(requestId, pending);
+
+    // Query the FULL K-closest root set directly — the same set publishes
+    // replicate to (pubsub:publish-k) — rather than a single routed walk
+    // that reaches only ONE root plus its subscriber-children.  Each root
+    // answers with its own live cache count + subscriber count; the caller
+    // aggregates with max.  Without this, the request lands on whichever
+    // node is globally closest to the topicId, whose replayCache may be
+    // empty or diverged while sibling roots (and the replay-on-subscribe
+    // path) hold the queue — the "current_count: 0 even though a new
+    // subscriber gets a full replay" bug.
+    if (this._useKClosestMode()) {
+      const roots = await this._findKClosest(topicId, this.rootSetSize);
+      for (const target of roots) {
+        if (target === this.nodeId) {
+          // Self is a root: fold in our own cache locally rather than
+          // round-tripping a response to ourselves.  Mark seen so the
+          // routed walk below (if it lands here) doesn't double-count.
+          const role = this.axonRoles.get(topicId);
+          if (role && !this._markMetricsReqSeen(requestId)) {
+            const resp = this._buildMetricsResp(reqPayload, role, topicId);
+            if (resp) {
+              pending.accumulated.push({
+                responderId:   resp.responderId,
+                entries:       resp.entries,
+                current_count: resp.current_count,
+                subscribers:   resp.subscribers,
+              });
+              for (const [childId] of role.children) {
+                if (childId === this.nodeId) continue;
+                this.dht.sendDirect(childId, 'pubsub:metricsBroadcast', reqPayload);
+              }
+            }
+          }
+          continue;
+        }
+        this.dht.sendDirect(target, 'pubsub:metricsReq-k', reqPayload);
+      }
+    }
+
+    // Routed walk too: backward-compat with roots that predate
+    // metricsReq-k, and a safety net when our K-closest view is stale.
+    // Dedup by requestId means a root that receives both answers once.
+    this.dht.routeMessage(topicId, 'pubsub:metricsReq', reqPayload);
+
     return new Promise(resolve => {
-      const pending = { accumulated: [] };
-      this._pendingMetricsReqs.set(requestId, pending);
-      this.dht.routeMessage(topicId, 'pubsub:metricsReq', {
-        topicId:     toHex(topicId),
-        postHashes:  postHashes ?? null,
-        requesterId: toHex(this.nodeId),
-        requestId,
-      });
       setTimeout(() => {
         this._pendingMetricsReqs.delete(requestId);
         resolve(pending.accumulated);
