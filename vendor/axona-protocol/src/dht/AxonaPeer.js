@@ -44,9 +44,10 @@ import { clz264, toHex, fromHex, isHexId } from '../utils/hexid.js';
 import { deriveTopicId, deriveTopicIdBig } from '../pubsub/post.js';
 import { buildEnvelope }  from '../pubsub/envelope.js';
 import { buildKill }      from '../pubsub/kill.js';
+import { buildTouch }     from '../pubsub/touch.js';
 import { buildUnpub }     from '../pubsub/unpub.js';
 import { AxonaManager, MAX_PUBLISH_BYTES } from '../pubsub/AxonaManager.js';
-import { PublishError, SubscribeError, KillError, UnpubError, PullError, MetricsError, ErrorCodes } from '../errors.js';
+import { PublishError, SubscribeError, KillError, UnpubError, TouchError, PullError, MetricsError, ErrorCodes } from '../errors.js';
 
 // ── B-3 (eclipse prevention) tunables ───────────────────────────────
 // Max concurrent verification probes triggered by gossip introductions —
@@ -1344,6 +1345,66 @@ export class AxonaPeer extends DHT {
     }
 
     am.pubsubKill(topicIdBig, kill);
+    return { ok: true };
+  }
+
+  /**
+   * Touch a message (Phase A #7) — a creator-only keep-alive.  Signed by the
+   * same identity that published the message; routed to the topic's K-closest
+   * roots, each of which (if it holds the message) resets the message's
+   * hold-time expiry to `now + hold` (bounded by its absolute 48h ceiling),
+   * moves it to the head of the replay queue, and makes it the last entry to
+   * be evicted.  Use it to keep a still-relevant message (a pinned status, a
+   * current value) alive past its default hold without re-publishing.
+   *
+   * Self-authenticating, exactly like `kill`: only the message's signer can
+   * touch it.  Anonymous (unsigned) messages can't be touched.
+   *
+   * @param {string} topic   the topic the message was published to
+   * @param {string} msgId   64-char hex (the value `pub` returned)
+   * @param {object} [opts]
+   * @param {string|null} [opts.publisher]  same addressing mode used for pub
+   * @returns {Promise<{ ok: true }>}
+   */
+  async touch(topic, msgId, opts = {}) {
+    if (typeof topic !== 'string' || topic.length === 0) {
+      throw new TouchError(ErrorCodes.TOUCH_INVALID_TOPIC,
+        `peer.touch: topic must be a non-empty string, got ${typeof topic}`,
+        { context: { topic } });
+    }
+    if (typeof msgId !== 'string' || !/^[0-9a-f]{64}$/.test(msgId)) {
+      throw new TouchError(ErrorCodes.TOUCH_INVALID_MSGID,
+        `peer.touch: msgId must be a 64-char hex string (the value peer.pub returned)`,
+        { context: { topic, msgId } });
+    }
+    if (!this._identity) {
+      throw new TouchError(ErrorCodes.TOUCH_SIGN_FAILED,
+        'peer.touch: identity required — a touch must be signed by the message creator',
+        { context: { topic } });
+    }
+    const am           = this._requireAxonaManager('touch');
+    const publisherId  = 'publisher' in opts ? opts.publisher : this._nodeIdHex();
+    const publisherBig = publisherId === null ? null : fromHex(publisherId);
+    const topicIdBig   = await deriveTopicIdBig(publisherBig, topic);
+    const topicIdHex   = publisherBig === null
+      ? await deriveTopicId(null, topic)
+      : await deriveTopicId(publisherId, topic);
+
+    let touch;
+    try {
+      touch = await buildTouch({
+        topicId: topicIdHex,
+        msgId,
+        seq:      this._nextPubSeq(),
+        identity: this._identity,
+      });
+    } catch (cause) {
+      throw new TouchError(ErrorCodes.TOUCH_SIGN_FAILED,
+        `peer.touch: signing the touch failed (${cause.message})`,
+        { cause, context: { topic, msgId } });
+    }
+
+    am.pubsubTouch(topicIdBig, touch);
     return { ok: true };
   }
 

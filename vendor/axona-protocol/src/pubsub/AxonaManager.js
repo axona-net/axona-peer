@@ -41,6 +41,7 @@
 import { toHex, fromHex, isHexId } from '../utils/hexid.js';
 import { verifyEnvelope, checkFreshness, MAX_PUBLISH_SKEW_MS } from './envelope.js';
 import { verifyKill } from './kill.js';
+import { verifyTouch } from './touch.js';
 import { verifyUnpub } from './unpub.js';
 import { deriveTopicId, sha256Hex } from './post.js';
 
@@ -187,6 +188,10 @@ export class AxonaManager {
     this._tombstones  = new Map();       // msgId(hex) -> expiresAt (ms)
     this._seenKills   = new Map();       // kill.signature -> insertedAt (ms)
     this._seenKillCap = 4096;
+    // Phase A #7 (touch): dedup set for touch objects already processed
+    // (keyed by the touch's signature), same bound as kills.
+    this._seenTouches   = new Map();     // touch.signature -> insertedAt (ms)
+    this._seenTouchCap  = 4096;
 
     // Exactly-once gate for delivery to the LOCAL application callback.
     // Deliberately SEPARATE from `_seenPublishes`: that set means "this
@@ -241,6 +246,8 @@ export class AxonaManager {
     dht.onRoutedMessage('pubsub:publish',      (p, m) => this._onPublish(p, m));
     dht.onRoutedMessage('pubsub:kill',         (p, m) => this._onKill(p, m));
     dht.onDirectMessage('pubsub:kill-k',       (p, m) => this._onKillDirect(p, m));
+    dht.onRoutedMessage('pubsub:touch',        (p, m) => this._onTouch(p, m));
+    dht.onDirectMessage('pubsub:touch-k',      (p, m) => this._onTouchDirect(p, m));
     dht.onRoutedMessage('pubsub:unpub',        (p, m) => this._onUnpub(p, m));
     dht.onDirectMessage('pubsub:unpub-k',      (p, m) => this._onUnpubDirect(p, m));
     dht.onDirectMessage('pubsub:deliver',      (p, m) => this._onDeliver(p, m));
@@ -374,6 +381,42 @@ export class AxonaManager {
     }
     // Axonal/routed fallback.
     this.dht.routeMessage(topicId, 'pubsub:kill', payload);
+  }
+
+  /**
+   * Touch a message (Phase A #7) — creator-only keep-alive.  Routes the signed
+   * `touch` to the topic's K-closest roots (mirrors `_asyncKill`); each root
+   * that holds the message resets its hold-time expiry (bounded by the 48h
+   * ceiling), moves it to the head of the replay queue, and bumps its eviction
+   * recency.  Fire-and-forget.
+   *
+   * @param {bigint} topicId
+   * @param {object} touch   signed touch object (see pubsub/touch.js).
+   */
+  pubsubTouch(topicId, touch) {
+    if (typeof topicId !== 'bigint') {
+      throw new TypeError(`AxonaManager.pubsubTouch: topicId must be bigint, got ${typeof topicId}`);
+    }
+    this._asyncTouch(topicId, touch)
+      .catch(err => console.error('AxonaManager: touch failed:', err));
+  }
+
+  /** @private — route the touch to K-closest roots (mirrors _asyncKill). */
+  async _asyncTouch(topicId, touch) {
+    const topicIdHex = toHex(topicId);
+    const payload = { topicId: topicIdHex, touch };
+    if (this._useKClosestMode()) {
+      const roots = await this._findKClosest(topicId, this.rootSetSize);
+      if (roots.length > 0) {
+        for (const target of roots) this.dht.sendDirect(target, 'pubsub:touch-k', payload);
+        // Apply locally too if we're one of the roots (sendDirect to self may
+        // be a no-op on some transports).
+        if (roots.includes(this.nodeId)) this._handleTouch(topicId, touch);
+        return;
+      }
+    }
+    // Axonal/routed fallback.
+    this.dht.routeMessage(topicId, 'pubsub:touch', payload);
   }
 
   /**
@@ -743,6 +786,80 @@ export class AxonaManager {
     }
     for (const d of dead) role.children.delete(d);
     this._emitLog?.('debug', 'kill-applied', { topicId: topicIdHex, msgId: kill.msgId });
+    return 'consumed';
+  }
+
+  // ── Touch (creator-only keep-alive, Phase A #7) ────────────────────────
+
+  /** Routed touch ingress.  Returns a routing verdict ('consumed'|'forward'). */
+  async _onTouch(payload, meta) {
+    return this._handleTouch(_wire(payload.topicId), payload?.touch);
+  }
+
+  /** Direct (K-closest) touch ingress.  We're a targeted root; verdict unused. */
+  async _onTouchDirect(payload, meta) {
+    await this._handleTouch(_wire(payload.topicId), payload?.touch);
+  }
+
+  /**
+   * Core touch handler (shared by routed + direct paths).  Verifies the touch
+   * signature + freshness, dedups, then — if we host the topic and hold the
+   * target message — checks the touch signer matches the MESSAGE signer
+   * (creator-only) and refreshes the entry: resets its hold-time expiry to
+   * `now + hold` (bounded by the absolute 48h ceiling, so a touch can never
+   * pin a message past the cap a pull also respects), bumps its eviction
+   * recency, and moves it to the head of the replay queue.  Self-authenticating:
+   * the right to keep a message alive IS authorship.
+   *
+   * @returns {Promise<'consumed'|'forward'>}
+   */
+  async _handleTouch(topicId, touch) {
+    // 1. signature.
+    let v;
+    try { v = await verifyTouch(touch); } catch { v = { ok: false }; }
+    if (!v.ok) { this._emitLog?.('debug', 'touch-bad-signature-dropped', {}); return 'consumed'; }
+    // 2. freshness on the touch's OWN ts (anti-replay of the touch).
+    if (!checkFreshness(touch, { now: this._now() }).ok) {
+      this._emitLog?.('debug', 'touch-stale-dropped', {}); return 'consumed';
+    }
+    // 3. dedup by touch signature.
+    if (this._seenTouches.has(touch.signature)) return 'consumed';
+    this._seenTouches.set(touch.signature, this._now());
+    if (this._seenTouches.size > this._seenTouchCap) {
+      const toDrop = this._seenTouchCap / 2; let i = 0;
+      for (const k of this._seenTouches.keys()) { if (i++ >= toDrop) break; this._seenTouches.delete(k); }
+    }
+    // 4. do we host the topic?
+    const role = this.axonRoles.get(topicId);
+    if (!role) return 'forward';                       // not hosting → route onward to a root
+    // 5. find the target message in our replay cache.
+    const cache = role.replayCache || [];
+    const idx   = cache.findIndex(e => e.postHash === touch.msgId);
+    if (idx === -1) return 'forward';                  // not here (yet/anymore) → let a root with it act
+    // 6. authorize: the touch signer MUST be the message signer (creator-only).
+    let env = null;
+    try { env = JSON.parse(cache[idx].json); } catch { /* unparseable */ }
+    const msgSigner = (env && typeof env.signerPubkey === 'string') ? env.signerPubkey : null;
+    if (!msgSigner || msgSigner !== touch.signerPubkey) {
+      this._emitLog?.('debug', 'touch-unauthorized-dropped', { msgId: touch.msgId });
+      return 'consumed';                               // wrong signer (or unsigned msg) → reject
+    }
+    // 7. keep-alive: reset hold (bounded by ceiling), bump recency, move to head.
+    const entry  = cache[idx];
+    const now    = this._now();
+    const holdMs = Math.min(role.maxHoldMs || DEFAULT_HOLD_MS, MAX_HOLD_MS);
+    if (typeof entry.ceilingAt !== 'number') {
+      entry.ceilingAt = (typeof entry.ts === 'number' ? entry.ts : now) + MAX_HOLD_MS;
+    }
+    entry.expiresAt = Math.min(now + holdMs, entry.ceilingAt);
+    // `touchedTs` is the touch's SIGNED ts (== now at the publisher); it
+    // dominates eviction ordering (see _orderLt) so a touched message is
+    // evicted last, and is identical across all K roots that apply the same
+    // touch — keeping replicas convergent.
+    entry.touchedTs = touch.ts;
+    cache.splice(idx, 1);
+    cache.unshift(entry);
+    this._emitLog?.('debug', 'touch-applied', { topicId: toHex(topicId), msgId: touch.msgId });
     return 'consumed';
   }
 
@@ -1220,6 +1337,13 @@ export class AxonaManager {
 
   /** True iff entry `a` is strictly lower-ordered (older) than `b`. */
   _orderLt(a, b) {
+    // Phase A #7: a touched (kept-alive) entry always outranks an untouched
+    // one, and among touched entries the more-recently-touched outranks — so
+    // `touch` moves a message to the head of the queue and makes it the LAST
+    // to be evicted. `touchedTs` is the touch's signed ts (identical across
+    // replicas); untouched entries are 0, preserving prior ordering.
+    const ka = a.touchedTs ?? 0, kb = b.touchedTs ?? 0;
+    if (ka !== kb) return ka < kb;
     const sa = a.seq ?? 0, sb = b.seq ?? 0;
     if (sa !== sb) return sa < sb;
     const ta = a.ts ?? 0, tb = b.ts ?? 0;
@@ -1528,11 +1652,20 @@ export class AxonaManager {
     // D-1: cap the inbound replay batch (a legit batch is ≤ replay cache).
     const batch = messages.slice(0, MAX_REPLAY_BATCH);
     for (const msg of batch) {
-      const { json, publishId, publishTs } = msg;
+      const { json, publishId, publishTs, postHash, publisher } = msg;
       if (this._alreadySeenPublish(publishId)) continue;
+      // Phase A #2: never resurrect a killed message. A lagging replica may
+      // still carry it in the batch it replays; without this guard a kill
+      // could be undone the next time some relay replays its stale cache.
+      if (postHash && this._isTombstoned(postHash)) continue;
       this._recordReceived(topicId, publishId, publishTs);
       const role = this.axonRoles.get(topicId);
-      if (role) this._addToReplayCache(role, { json, publishId, publishTs });
+      // Preserve postHash (and publisher) so a copy acquired via replay stays
+      // addressable: kill() and pull() match on postHash, and the metrics
+      // ownership gate samples publisher. Dropping them here made replay-
+      // acquired entries silently unkillable / unpullable — they would be
+      // re-served to future subscribers even after a successful kill.
+      if (role) this._addToReplayCache(role, { json, publishId, publishTs, postHash, publisher });
       this._deliverToApp(topicId, json, publishId, publishTs);
     }
   }

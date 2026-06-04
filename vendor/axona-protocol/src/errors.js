@@ -112,6 +112,16 @@ export class UnpubError extends AxonaError {
 }
 
 /**
+ * Touch (creator-only keep-alive) failed — no identity to sign, a malformed
+ * msgId, etc.  Like kill, a touch must be signed by the message creator; a
+ * network that simply can't authorize the touch is not a local error.
+ * TouchError is for local/programmer faults only.
+ */
+export class TouchError extends AxonaError {
+  constructor(code, message, opts) { super(code, message, opts); }
+}
+
+/**
  * Pull failed — msgId not in cache window, K-closest set unreachable,
  * malformed msgId, etc.  Note: cache-miss for a msgId older than the
  * replay window is NOT an error — `pull()` returns null in that case.
@@ -178,6 +188,10 @@ export const ErrorCodes = Object.freeze({
   UNPUB_INVALID_TOPIC:       'UNPUB_INVALID_TOPIC',
   UNPUB_PUBLIC_TOPIC:        'UNPUB_PUBLIC_TOPIC',
   UNPUB_SIGN_FAILED:         'UNPUB_SIGN_FAILED',
+
+  TOUCH_INVALID_TOPIC:       'TOUCH_INVALID_TOPIC',
+  TOUCH_INVALID_MSGID:       'TOUCH_INVALID_MSGID',
+  TOUCH_SIGN_FAILED:         'TOUCH_SIGN_FAILED',
 
   // Pull
   PULL_INVALID_MSGID:        'PULL_INVALID_MSGID',

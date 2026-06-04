@@ -25,6 +25,7 @@ export {
   SubscribeError,
   KillError,
   UnpubError,
+  TouchError,
   PullError,
   MetricsError,
   UpgradeRequiredError,
@@ -123,6 +124,11 @@ export {
   verifyKill,
   KILL_DOMAIN,
 } from './pubsub/kill.js';
+export {
+  buildTouch,
+  verifyTouch,
+  TOUCH_DOMAIN,
+} from './pubsub/touch.js';
 export {
   buildUnpub,
   verifyUnpub,
