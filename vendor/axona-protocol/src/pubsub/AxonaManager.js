@@ -836,16 +836,33 @@ export class AxonaManager {
     const cache = role.replayCache || [];
     const idx   = cache.findIndex(e => e.postHash === touch.msgId);
     if (idx === -1) return 'forward';                  // not here (yet/anymore) → let a root with it act
-    // 6. authorize: the touch signer MUST be the message signer (creator-only).
-    let env = null;
-    try { env = JSON.parse(cache[idx].json); } catch { /* unparseable */ }
-    const msgSigner = (env && typeof env.signerPubkey === 'string') ? env.signerPubkey : null;
-    if (!msgSigner || msgSigner !== touch.signerPubkey) {
-      this._emitLog?.('debug', 'touch-unauthorized-dropped', { msgId: touch.msgId });
-      return 'consumed';                               // wrong signer (or unsigned msg) → reject
+    // 6. authorize by TOPIC OWNERSHIP (not message authorship).  A topic is
+    //    "owned" iff its anchor is a real identity — a publisher nodeId whose
+    //    low 256 bits are sha256(pubkey).  Two anchor shapes are UNOWNED:
+    //    public topics (null anchor) and synthetic regional anchors
+    //    (`prefix‖0^256`).  The rule the app asked for:
+    //      · unowned topic → ANYONE may touch (any valid, fresh, signed touch);
+    //      · owned topic   → only the OWNER may — the touch signer's pubkey must
+    //        hash to the anchor's 256-bit suffix (the same pubkey↔nodeId bind
+    //        `unpub` uses; the 8-bit geo prefix is the owner's own choice, so
+    //        only the suffix is checked).
+    const entry  = cache[idx];
+    const LOW256 = (1n << 256n) - 1n;
+    const anchor = (typeof entry.publisher === 'bigint') ? entry.publisher : null;
+    const owned  = anchor !== null && (anchor & LOW256) !== 0n;
+    if (owned) {
+      let pubSuffix = null;
+      try {
+        const pkBytes = new Uint8Array((touch.signerPubkey.match(/../g) || []).map(h => parseInt(h, 16)));
+        pubSuffix = await sha256Hex(pkBytes);
+      } catch { /* malformed pubkey */ }
+      const ownerSuffix = (anchor & LOW256).toString(16).padStart(64, '0');
+      if (!pubSuffix || pubSuffix !== ownerSuffix) {
+        this._emitLog?.('debug', 'touch-not-owner-dropped', { msgId: touch.msgId });
+        return 'consumed';                             // not the owner of an owned topic → reject
+      }
     }
     // 7. keep-alive: reset hold (bounded by ceiling), bump recency, move to head.
-    const entry  = cache[idx];
     const now    = this._now();
     const holdMs = Math.min(role.maxHoldMs || DEFAULT_HOLD_MS, MAX_HOLD_MS);
     if (typeof entry.ceilingAt !== 'number') {

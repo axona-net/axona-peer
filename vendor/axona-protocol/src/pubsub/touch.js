@@ -1,13 +1,20 @@
 // =====================================================================
-// touch.js — the signed "touch" object: creator-only keep-alive
+// touch.js — the signed "touch" object: keep-alive, gated by TOPIC OWNERSHIP
 //            (Phase A #7).
 //
-// A touch names a single published message (topicId + msgId) and is signed
-// by the SAME key that signed the original message.  A topic's root axons
-// verify the touch's signature, then check `signerPubkey` matches the
-// signer of the cached message — so only the original creator can refresh
-// it.  No central authority: the right to keep a message alive is proven by
-// the same keypair that proved authorship (the mirror of `kill`).
+// A touch names a single published message (topicId + msgId) and is always
+// signed (for freshness / replay protection).  A topic's root axons verify
+// the signature, then authorize by **topic ownership** (see
+// AxonaManager._handleTouch):
+//   · OPEN topic (ownerless — a public topic, or a synthetic regional anchor
+//     `prefix‖0^256`): ANYONE may touch — any valid, fresh, signed touch is
+//     accepted.
+//   · OWNED topic (anchored at a real identity): only the OWNER may — the
+//     touch signer's pubkey must hash to the owner anchor's 256-bit suffix
+//     (the same pubkey↔nodeId bind `unpub` uses; the 8-bit geo prefix is the
+//     owner's own choice, so only the suffix is checked).
+// No central authority: the right to keep a message alive is proven by the
+// owning keypair (owned topics) or open to all (ownerless topics).
 //
 // Applying a touch on a root that holds the message:
 //   · resets the message's hold-time expiry to `now + hold`, BOUNDED by its
@@ -29,8 +36,10 @@
 // re-injected later, and `ts` is the recency stamped onto the entry.
 // `signerPubkey` is the 64-char-hex Ed25519 public key.
 //
-// Anonymous (unsigned) messages have no provable creator, so they cannot be
-// touched — there is no signerPubkey to match.
+// Authorization is by topic, not message authorship: a message published
+// anonymously to an OPEN topic is still touchable (anyone may), while on an
+// OWNED topic only the owner may touch — regardless of who authored the
+// individual message.
 // =====================================================================
 
 import { canonical }                        from './post.js';

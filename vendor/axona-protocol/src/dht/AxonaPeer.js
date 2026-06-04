@@ -1349,16 +1349,19 @@ export class AxonaPeer extends DHT {
   }
 
   /**
-   * Touch a message (Phase A #7) — a creator-only keep-alive.  Signed by the
-   * same identity that published the message; routed to the topic's K-closest
-   * roots, each of which (if it holds the message) resets the message's
-   * hold-time expiry to `now + hold` (bounded by its absolute 48h ceiling),
-   * moves it to the head of the replay queue, and makes it the last entry to
-   * be evicted.  Use it to keep a still-relevant message (a pinned status, a
-   * current value) alive past its default hold without re-publishing.
+   * Touch a message (Phase A #7) — a keep-alive gated by TOPIC OWNERSHIP.
+   * Always signed (for freshness); routed to the topic's K-closest roots,
+   * each of which (if it holds the message) resets the message's hold-time
+   * expiry to `now + hold` (bounded by its absolute 48h ceiling), moves it to
+   * the head of the replay queue, and makes it the last entry to be evicted.
+   * Use it to keep a still-relevant message (a pinned status, a current value)
+   * alive past its default hold without re-publishing.
    *
-   * Self-authenticating, exactly like `kill`: only the message's signer can
-   * touch it.  Anonymous (unsigned) messages can't be touched.
+   * Authority is self-authenticating and by topic, not by message authorship:
+   * on an **open** topic (public, or a synthetic regional anchor) **anyone**
+   * may touch; on an **owned** topic only the **owner** may (the touch signer's
+   * pubkey must hash to the owner's nodeId suffix). Pass the same `publisher`
+   * you published under so the right topic id is derived.
    *
    * @param {string} topic   the topic the message was published to
    * @param {string} msgId   64-char hex (the value `pub` returned)
