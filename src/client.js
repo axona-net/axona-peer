@@ -99,9 +99,13 @@ const $subList        = document.getElementById('sub-list');
 function getBridgeUrl() {
   const fromQs = new URLSearchParams(location.search).get('bridge');
   if (fromQs) return fromQs;
-  // Default bridge: the project-operated public introducer.  Override
-  // via ?bridge=ws://localhost:8080 for local development against a
-  // bridge running on your own machine.
+  // The SF testnet droplet serves this app AND fronts its bridge at the same
+  // origin (testnet.axona.net), so default to the same-origin bridge there.
+  // This keeps release/2.28.0 dual-purpose: served from testnet.axona.net it
+  // targets the testnet; served from axona.net (the prod flag-day) it targets
+  // the production introducer. Override either with ?bridge=ws://localhost:8080
+  // for local dev.
+  if (location.hostname === 'testnet.axona.net') return 'wss://testnet.axona.net';
   return 'wss://bridge.axona.net';
 }
 const bridgeUrl = getBridgeUrl();
