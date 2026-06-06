@@ -57,6 +57,30 @@ const MAX_VERIFY_PROBES = 8;
 // Max peers disclosed by a single local_probe reply (D-4): enough for an
 // honest annealing/dead-replace pick, too few to cheaply map the mesh.
 const LOCAL_PROBE_MAX   = 8;
+// Peer-relayed signaling: how long a "target is reachable over the mesh"
+// verdict (from the iterative lookup, per Peer-Relayed-Signaling §8b
+// finding 6) stays cached, so per-ICE-candidate signal frames within one
+// negotiation don't each pay a full lookup.
+const RELAY_REACH_TTL_MS = 5000;
+// Memory bounds for two caches that the TTL/threshold logic alone does NOT
+// bound by entry COUNT: the relay-reachability verdict cache keeps one entry
+// per distinct peer-id ever checked (TTL only gates freshness, never evicts),
+// and the triadic transit cache keeps one entry per (origin,next) pair that
+// never reaches TRIADIC_THRESHOLD. Both leak slowly on a churny/large mesh.
+const RELAY_REACH_CAP   = 1024;
+const TRANSIT_CACHE_CAP = 4096;
+
+/** Evict the oldest-inserted half of a Map once it exceeds `cap` (cheap FIFO
+ *  bound for caches whose entries are individually cheap to recompute). */
+function capOldest(map, cap) {
+  if (map.size <= cap) return;
+  const drop = cap / 2;
+  let i = 0;
+  for (const k of map.keys()) {
+    if (i++ >= drop) break;
+    map.delete(k);
+  }
+}
 
 export class AxonaPeer extends DHT {
   /**
@@ -237,6 +261,16 @@ export class AxonaPeer extends DHT {
       this._installRoutingHandlers();
     }
 
+    // Peer-relayed signaling (bridgeless connect): if the transport exposes
+    // a signal-relay hook (the web transport, when meshRelay is enabled),
+    // register our routed delivery as the relay sink.  The transport's
+    // sendSignal then prefers routing SDP/ICE through the mesh over the
+    // bridge.  Transports without this hook (sim/node) are unaffected.
+    const relayTransport = this._node?.transport;
+    if (relayTransport && typeof relayTransport.setSignalRelay === 'function') {
+      relayTransport.setSignalRelay((toHexId, signal) => this._relaySignalSink(toHexId, signal));
+    }
+
     // Auto-admit any peers the transport has already bound for us
     // (e.g., the bridge from webTransport's autoHandshake).  Sub-
     // transports that don't expose boundPeers() (SimTransport,
@@ -272,6 +306,11 @@ export class AxonaPeer extends DHT {
     // onPeerBound handler receives BigInt (contract).
     if (transport && typeof transport.onPeerBound === 'function') {
       this._onPeerBoundUnsub = transport.onPeerBound((peerBig) => {
+        // A (re)bound peer is alive — clear any dead-mark from a prior drop,
+        // or it would stay shadow-banned: routing skips _deadPeers, and the
+        // synaptome-seed below would re-add a synapse the router then ignores.
+        // Symmetric counterpart to the onPeerDied eviction.
+        this._node?._deadPeers?.delete(peerBig);
         try { this._seedSynaptomeWithSponsor(peerBig); }
         catch (err) {
           if (typeof console !== 'undefined') {
@@ -287,6 +326,38 @@ export class AxonaPeer extends DHT {
         // also flushes on its 10 s cadence; this makes convergence
         // immediate on each new binding.
         this._axonaManager?.invalidateKClosestCache?.();
+      });
+    }
+
+    // Symmetric counterpart to onPeerBound: when a peer's channel dies
+    // (heartbeat timeout / send-fail eviction at the transport, or a bridge
+    // socket close), EVICT it from the synaptome immediately.  Until this
+    // existed, AxonaPeer only ever *admitted* peers; a dead synapse lingered
+    // until lazy anneal cleanup, and routing (greedy lookup_step / route_msg)
+    // would still pick that dead peer when it was XOR-near a target — the send
+    // failed and the route died one hop short.  This is acutely fatal for
+    // bridgeless peer-relay right after the central bridge drops: the dead
+    // bridge synapse poisons lookup()/routeMessage toward many targets, so a
+    // relayed answer/ICE never finds its way back.  Eager eviction keeps the
+    // routing table honest (every synapse is a live channel) the moment a peer
+    // goes; the synapse re-admits via onPeerBound if the channel re-forms.
+    if (transport && typeof transport.onPeerDied === 'function') {
+      this._onPeerDiedUnsub = transport.onPeerDied((peerBig) => {
+        try {
+          const dead = (typeof peerBig === 'bigint') ? peerBig
+            : (typeof peerBig === 'string' && isHexId(peerBig)) ? fromHex(peerBig) : null;
+          if (dead === null) return;
+          const node = this._node;
+          if (!node) return;
+          node.synaptome?.delete(dead);
+          node.incomingSynapses?.delete(dead);
+          node.connections?.delete(dead);
+          (node._deadPeers ??= new Set()).add(dead);
+          this._axonaManager?.invalidateKClosestCache?.();
+          this._emitLog?.('info', 'peer-died-evicted', { peer: toHex(dead) });
+        } catch (err) {
+          if (typeof console !== 'undefined') console.warn('AxonaPeer.onPeerDied: eviction failed', err);
+        }
       });
     }
 
@@ -525,10 +596,19 @@ export class AxonaPeer extends DHT {
         ? targetId
         : BigInt('0x' + String(targetId));
 
-      // Greedy 1-hop forward
+      // Greedy 1-hop forward — only over synapses we are actually connected
+      // to (skip dead/unbound entries, e.g. the bridge after it drops; see
+      // _greedyNextHopToward).  Without this a dead synapse that is XOR-near
+      // the target is picked, the send throws, and the relay dies one hop
+      // short — breaking bridgeless peer-relay right when it's needed.
+      const connOk = (typeof node.transport?.isConnected === 'function')
+        ? node.transport.isConnected.bind(node.transport) : null;
+      const deadSet = node._deadPeers;
       let nextHopId = null;
       let bestDist  = node.id ^ targetBig;
       for (const syn of node.synaptome.values()) {
+        if (deadSet && deadSet.has(syn.peerId)) continue;
+        if (connOk && !connOk(syn.peerId)) continue;
         const d = syn.peerId ^ targetBig;
         if (d < bestDist) { bestDist = d; nextHopId = syn.peerId; }
       }
@@ -580,6 +660,30 @@ export class AxonaPeer extends DHT {
       }
     });
 
+    // ── mesh:signal — peer-relayed WebRTC signaling (bridgeless connect) ──
+    // A routed message carrying an opaque SDP/ICE payload toward a target
+    // nodeId the originator has no direct channel to.  Intermediaries
+    // forward (return falsy); only the terminal node (we ARE the target)
+    // consumes, handing the payload to the transport's mesh-signal ingress
+    // (transport.deliverMeshSignal → MeshManager.onSignal), which drives the
+    // SAME offerer/responder/ICE state machine the bridge path uses — only
+    // the transport of the signaling bytes differs.  The resulting WebRTC
+    // channel is still authenticated end-to-end (axona/4 + DTLS-fingerprint
+    // binding), so a relay can drop/observe but never MITM.  Design:
+    // axona-docs/implementation/Peer-Relayed-Signaling-v0.1.md §3.1.
+    this.onRoutedMessage('mesh:signal', async (payload, meta) => {
+      if (meta.targetId !== node.id) return null;       // not us — forward
+      const t = node.transport;
+      if (t && typeof t.deliverMeshSignal === 'function'
+          && payload && typeof payload.from === 'string') {
+        try { await t.deliverMeshSignal(payload.from, payload.signal); }
+        catch (err) {
+          this._domain?._emit?.({ type: 'mesh-signal-deliver-failed', err: err?.message });
+        }
+      }
+      return 'consumed';
+    });
+
     this._routingHandlersInstalled = true;
   }
 
@@ -605,6 +709,10 @@ export class AxonaPeer extends DHT {
     if (this._onPeerBoundUnsub) {
       this._onPeerBoundUnsub();
       this._onPeerBoundUnsub = null;
+    }
+    if (this._onPeerDiedUnsub) {
+      this._onPeerDiedUnsub();
+      this._onPeerDiedUnsub = null;
     }
     this._started = false;
   }
@@ -1092,7 +1200,6 @@ export class AxonaPeer extends DHT {
 
   async lookup(targetKey) {
     const node   = this._node;
-    const engine = this._engine;
     const domain = this._domain;
     if (!node || !node.alive) return null;
 
@@ -2073,8 +2180,20 @@ export class AxonaPeer extends DHT {
 
   // ── AxonaManager glue ────────────────────────────────────────────
 
+  // Forward AxonaManager's 24 security drop-path logs (bad-signature, stale,
+  // oversize, posthash-mismatch, unauthorized kill/touch/unpub, …) to this
+  // peer's onLog surface. Idempotent per manager instance; defensively
+  // optional so an older vendored AxonaManager without setLogSink is a no-op.
+  _wireManagerLog(am) {
+    if (am && typeof am.setLogSink === 'function' && this._managerLogWired !== am) {
+      am.setLogSink((level, msg, context) => this._emitLog(level, msg, context));
+      this._managerLogWired = am;
+    }
+    return am;
+  }
+
   _requireAxonaManager(callerName) {
-    if (this._axonaManager) return this._axonaManager;
+    if (this._axonaManager) return this._wireManagerLog(this._axonaManager);
     // Fallback 1: ask the engine for this node's AxonaManager.  Different
     // engine builds expose this differently; we probe in priority
     // order and cache the result.
@@ -2104,7 +2223,7 @@ export class AxonaPeer extends DHT {
       );
     }
     this._axonaManager = am;
-    return am;
+    return this._wireManagerLog(am);
   }
 
   /**
@@ -2505,9 +2624,21 @@ export class AxonaPeer extends DHT {
     const target = (typeof targetId === 'bigint')
       ? targetId
       : BigInt('0x' + targetId);
+    // Only forward to a synapse we are ACTUALLY connected to.  A dead synapse
+    // (e.g. the bridge after it dies — peers keep the synapse until anneal
+    // cleans it) is XOR-near many targets and would be picked as the greedy
+    // best, then transport.send() throws and the single-path forward gives up
+    // one hop short.  Skipping unconnected synapses lets routing pick the
+    // next-best LIVE hop and route around the dead node — essential for
+    // bridgeless peer-relay right after the central bridge drops.
+    const t = this._node.transport;
+    const connOk = (typeof t?.isConnected === 'function') ? t.isConnected.bind(t) : null;
+    const dead   = this._node._deadPeers;
     let bestPeerId = null;
     let bestDist   = this._node.id ^ target;
     for (const syn of this._node.synaptome.values()) {
+      if (dead && dead.has(syn.peerId)) continue;
+      if (connOk && !connOk(syn.peerId)) continue;
       const d = syn.peerId ^ target;
       if (d < bestDist) { bestDist = d; bestPeerId = syn.peerId; }
     }
@@ -2517,9 +2648,19 @@ export class AxonaPeer extends DHT {
   /**
    * Bounded 2-hop "anyone closer than me?" check.  Parallel
    * `lookahead_probe` RPCs to each first-hop synapse; aggregates the
-   * 2-hop responses + incomingSynapses-as-reverse-routing; returns
-   * the globally-closest peer id strictly closer than self, or null
-   * if this peer is a true 2-hop terminal.
+   * 2-hop responses + incomingSynapses-as-reverse-routing.
+   *
+   * Returns the **first-hop synapse** (a peer we are DIRECTLY connected to)
+   * that leads to the closest 2-hop node strictly closer than self — i.e. the
+   * NEXT HOP to forward to, NOT the 2-hop destination.  This is the routed-
+   * message forwarder's fallback when greedy finds no 1-hop progress; the
+   * caller does `transport.send(<return>, 'route_msg', …)`, so it MUST be an
+   * adjacent peer.  Returning the 2-hop node here (the old behaviour) made the
+   * forwarder send route_msg to a peer it has no channel to → the send threw
+   * and routing died one hop short — breaking peer-relayed signaling whenever
+   * greedy fell through to the 2-hop path.  Each candidate first hop is one
+   * that just ANSWERED a probe, so the channel to it is proven live.
+   * Returns null if this peer is a true 2-hop terminal.
    */
   async _findCloserInTwoHops(targetId) {
     const node = this._node;
@@ -2527,7 +2668,7 @@ export class AxonaPeer extends DHT {
       ? targetId
       : BigInt('0x' + targetId);
     const myDist = node.id ^ target;
-    let bestPeerId = null;
+    let bestPeerId = null;        // the FIRST-HOP (adjacent) peer to forward to
     let bestDist   = myDist;
 
     const probeTargets = [...node.synaptome.values()].map(s => s.peerId);
@@ -2537,15 +2678,21 @@ export class AxonaPeer extends DHT {
           node.transport.send(peerId, 'lookahead_probe', { target, fromDist: myDist })
         )
       );
-      for (const r of settled) {
+      // settled[i] corresponds to probeTargets[i] (Promise.allSettled preserves
+      // order).  r.value.peerId is the 2-hop node that first hop would forward
+      // to; we score by ITS distance but forward to the FIRST HOP (probeTargets[i]).
+      for (let i = 0; i < settled.length; i++) {
+        const r = settled[i];
         if (r.status !== 'fulfilled' || !r.value || r.value.terminal) continue;
         const d = r.value.peerId ^ target;
         if (d < bestDist) {
           bestDist   = d;
-          bestPeerId = r.value.peerId;
+          bestPeerId = probeTargets[i];   // adjacent next hop, not the 2-hop node
         }
       }
     }
+    // incomingSynapses are reverse channels — the peer IS directly connected,
+    // so the peer id itself is a valid (adjacent) next hop.
     for (const syn of node.incomingSynapses.values()) {
       const d = syn.peerId ^ target;
       if (d < bestDist) { bestDist = d; bestPeerId = syn.peerId; }
@@ -2698,9 +2845,27 @@ export class AxonaPeer extends DHT {
       // and onPeerBound admits on success. Never binds ⇒ never admitted.
       if ((this._verifyProbes ?? 0) >= MAX_VERIFY_PROBES) return;
       this._verifyProbes = (this._verifyProbes ?? 0) + 1;
-      try { await t.openConnection(peerId); }
+      let opened = false;
+      try { opened = await t.openConnection(peerId); }
       catch { /* unverifiable → not admitted */ }
       finally { this._verifyProbes = Math.max(0, (this._verifyProbes ?? 1) - 1); }
+      // AUTONOMOUS BRIDGELESS CONNECT.  openConnection only succeeds for a
+      // peer the transport already has a (bridge-assigned) binding for; a peer
+      // discovered purely peer-to-peer (triadic_introduce / hop_cache /
+      // lateral_spread) has none, so without the bridge it could never be
+      // connected.  When the transport supports peer-relay (web transport with
+      // meshRelay on), fall back to forming the edge by relaying the WebRTC
+      // signaling THROUGH the mesh — no bridge required.  The axona/4 handshake
+      // on the resulting channel binds the identity and onPeerBound admits it,
+      // so a forged introduction still can't poison the table.  This is what
+      // makes new-connection formation independent of the bridge in steady
+      // state; connectViaRelay itself no-ops when meshRelay is disabled, when
+      // we're not yet meshed (cold bootstrap still needs the rendezvous), or
+      // when a channel/binding to the peer already exists.
+      if (!opened && typeof t.connectViaRelay === 'function') {
+        try { t.connectViaRelay(toHex(peerId)); }
+        catch { /* best-effort; falls back to bridge if relay can't route */ }
+      }
       return;
     }
 
@@ -2716,7 +2881,6 @@ export class AxonaPeer extends DHT {
   /** Admission gate.  Same logic as engine._addByVitality verbatim. */
   async _addByVitality(newSyn) {
     const node   = this._node;
-    const engine = this._engine;
     const domain = this._domain;
     const cap = node._maxSynaptome ?? domain.MAX_SYNAPTOME;
 
@@ -2785,6 +2949,7 @@ export class AxonaPeer extends DHT {
         .catch(() => { /* opportunistic — see _reinforceWave comment */ });
     } else {
       node.transitCache.set(key, count);
+      capOldest(node.transitCache, TRANSIT_CACHE_CAP);
     }
   }
 
@@ -2796,7 +2961,6 @@ export class AxonaPeer extends DHT {
    */
   async _tryAnneal() {
     const node   = this._node;
-    const engine = this._engine;
     const domain = this._domain;
     if (!node.alive || node.synaptome.size === 0) return;
 
@@ -2846,7 +3010,6 @@ export class AxonaPeer extends DHT {
    */
   async _evictAndReplace(deadSyn) {
     const node   = this._node;
-    const engine = this._engine;
     const domain = this._domain;
 
     node.synaptome.delete(deadSyn.peerId);
@@ -2882,7 +3045,6 @@ export class AxonaPeer extends DHT {
    */
   async _localCandidate(lo, hi) {
     const node   = this._node;
-    const engine = this._engine;
     const domain = this._domain;
 
     const probeTargets = [...node.synaptome.values()].map(s => s.peerId);
@@ -3049,6 +3211,65 @@ export class AxonaPeer extends DHT {
     }
   }
 
+  // ── Peer-relayed signaling sink (bridgeless connect) ────────────────
+  //
+  // Registered as the web transport's `setSignalRelay` hook on start().
+  // The transport's sendSignal calls this with (toNodeIdHex, signalPayload)
+  // when it wants to deliver an SDP/ICE frame; we route it through the mesh
+  // as a `mesh:signal` to the target.  Synchronous "took ownership" return:
+  //   true  → we will deliver via the mesh (the sink skips the bridge)
+  //   false → we can't (not meshed / bad id) — the sink falls back to the
+  //           bridge, the cold-bootstrap rendezvous path (design §3.3).
+  _relaySignalSink(toHexId, signal) {
+    if (!this._started || !this._node?.alive) return false;
+    if (typeof toHexId !== 'string') return false;
+    if (this._node.synaptome.size === 0) return false;   // not meshed → bridge
+    let toBig;
+    try { toBig = fromHex(toHexId); } catch { return false; }
+    if (toBig === this._node.id) return false;
+    // Fire-and-forget; the negotiation's own retry/timeout (mesh layer)
+    // re-drives if a frame is lost (design §6).
+    this._relayMeshSignal(toBig, toHexId, signal).catch(() => {});
+    return true;
+  }
+
+  /** Deliver one signaling frame to `toBig` over the mesh as a routed
+   *  `mesh:signal`.  Reachability is gated on the iterative lookup
+   *  (alpha-parallel, dead-peer-aware — Peer-Relayed-Signaling §8b
+   *  finding 6), cached briefly; delivery is route_msg with one retry. */
+  async _relayMeshSignal(toBig, toHexId, signal) {
+    if (!(await this._relayReachable(toBig))) {
+      this._domain?._emit?.({ type: 'mesh-signal-unreachable', to: toHexId });
+      return;
+    }
+    // Canonical 66-char hex (the web transport's meshId form) so the
+    // responder's answer routes back via fromHex() without a width mismatch.
+    const body = { from: toHex(this._node.id), signal };
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const r = await this.routeMessage(toBig, 'mesh:signal', body);
+        if (r && r.consumed) return;
+      } catch { /* retry */ }
+    }
+    this._domain?._emit?.({ type: 'mesh-signal-relay-failed', to: toHexId });
+  }
+
+  /** Is `toBig` reachable over the mesh right now?  Verdict cached for
+   *  RELAY_REACH_TTL_MS so per-ICE-candidate frames don't each lookup. */
+  async _relayReachable(toBig) {
+    const key = toBig.toString(16);
+    if (!this._relayReach) this._relayReach = new Map();
+    const cached = this._relayReach.get(key);
+    const now = Date.now();
+    if (cached && (now - cached.ts) < RELAY_REACH_TTL_MS) return cached.ok;
+    let ok = false;
+    try { const lk = await this.lookup(toBig); ok = !!(lk && lk.found); }
+    catch { ok = false; }
+    this._relayReach.set(key, { ok, ts: Date.now() });
+    capOldest(this._relayReach, RELAY_REACH_CAP);
+    return ok;
+  }
+
   /**
    * Dispatch a routed message to the local handler for `type`.
    * Returns the handler's return value (truthy = 'consumed' or other
@@ -3213,7 +3434,6 @@ export class AxonaPeer extends DHT {
   //
   async _lookupStep(ctx) {
     const node   = this._node;
-    const engine = this._engine;
     const domain = this._domain;
     if (!node || !node.alive) {
       return this._lookupResult(ctx, false);

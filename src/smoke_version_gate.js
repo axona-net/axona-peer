@@ -90,7 +90,11 @@ function probe({ helloVersion /* undefined = skip */ }) {
     }
     ws.on('open', () => {
       if (helloVersion !== undefined) {
-        ws.send(JSON.stringify({ type: 'client-hello', version: helloVersion }));
+        // wireVersion '2.0' clears the bridge's wire-major partition gate so
+        // this smoke exercises the VERSION floor in isolation (the real app
+        // sends WIRE_VERSION from the kernel). Without it the gate rejects on
+        // wire before version is ever checked.
+        ws.send(JSON.stringify({ type: 'client-hello', version: helloVersion, wireVersion: '2.0' }));
       }
     });
     ws.on('message', (data) => {

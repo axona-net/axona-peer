@@ -17,10 +17,19 @@
 // `msgId` is content-derived so any receiver can verify a message
 // matches a claimed identity without trusting the sender:
 //
-//   When signed:
-//     msgId = sha256( canonicalize({ signature, seq, ts, topic, message }) )
-//   When unsigned:
-//     msgId = sha256( canonicalize({ seq, ts, topic, message }) )
+//     msgId = sha256( canonicalize({ publisher, message }) )
+//
+//   where `publisher` is the signer's pubkey (`signerPubkey`) for a signed
+//   envelope, or `null` for an unsigned/anonymous one — i.e. exactly the
+//   author identity a receiver can read off the envelope and re-verify.
+//
+// The id is therefore a stable CONTENT ADDRESS of (author, message): the
+// SAME (publisher, message) always hashes to the SAME msgId. It deliberately
+// does NOT fold in `ts`, `seq`, `topic`, or the `signature` — so a message's
+// id is independent of WHEN it was sent or its position in the publisher's
+// stream. A publisher that needs two otherwise-identical messages to have
+// distinct ids includes a nonce in `message`. (Anti-replay and ordering do
+// not rely on the msgId — they use the signed `seq`/`ts`, see below.)
 //
 // The signature covers a DOMAIN-TAGGED core (finding E-4 — explicit
 // domain separation so an envelope signature can never be replayed as a
@@ -42,9 +51,10 @@
 // Publishers seed `seq` from the wall clock (see AxonaPeer._nextPubSeq)
 // so it stays monotonic across restarts without persisted state.
 //
-// Receivers verify the signature against signerPubkey and recompute
-// msgId — any tamper to seq/ts/topic/message breaks the signature AND
-// the hash; any tamper to signature breaks the msgId.  pull(msgId) (A3)
+// Receivers verify the signature against signerPubkey AND recompute the
+// msgId: a tamper to `message` breaks both the signature and the msgId; a
+// tamper to seq/ts/topic breaks the signature; a swap of signerPubkey
+// breaks the recomputed msgId (and the signature). pull(msgId) (A3)
 // therefore returns an envelope that the caller can independently
 // authenticate.
 //
@@ -77,13 +87,21 @@ export const ENVELOPE_DOMAIN = 'axona:pubsub-envelope:v2';
 export const MAX_PUBLISH_SKEW_MS = 300_000;
 
 /**
- * Compute the content-derived msgId for an envelope.
+ * Compute the content-derived msgId for an envelope:
  *
- * @param {object} core  { ts, topic, message } plus optional `signature`
+ *     msgId = sha256( canonicalize({ publisher, message }) )
+ *
+ * `publisher` is the author identity (the signer's pubkey, or null when
+ * unsigned).  The id is a stable content address of (author, message) — it
+ * intentionally does NOT depend on time, sequence, topic, or signature, so a
+ * publisher that wants distinct ids for otherwise-identical content adds a
+ * nonce to `message`.
+ *
+ * @param {object} core  { publisher, message }
  * @returns {Promise<string>} 64-char hex sha256
  */
-export async function computeMsgId(core) {
-  return sha256Hex(canonical(core));
+export async function computeMsgId({ publisher = null, message }) {
+  return sha256Hex(canonical({ publisher, message }));
 }
 
 /**
@@ -118,9 +136,11 @@ export async function buildEnvelope({ topic, message, ts = Date.now(), seq = 0, 
     signerPubkey = identity.pubkeyHex;
   }
 
-  const msgId = signature
-    ? await computeMsgId({ signature, seq, ts, topic, message })
-    : await computeMsgId({            seq, ts, topic, message });
+  // msgId = hash(publisher + message). `publisher` is the signer's pubkey
+  // (recoverable from the envelope as signerPubkey, so a receiver can
+  // recompute and verify); null for an unsigned/anonymous envelope.  Time
+  // and sequence are deliberately NOT folded in — see the header.
+  const msgId = await computeMsgId({ publisher: signerPubkey ?? null, message });
 
   const envelope = { msgId, seq, ts, topic, message };
   if (signature) {
@@ -183,10 +203,14 @@ export async function verifyEnvelope(envelope) {
     if (!sigOk) return { ok: false, reason: 'bad_signature', signed: true };
   }
 
-  // Recompute msgId (binds seq).
-  const expected = signed
-    ? await computeMsgId({ signature: envelope.signature, seq: envelope.seq, ts: envelope.ts, topic: envelope.topic, message: envelope.message })
-    : await computeMsgId({                                 seq: envelope.seq, ts: envelope.ts, topic: envelope.topic, message: envelope.message });
+  // Recompute msgId = hash(publisher + message), where publisher is the
+  // signer's pubkey for a signed envelope (null otherwise) — the same author
+  // identity buildEnvelope used.  Binds the message to its author; a swapped
+  // signerPubkey changes the id (and would already have failed the signature).
+  const expected = await computeMsgId({
+    publisher: signed ? envelope.signerPubkey : null,
+    message:   envelope.message,
+  });
   if (expected !== envelope.msgId) {
     return { ok: false, reason: 'bad_msgid', signed };
   }

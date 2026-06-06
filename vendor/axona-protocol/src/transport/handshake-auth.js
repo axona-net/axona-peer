@@ -46,8 +46,21 @@
 import { canonical }              from '../pubsub/post.js';
 import { sign, verify, importPublicKey } from '../pubsub/ed25519.js';
 
-/** The wire proto tag for the authenticated handshake. */
-export const AUTH_PROTO = 'axona/4';
+/**
+ * The wire proto tag for the authenticated handshake — ALSO the network
+ * partition key. It is both hard-checked (`proto_mismatch`) and folded into the
+ * SIGNED transcript (transcriptBytes), so two peers on different proto tags can
+ * never form an authenticated channel: the verify either rejects the tag
+ * outright or the signature fails to cover the verifier's transcript. Bumping
+ * this tag is therefore a hermetic flag-day partition — it severs BOTH the
+ * peer↔peer mesh auth and the peer↔bridge-embedded-node auth in one move,
+ * regardless of rendezvous. The auth MECHANICS are unchanged across the bump;
+ * the rev is the partition epoch.
+ *   axona/4 → axona/5: 2026-06 wire flag-day (msgId v2.18 split + this kernel
+ *   family). Pre-bump (axona/4, kernel ≤2.16) and post-bump nodes cannot
+ *   interoperate at any authenticated layer.
+ */
+export const AUTH_PROTO = 'axona/5';
 
 const _enc = new TextEncoder();
 const MASK_256 = (1n << 256n) - 1n;

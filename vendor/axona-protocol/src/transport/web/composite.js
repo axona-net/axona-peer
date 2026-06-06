@@ -138,6 +138,13 @@ export class CompositeTransport extends Transport {
     if (typeof handler !== 'function') {
       throw new TypeError('onPeerBound: handler must be a function');
     }
+    // Dedup the fan-out so `handler` fires once per peer even if more than one
+    // sub-transport binds the same nodeId.  The dedup MUST be re-armed when the
+    // peer dies — otherwise it is PERMANENT: a peer that drops and later
+    // reconnects (churn, or a bridgeless relay reconnect) would never re-fire
+    // onPeerBound, so the routing layer never re-admits it to the synaptome and
+    // ignores a peer it is actually connected to.  Clearing the nodeId from
+    // `seen` on peer-death lets the next bind re-fire.
     const seen = new Set();
     const wrapped = (nodeIdBig) => {
       if (typeof nodeIdBig !== 'bigint') return;
@@ -146,11 +153,11 @@ export class CompositeTransport extends Transport {
       try { handler(nodeIdBig); }
       catch (err) { this._log?.('peer-bound-fanout-threw', { err: err.message }); }
     };
+    const rearm = (nodeIdBig) => { if (typeof nodeIdBig === 'bigint') seen.delete(nodeIdBig); };
     const unsubs = [];
     for (const t of this._subs) {
-      if (typeof t.onPeerBound === 'function') {
-        unsubs.push(t.onPeerBound(wrapped));
-      }
+      if (typeof t.onPeerBound === 'function') unsubs.push(t.onPeerBound(wrapped));
+      if (typeof t.onPeerDied  === 'function') unsubs.push(t.onPeerDied(rearm));
     }
     return () => { for (const u of unsubs) try { u(); } catch { /* swallow */ } };
   }

@@ -41,12 +41,20 @@ import { UpgradeRequiredError } from '../errors.js';
 
 // ── Constants ──────────────────────────────────────────────────────
 
-/** The wire-format version this build of the kernel speaks. */
-export const WIRE_VERSION = '1.0';
+/** The wire-format version this build of the kernel speaks. Major is the
+ *  hard-compat axis (see wireCompatible): a major bump partitions the
+ *  peer↔bridge handshake. Bumped 1.0 → 2.0 for the 2026-06 wire flag-day
+ *  (paired with the AUTH_PROTO axona/4 → axona/5 bump, which is the
+ *  load-bearing peer-to-peer partition). The web client now sends this in its
+ *  client-hello so the bridge gate can reject a mismatched major early. */
+export const WIRE_VERSION = '2.0';
 
 /** The kernel's own peer-version string.  Apps wrapping the kernel
- *  pass their own version through; this is just the default. */
-export const KERNEL_VERSION = '2.16.0';
+ *  pass their own version through; this is just the default.  Kept on the 2.x
+ *  line (NOT bumped to 3.x) so the bridge's major-version namespace gate
+ *  (kernel-2.x vs peer-app-3.x in flagDayFloor) still classifies it correctly;
+ *  the partition rides on WIRE_VERSION + AUTH_PROTO, not this semver. */
+export const KERNEL_VERSION = '2.28.0';
 
 /** WebSocket close code for version mismatches (custom, in the
  *  application-specific 4000-4999 range). */

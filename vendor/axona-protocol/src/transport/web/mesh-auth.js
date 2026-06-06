@@ -177,12 +177,22 @@ export class MeshAuth {
       // and onHelloSig and awaits verifyAuthHello, so without this flag
       // two concurrent calls could both verify and bind the same peer.
       st.verifying = true;
-      const res = await verifyAuthHello(st.pendingSig, { cbv });
-      if (!res.ok) { st.verifying = false; this._log('auth-mesh-rejected', { meshId, reason: res.reason }); return; }
-      if (st.peerNodeId && res.nodeId !== st.peerNodeId) {
-        this._log('auth-mesh-id-mismatch', { meshId }); return;
-      }
+      // `verifying` MUST be cleared on EVERY non-success exit, or the channel
+      // wedges: the guard above is `!st.verifying && !st.bound`, so any path
+      // that leaves verifying=true with bound=false (the id-mismatch return, or
+      // a throw from _bindPeer) blocks every future _progress retry forever —
+      // the channel stays authenticated-but-never-bound (absent from
+      // boundPeers, never admitted to routing) until it dies. A `finally`
+      // guarantees the reset on all paths; on success bound=true blocks
+      // re-entry regardless, so clearing it there too is harmless. (Verified by
+      // smoke_mesh_auth_loopback testTransientBindThrowRecovers, which fails
+      // without this.)
       try {
+        const res = await verifyAuthHello(st.pendingSig, { cbv });
+        if (!res.ok) { this._log('auth-mesh-rejected', { meshId, reason: res.reason }); return; }
+        if (st.peerNodeId && res.nodeId !== st.peerNodeId) {
+          this._log('auth-mesh-id-mismatch', { meshId }); return;
+        }
         // Symmetric per-channel key = the sorted nonce pair.  Both endpoints
         // hold the same two nonces, so this string is IDENTICAL on each side
         // of a given channel — letting the transport deterministically pick
@@ -191,7 +201,11 @@ export class MeshAuth {
         this._bindPeer(res.nodeId, meshId, channelKey);
         st.bound = true;
         this._log('auth-mesh-complete', { meshId, peer: res.nodeId });
-      } catch (err) { this._log('mesh-bind-failed', { meshId, err: err.message }); }
+      } catch (err) {
+        this._log('mesh-bind-failed', { meshId, err: err.message });
+      } finally {
+        st.verifying = false;
+      }
     }
   }
 }

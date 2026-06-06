@@ -61,12 +61,25 @@ export class NeuronNode extends DHTNode {
    * Register that `peerId` has an outgoing synapse pointing TO this node.
    * Only stored if no outgoing synapse to that peer already exists (outgoing
    * synapses are always preferred as they carry trained weights).
+   *
+   * Bounded by the node's synaptome budget: the reverse index participates in
+   * AP routing (see `progressCandidates`), so it MUST respect the same hard
+   * limit as the outgoing synaptome — otherwise a popular node accrues an
+   * unbounded reverse in-degree and routes through far more peers than a real
+   * (connection-capped) node ever could, inflating measured performance. The
+   * budget is SHARED: a real peer holds at most `_maxSynaptome` routing peers
+   * total, regardless of who initiated each channel. When `_maxSynaptome` is
+   * unset (no engine budget, e.g. a bare kernel node — production never
+   * populates the reverse index), the cap is inactive.
    */
   addIncomingSynapse(peerId, latency, stratum) {
     if (this.synaptome.has(peerId)) return; // outgoing already covers this peer
-    if (!this.incomingSynapses.has(peerId)) {
-      this.incomingSynapses.set(peerId, { peerId, latency, weight: 0.1, stratum });
+    if (this.incomingSynapses.has(peerId)) return;
+    const cap = this._maxSynaptome;
+    if (cap != null && (this.synaptome.size + this.incomingSynapses.size) >= cap) {
+      return;                                // routing-degree budget reached
     }
+    this.incomingSynapses.set(peerId, { peerId, latency, weight: 0.1, stratum });
   }
 
   hasSynapse(peerId) {

@@ -38,7 +38,15 @@
 const DEFAULTS = Object.freeze({
   // Routing / Kademlia
   _k:                  20,
-  MAX_HOPS:            16,
+  // Upper bound on hops before a lookup/route gives up. The vast majority of
+  // lookups converge in ~7 hops (p95 ~11 at 25k under a 100-connection cap);
+  // 40 is a generous ceiling for the rare long tail. Under a hard connection
+  // cap the sparser graph occasionally needs >16 hops to converge, so a 16-hop
+  // ceiling silently dropped ~0.5% of lookups that a higher ceiling completes
+  // — verified in dht-sim (16 → ~99.4%, 40 → 100% at 25k, matching NH-1, whose
+  // engine has long used 40). 40-hop lookups are exceedingly rare, so the
+  // worst-case latency cost is paid by almost no one.
+  MAX_HOPS:            40,
   EPSILON:             0.05,
   LOOKAHEAD_ALPHA:     5,
   GEO_REGION_BITS:     8,

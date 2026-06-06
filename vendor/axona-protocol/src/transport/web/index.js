@@ -38,7 +38,7 @@ import { BridgeTransport, BRIDGE_CONN_ID_EXPORT as BRIDGE_CONN_ID } from './brid
 import { CompositeTransport } from './composite.js';
 import { isHexId, toHex, fromHex } from '../../utils/hexid.js';
 import { TransportError, ErrorCodes, UpgradeRequiredError } from '../../errors.js';
-import { KERNEL_VERSION }    from '../handshake.js';
+import { KERNEL_VERSION, WIRE_VERSION } from '../handshake.js';
 import {
   buildAuthHello, verifyAuthHello, cbvFromNonces, AUTH_PROTO,
 } from '../handshake-auth.js';
@@ -105,6 +105,17 @@ const RECONNECT_BACKOFF_MAX_MS     = 16000;
 const UPGRADE_CLOSE_CODE = 4426;
 /** Window of recent RTT samples kept for the average. */
 const RTT_WINDOW = 10;
+// Ceiling on concurrent in-flight relay negotiations a node will START. The
+// autonomous bridgeless-connect path (connectViaRelay, fired from peer
+// discovery) is otherwise unbounded: a peer that sprays gossip introductions
+// (triadic_introduce / hop_cache / lateral_spread) with distinct fabricated
+// nodeIds could drive an arbitrary number of concurrent RTCPeerConnection
+// negotiations. We throttle on the mesh's never-opened count, which the
+// negotiation watchdog reaps on its own — so the cap frees up without any
+// completion bookkeeping. Generous: normal nodes open channels in seconds and
+// sit far below this; legitimate relay connects past the cap simply retry on
+// the next discovery tick.
+const MAX_PENDING_RELAY_NEGOTIATIONS = 64;
 
 export function webTransport({
   bridgeUrl,
@@ -124,6 +135,17 @@ export function webTransport({
   reconnect = true,
   reconnectInitialMs = RECONNECT_BACKOFF_INITIAL_MS,
   reconnectMaxMs     = RECONNECT_BACKOFF_MAX_MS,
+  // Peer-relayed signaling (bridgeless connect).  When true (the default as of
+  // kernel v2.19.0, after the end-to-end verification in Peer-Relayed-Signaling
+  // §8d), sendSignal prefers routing SDP/ICE through the mesh (via an AxonaPeer
+  // relay registered with setSignalRelay) over the bridge, and connectViaRelay()
+  // forms a new WebRTC edge to a nodeId without the bridge — driven autonomously
+  // by AxonaPeer._considerCandidate on peer discovery.  Pass `false` to pin the
+  // legacy bridge-only behaviour (the bridge bootstrap path is unaffected either
+  // way: it signals by 3-char connId, which is not a hex nodeId, so the relay
+  // sink never intercepts it).  Design:
+  // axona-docs/implementation/Peer-Relayed-Signaling-v0.1.md.
+  meshRelay = true,
 } = {}) {
   if (typeof bridgeUrl !== 'string' || !/^wss?:\/\//.test(bridgeUrl)) {
     throw new TransportError(ErrorCodes.TRANSPORT_NOT_STARTED,
@@ -194,8 +216,11 @@ export function webTransport({
         // re-clears the gate without bespoke caller logic.
         try {
           socket.send(JSON.stringify({
-            type:    'client-hello',
-            version: peerVersion || KERNEL_VERSION,
+            type:        'client-hello',
+            version:     peerVersion || KERNEL_VERSION,
+            wireVersion: WIRE_VERSION,   // major-compat axis; the bridge gate
+                                         // rejects a mismatched major (4426)
+            ...(meshRelay ? { capabilities: ['mesh-relay'] } : {}),
           }));
         } catch (err) {
           log('auto-handshake-client-hello-failed', { err: err.message });
@@ -269,8 +294,22 @@ export function webTransport({
   // Wrap them in the bridge's `signal` envelope so the bridge can
   // route the payload to the destination peer.  Pattern matches
   // axona-peer/src/client.js's MeshManager setup verbatim.
+  // Peer-relayed signaling: an AxonaPeer registers its routed-delivery sink
+  // here via composite.setSignalRelay().  When meshRelay is enabled and the
+  // destination is a nodeId (hex meshId — the bridgeless connectViaRelay
+  // path uses nodeIds as meshIds, whereas the bridge path uses 3-char
+  // connIds), we offer the frame to the relay first; it returns true if it
+  // took ownership (will route through the mesh), else we fall back to the
+  // bridge.  Pure bridge behaviour is preserved when meshRelay is off.
+  let signalRelay = null;
   const mesh = new MeshManager({
     sendSignal: (toPeerId, payload) => {
+      if (meshRelay && typeof signalRelay === 'function' && isHexId(toPeerId)) {
+        let took = false;
+        try { took = signalRelay(toPeerId, payload) === true; }
+        catch (err) { log('signal-relay-threw', { to: toPeerId, err: err.message }); }
+        if (took) return;
+      }
       if (!socketOpen) {
         log('signal-drop-no-bridge', { to: toPeerId });
         return;
@@ -714,6 +753,61 @@ export function webTransport({
   composite.mesh    = mesh;
   composite.webrtc  = webrtc;
   composite.bridge  = bridge;
+
+  // ── Peer-relayed signaling surface (bridgeless connect) ──────────────
+  // Only meaningful when meshRelay is enabled; an AxonaPeer detects these
+  // methods on its transport and wires itself up on start().
+  //
+  // setSignalRelay(fn): register the outbound relay sink.  fn(toHexId,
+  //   payload) → boolean ("took ownership").  Consumed by the sendSignal
+  //   closure above.
+  composite.setSignalRelay = (fn) => {
+    if (fn !== null && typeof fn !== 'function') {
+      throw new TypeError('setSignalRelay: fn must be a function or null');
+    }
+    signalRelay = fn;
+  };
+  // deliverMeshSignal(fromHex, payload): terminal ingress — a relayed
+  //   `mesh:signal` reached us as its target; feed it into the SAME mesh
+  //   signaling state machine the bridge path drives (offerer/responder/ICE).
+  composite.deliverMeshSignal = (fromHex, payload) => {
+    if (typeof mesh.onSignal !== 'function') return;
+    try { return mesh.onSignal(fromHex, payload); }
+    catch (err) { log('mesh-signal-deliver-threw', { from: fromHex, err: err.message }); }
+  };
+  // connectViaRelay(toHex): initiate a new direct WebRTC channel to a nodeId
+  //   we hold no binding for, using the nodeId as the meshId.  The offer's
+  //   SDP/ICE then rides the relay sink above.  No-op when meshRelay is off,
+  //   when we already own a binding/channel to the target, or for self.
+  composite.connectViaRelay = (toHex) => {
+    if (!meshRelay) { log('relay-connect-disabled', { to: toHex }); return false; }
+    if (typeof toHex !== 'string' || !isHexId(toHex)) return false;
+    if (toHex === localNodeIdHex) return false;
+    try {
+      const toBig = fromHex(toHex);
+      // No-op if we already own a binding, an open channel, OR an in-flight
+      // negotiation to this peer.  The last guard is essential: peer discovery
+      // (triadic_introduce etc.) fires connectViaRelay repeatedly, and without
+      // it each call would re-run _initiateTo and overwrite the in-progress
+      // RTCPeerConnection, restarting ICE so the channel never opens.
+      if (webrtc.ownsPeer(toBig) || mesh.isConnected(toHex) || mesh.hasPeer(toHex)) return false;
+    } catch { return false; }
+    // Backpressure: cap concurrent in-flight relay negotiations so a flood of
+    // gossip-introduced fake peerIds can't drive unbounded RTCPeerConnection
+    // setup. The watchdog reaps stuck never-opened negotiations, so the cap
+    // self-frees; a throttled connect retries on the next discovery tick.
+    const pending = mesh.pendingNegotiations();
+    if (pending >= MAX_PENDING_RELAY_NEGOTIATIONS) {
+      log('relay-connect-throttled', { to: toHex, pending });
+      return false;
+    }
+    log('relay-connect-initiate', { to: toHex });
+    mesh._initiateTo(toHex);
+    return true;
+  };
+  // Advisory capability surface (forward-compat; functional gate is the flag).
+  composite.capabilities = () => (meshRelay ? ['mesh-relay'] : []);
+  composite.hasCapability = (cap) => composite.capabilities().includes(cap);
   Object.defineProperty(composite, 'socket',          { get() { return socket; } });
   Object.defineProperty(composite, 'bridgeReady',     { get() { return bridgeReady; } });
   // Display surface: hex (derived from BigInt).  External UI / log
