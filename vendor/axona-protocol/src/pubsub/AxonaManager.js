@@ -1746,19 +1746,29 @@ export class AxonaManager {
     const batch = messages.slice(0, MAX_REPLAY_BATCH);
     for (const msg of batch) {
       const { json, publishId, publishTs, postHash, publisher } = msg;
-      if (this._alreadySeenPublish(publishId)) continue;
       // Phase A #2: never resurrect a killed message. A lagging replica may
       // still carry it in the batch it replays; without this guard a kill
       // could be undone the next time some relay replays its stale cache.
       if (postHash && this._isTombstoned(postHash)) continue;
-      this._recordReceived(topicId, publishId, publishTs);
-      const role = this.axonRoles.get(topicId);
-      // Preserve postHash (and publisher) so a copy acquired via replay stays
-      // addressable: kill() and pull() match on postHash, and the metrics
-      // ownership gate samples publisher. Dropping them here made replay-
-      // acquired entries silently unkillable / unpullable — they would be
-      // re-served to future subscribers even after a successful kill.
-      if (role) this._addToReplayCache(role, { json, publishId, publishTs, postHash, publisher });
+      // App delivery is gated by _appDelivered (inside _deliverToApp), NOT by
+      // the network-level _seenPublishes set. A node that relayed this publish
+      // as a K-closest ROOT marked it in _seenPublishes WITHOUT delivering to
+      // its app (its app had not subscribed yet). Gating the replay path on
+      // _seenPublishes therefore silently DROPPED legitimate backlog for
+      // exactly the subscribers that happen to also be roots for the topic —
+      // a non-deterministic "late subscriber sees nothing" bug. So: always
+      // attempt app delivery (idempotent), and only re-cache / re-record the
+      // first time the router sees the publishId.
+      if (!this._alreadySeenPublish(publishId)) {
+        this._recordReceived(topicId, publishId, publishTs);
+        const role = this.axonRoles.get(topicId);
+        // Preserve postHash (and publisher) so a copy acquired via replay stays
+        // addressable: kill() and pull() match on postHash, and the metrics
+        // ownership gate samples publisher. Dropping them here made replay-
+        // acquired entries silently unkillable / unpullable — they would be
+        // re-served to future subscribers even after a successful kill.
+        if (role) this._addToReplayCache(role, { json, publishId, publishTs, postHash, publisher });
+      }
       this._deliverToApp(topicId, json, publishId, publishTs);
     }
   }
