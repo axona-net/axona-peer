@@ -256,6 +256,47 @@ export function geoCellCenter(cellId) {
 }
 
 /**
+ * Centers of the two S2 level-3 sub-cells that make up an 8-bit cell — i.e.
+ * the two "halves" of the cell, which Axona names independently. Index 0 is
+ * the lower Hilbert sub-cell (2·trunc), index 1 the upper (2·trunc+1).
+ * geoCellHalf() returns the matching index for a coordinate, so a caller can
+ * pair a point with the right half-name. Returns null for reserved IDs.
+ *
+ * @param {number} cellId – 8-bit cell ID in [0, 192).
+ * @returns {[{lat:number,lng:number},{lat:number,lng:number}] | null}
+ */
+export function geoCellSubCenters(cellId) {
+  if (!isValidCellId(cellId)) return null;
+  const face = cellId >> 5;
+  const trunc = cellId & 0x1F;
+  const sub = (d) => {
+    const { x, y } = hilbert8x8_d2xy(d);
+    const u = stToUV((x + 0.5) / S_BINS);
+    const v = stToUV((y + 0.5) / T_BINS);
+    const p = faceUVToXYZ(face, u, v);
+    return xyzToLatLng(p.x, p.y, p.z);
+  };
+  return [sub(trunc << 1), sub((trunc << 1) | 1)];
+}
+
+/**
+ * Which half (0 or 1) of its 8-bit cell a coordinate falls in. Pairs with
+ * geoCellSubCenters() and the two region names: 0 = lower Hilbert sub-cell.
+ *
+ * @param {number} lat
+ * @param {number} lng
+ * @returns {0 | 1}
+ */
+export function geoCellHalf(lat, lng) {
+  const { x, y, z } = latLngToXYZ(lat, lng);
+  const face = xyzToFace(x, y, z);
+  const { u, v } = xyzToFaceUV(face, x, y, z);
+  const sBin = clamp(Math.floor(uvToST(u) * S_BINS), 0, S_BINS - 1);
+  const tBin = clamp(Math.floor(uvToST(v) * T_BINS), 0, T_BINS - 1);
+  return hilbert8x8_xy2d(sBin, tBin) & 1;
+}
+
+/**
  * Compute the four (lat, lng) corners of an 8-bit S2 cell, in
  * face-local order.  The cell boundary on the sphere is the great-
  * circle arc between consecutive corners.  Useful for the visualizer
