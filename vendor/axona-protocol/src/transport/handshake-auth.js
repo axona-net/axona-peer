@@ -1,5 +1,5 @@
 // =====================================================================
-// handshake-auth.js — authenticated peer-identity handshake (axona/4).
+// handshake-auth.js — authenticated peer-identity handshake (axona/5).
 //
 // Closes the root authentication gap: before v4, a peer's routing
 // identity (nodeId) was self-asserted — the hello carried only the

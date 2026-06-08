@@ -54,7 +54,7 @@ export const WIRE_VERSION = '2.0';
  *  line (NOT bumped to 3.x) so the bridge's major-version namespace gate
  *  (kernel-2.x vs peer-app-3.x in flagDayFloor) still classifies it correctly;
  *  the partition rides on WIRE_VERSION + AUTH_PROTO, not this semver. */
-export const KERNEL_VERSION = '2.31.0';
+export const KERNEL_VERSION = '2.32.0';
 
 /** WebSocket close code for version mismatches (custom, in the
  *  application-specific 4000-4999 range). */
