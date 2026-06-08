@@ -6,7 +6,7 @@ kernel node in the page: it connects to an [`axona-bridge`](https://github.com/a
 over WebSocket for bootstrap/signaling, forms a **WebRTC mesh** with the other
 peers, and exposes identity, routing, and pub/sub through a small UI.
 
-**v3.27.0** — on kernel **v2.31.0** (`axona/5` wire epoch). Deployed at
+**v3.28.0** — on kernel **v2.32.0** (`axona/5` wire epoch). Deployed at
 [axona.net](https://axona.net) (production, still the `axona/4` / kernel-2.16
 network) and at [testnet.axona.net](https://testnet.axona.net) (the `axona/5`
 testnet line this branch targets).
