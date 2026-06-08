@@ -492,7 +492,7 @@ function render() {
 
   // Header counts.  Open data channels of known — PLUS the count that
   // actually matters for routing: how many of those channels have
-  // completed the axona/4 handshake and bound into the synaptome.  The
+  // completed the axona/5 handshake and bound into the synaptome.  The
   // demo bug had every dot green while NOTHING was bound; surfacing the
   // bound count here means the Peer UI can no longer hide that.
   const openPeers = peers.filter(p => p.state === 'open').length;
@@ -509,7 +509,7 @@ function render() {
   $meshCount.textContent = `${openPeers} of ${peers.length}${boundLabel}`;
   $meshCount.classList.toggle('mesh-degraded', degraded);
   $meshCount.title = degraded
-    ? 'Mesh degraded: data channels are open but the axona/4 handshake '
+    ? 'Mesh degraded: data channels are open but the axona/5 handshake '
       + 'has not bound them — no authenticated routing is flowing.'
     : '';
   if (degraded !== _meshDegradedShown) {
