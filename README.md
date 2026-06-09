@@ -7,9 +7,9 @@ over WebSocket for bootstrap/signaling, forms a **WebRTC mesh** with the other
 peers, and exposes identity, routing, and pub/sub through a small UI.
 
 **v3.28.0** — on kernel **v2.32.0** (`axona/5` wire epoch). Deployed at
-[axona.net](https://axona.net) (production, still the `axona/4` / kernel-2.16
-network) and at [testnet.axona.net](https://testnet.axona.net) (the `axona/5`
-testnet line this branch targets).
+[axona.net](https://axona.net) (production — on the `axona/5` line since the
+2026-06-08 flag-day cutover) and at [testnet.axona.net](https://testnet.axona.net)
+(the staging line this branch targets, ahead of `main`).
 
 ## What it does
 
@@ -79,8 +79,8 @@ Every connection runs the kernel's `axona/5` authenticated handshake. A peer
 on an incompatible wire epoch is cleanly rejected — the bridge closes the
 WebSocket with code **4426** (`upgrade required`) and the client logs a
 developer-visible `UPGRADE REQUIRED` error telling it to update. Because the
-epoch is folded into the signed transcript, an `axona/5` peer and the older
-`axona/4` production network **cannot** interconnect by design.
+epoch is folded into the signed transcript, an `axona/5` peer and a peer on the
+retired `axona/4` epoch **cannot** interconnect by design.
 
 ## Layout
 
