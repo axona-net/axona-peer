@@ -33,10 +33,26 @@ export const POW_DOMAIN = 'axona:pow:v1';
 // must already be memory-hard.
 export const POW_DIFFICULTY = Object.freeze({ transport: 0, publish: 0 });
 
+// The ACTIVE difficulty (defaults to the shipped frozen value above). Kept
+// separate + mutable so tests can exercise the enforcement gates, and so a
+// future Stage-4 release can dial it up. NOTE: difficulty is a CONSENSUS
+// parameter — peers that disagree won't interoperate, so this is for tests and
+// a coordinated network-wide change, NOT ad-hoc per-peer tuning.
+const _active = { ...POW_DIFFICULTY };
+
 export function powDifficulty(role) {
-  const d = POW_DIFFICULTY[role];
+  const d = _active[role];
   return Number.isInteger(d) && d > 0 ? d : 0;
 }
+
+/** Set the active difficulty for a role (tests / coordinated Stage-4 dial). */
+export function setPowDifficulty(role, n) {
+  if (role == null) { Object.assign(_active, POW_DIFFICULTY); return; }
+  _active[role] = n;
+}
+
+/** Restore the active difficulty to the shipped default (all roles). */
+export function resetPowDifficulty() { Object.assign(_active, POW_DIFFICULTY); }
 
 /** Count leading zero bits of a byte array (the realized difficulty). */
 function leadingZeroBits(bytes) {

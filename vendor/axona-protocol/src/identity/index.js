@@ -26,7 +26,7 @@ import {
 }                                       from '../pubsub/ed25519.js';
 import { computeNodeId }                from './nodeid.js';
 import { IdentityError, ErrorCodes }    from '../errors.js';
-import { powMint }                      from '../pow/pow.js';
+import { powMint, powVerify }           from '../pow/pow.js';
 
 const ALGORITHM = { name: 'Ed25519' };
 
@@ -127,6 +127,7 @@ export async function dumpIdentity(identity) {
     privkey:   bytesToBase64(new Uint8Array(pkcs8)),
     region:    { ...identity.region },
     createdAt: identity.createdAt,
+    pow:       typeof identity.pow === 'string' ? identity.pow : '',   // Stage 2: persist the transport PoW nonce
   };
 }
 
@@ -211,9 +212,14 @@ export async function loadIdentity(envelope) {
     region: { lat: region.lat, lng: region.lng },
     createdAt: typeof createdAt === 'number' ? createdAt : Date.now(),
   });
-  // Stage 2: recompute the transport PoW (inert at difficulty 0 ⇒ ''). Cheap
-  // while difficulty is 0; persisted alongside the key once difficulty > 0.
-  identity.pow = await powMint({ pubkeyHex: identity.pubkeyHex, role: 'transport' });
+  // Stage 2: reuse the PERSISTED transport PoW nonce if it still satisfies the
+  // current difficulty — avoids re-solving the puzzle on every load once
+  // difficulty > 0; re-mint only if absent or now-insufficient. At difficulty 0
+  // the persisted '' (or absent) verifies trivially, so this is a no-op.
+  const storedPow = typeof envelope.pow === 'string' ? envelope.pow : '';
+  identity.pow = (await powVerify({ pubkeyHex: identity.pubkeyHex, nonce: storedPow, role: 'transport' }))
+    ? storedPow
+    : await powMint({ pubkeyHex: identity.pubkeyHex, role: 'transport' });
   return identity;
 }
 

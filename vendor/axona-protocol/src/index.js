@@ -96,6 +96,8 @@ export {
   POW_DOMAIN,
   POW_DIFFICULTY,
   powDifficulty,
+  setPowDifficulty,
+  resetPowDifficulty,
   powMint,
   powVerify,
   powBits,
