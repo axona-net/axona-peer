@@ -64,6 +64,7 @@
 
 import { canonical, sha256Hex }              from './post.js';
 import { sign, verify, importPublicKey }     from './ed25519.js';
+import { powMint }                           from '../pow/pow.js';
 
 const _enc = new TextEncoder();
 
@@ -146,6 +147,11 @@ export async function buildEnvelope({ topic, message, ts = Date.now(), seq = 0, 
   if (signature) {
     envelope.signature    = signature;
     envelope.signerPubkey = signerPubkey;
+    // Stage 2: publish-role PoW nonce — a SIBLING field (outside the signed
+    // core, like signerPubkey/signature), self-binding to signerPubkey via the
+    // PoW relation. Inert at difficulty 0 (''); a root verifies it at ingress
+    // before granting a per-publisher quota slot once publish difficulty > 0.
+    envelope.signerPow    = await powMint({ pubkeyHex: signerPubkey, role: 'publish' });
   }
   return envelope;
 }

@@ -40,6 +40,7 @@
 
 import { toHex, fromHex, isHexId } from '../utils/hexid.js';
 import { verifyEnvelope, checkFreshness, computeMsgId, MAX_PUBLISH_SKEW_MS } from './envelope.js';
+import { powVerify } from '../pow/pow.js';
 import { verifyKill } from './kill.js';
 import { verifyTouch } from './touch.js';
 import { verifyUnpub } from './unpub.js';
@@ -700,7 +701,18 @@ export class AxonaManager {
     if (!env || typeof env !== 'object' || typeof env.signature !== 'string') return true; // unsigned
     try {
       const res = await verifyEnvelope(env);
-      return res?.ok === true;
+      if (res?.ok !== true) return false;
+      // Stage 2: publish-PoW gate (the §7a anti-flood anchor). Self-binding to
+      // signerPubkey, so it is checked independently of the signature. INERT at
+      // difficulty 0 — any/absent signerPow passes, so envelopes that predate
+      // the field are accepted. Raising publish difficulty (Stage 4b) makes a
+      // fresh signing key cost a puzzle, so a flooder can't rotate keys to dodge
+      // the per-publisher quota for free.
+      return powVerify({
+        pubkeyHex: env.signerPubkey,
+        nonce:     typeof env.signerPow === 'string' ? env.signerPow : '',
+        role:      'publish',
+      });
     } catch {
       return false;                                  // claims a signature but verification threw → drop
     }

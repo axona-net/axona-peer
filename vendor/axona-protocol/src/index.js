@@ -91,6 +91,17 @@ export {
   computeNodeIdBigInt,
 } from './identity/index.js';
 
+// ── Proof-of-work scaffolding (E-1 / Stage 2 — inert at difficulty 0) ──
+export {
+  POW_DOMAIN,
+  POW_DIFFICULTY,
+  powDifficulty,
+  powMint,
+  powVerify,
+  powBits,
+  powCalibrate,
+} from './pow/pow.js';
+
 // ── Per-node DHT implementation (NH-1) ──────────────────────────────
 export { AxonaPeer }    from './dht/AxonaPeer.js';
 export { AxonaDomain }  from './dht/AxonaDomain.js';

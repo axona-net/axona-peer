@@ -45,6 +45,7 @@
 
 import { canonical }              from '../pubsub/post.js';
 import { sign, verify, importPublicKey } from '../pubsub/ed25519.js';
+import { powVerify }              from '../pow/pow.js';
 
 /**
  * The wire proto tag for the authenticated handshake — ALSO the network
@@ -107,6 +108,11 @@ export async function buildAuthHello({ identity, cbv, proto = AUTH_PROTO }) {
     nodeId: identity.id,
     pubkey: identity.pubkeyHex,
     sig:    'ed25519:' + bytesToHex(sigBytes),
+    // Stage 2: transport PoW nonce — a SIBLING field, NOT folded into the signed
+    // transcript (it self-binds to `pubkey` via the PoW relation, and keeping it
+    // out of the transcript preserves interop with peers that predate the field:
+    // their verify covers the same core). Inert at difficulty 0 (''):
+    pow:    typeof identity.pow === 'string' ? identity.pow : '',
   };
 }
 
@@ -161,6 +167,18 @@ export async function verifyAuthHello(frame, { cbv, proto = AUTH_PROTO } = {}) {
     return fail('verify_threw');
   }
   if (!sigOk)                                        return fail('bad_signature');
+
+  // Stage 2: transport PoW gate. Self-binding to the (already BIND-checked)
+  // pubkey, so it is verified independently of the channel-binding signature.
+  // INERT at difficulty 0 — `powVerify` returns true for any/absent nonce, so a
+  // peer that predates the `pow` field still passes. Raising transport
+  // difficulty (Stage 4a) turns this into the anti-eclipse mint cost.
+  const powOk = await powVerify({
+    pubkeyHex: frame.pubkey,
+    nonce:     typeof frame.pow === 'string' ? frame.pow : '',
+    role:      'transport',
+  });
+  if (!powOk)                                        return fail('bad_pow');
 
   return { ok: true, nodeId: frame.nodeId, pubkey: frame.pubkey };
 }

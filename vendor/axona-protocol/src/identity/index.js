@@ -26,6 +26,7 @@ import {
 }                                       from '../pubsub/ed25519.js';
 import { computeNodeId }                from './nodeid.js';
 import { IdentityError, ErrorCodes }    from '../errors.js';
+import { powMint }                      from '../pow/pow.js';
 
 const ALGORITHM = { name: 'Ed25519' };
 
@@ -89,13 +90,17 @@ export async function deriveIdentity({ lat, lng, extractable = true }) {
   const pubkey  = await exportPublicKey(pair.publicKey);
   const id      = await computeNodeId(pubkey, lat, lng);
 
-  return buildIdentity({
+  const identity = buildIdentity({
     id,
     pubkey,
     privateKey: pair.privateKey,
     region:     { lat, lng },
     createdAt:  Date.now(),
   });
+  // Stage 2: mint the transport PoW (inert at difficulty 0 ⇒ ''). Presented in
+  // the auth hello; raising difficulty later needs no identity-format change.
+  identity.pow = await powMint({ pubkeyHex: identity.pubkeyHex, role: 'transport' });
+  return identity;
 }
 
 /**
@@ -199,13 +204,17 @@ export async function loadIdentity(envelope) {
       { cause });
   }
 
-  return buildIdentity({
+  const identity = buildIdentity({
     id,
     pubkey: pubkeyBytes,
     privateKey,
     region: { lat: region.lat, lng: region.lng },
     createdAt: typeof createdAt === 'number' ? createdAt : Date.now(),
   });
+  // Stage 2: recompute the transport PoW (inert at difficulty 0 ⇒ ''). Cheap
+  // while difficulty is 0; persisted alongside the key once difficulty > 0.
+  identity.pow = await powMint({ pubkeyHex: identity.pubkeyHex, role: 'transport' });
+  return identity;
 }
 
 // ── internal: shared Identity constructor ────────────────────────────
@@ -219,6 +228,7 @@ function buildIdentity({ id, pubkey, privateKey, region, createdAt }) {
     privateKey,
     region,
     createdAt,
+    pow: '',                          // Stage 2: transport PoW nonce (deriveIdentity/loadIdentity overwrite; '' = inert)
     sign: (message) => sign(privateKey, message),
     // Verify against this identity's own public key — used for
     // round-trip sanity checks. To verify a different signer's
