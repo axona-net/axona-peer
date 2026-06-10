@@ -855,9 +855,13 @@ export class AxonaManager {
       this._emitLog?.('debug', 'kill-unauthorized-dropped', { msgId: kill.msgId });
       return 'consumed';                               // wrong signer (or unsigned msg) → reject, handled
     }
-    // 7. retract: drop from cache + tombstone so it can't be resurrected.
+    // 7. retract: drop EVERY cache copy of this content (SP-11 — identical-content
+    //    publishes share a content msgId but cache as separate entries, so a
+    //    single splice would leave duplicates alive; same msgId ⟹ same publisher
+    //    ⟹ same signer, so the authorization above covers all of them) +
+    //    tombstone so a lagging replica can't resurrect it.
     const topicName = (env && typeof env.topic === 'string') ? env.topic : null;
-    cache.splice(idx, 1);
+    role.replayCache = cache.filter(e => e.postHash !== kill.msgId);
     this._addTombstone(kill.msgId);
     // 8. purge subscribers — delete-marked delivery on their sub() handler.
     const deleteJson = JSON.stringify({ deleted: true, msgId: kill.msgId, topic: topicName });
@@ -1423,10 +1427,15 @@ export class AxonaManager {
     const max = role.maxMessages || this.replayCacheSize;
 
     // Per-publisher quota (open topics): evict THIS publisher's own
-    // lowest-ordered entries first, so flooding self-limits.
+    // lowest-ordered entries first, so flooding self-limits. SP-10: anonymous
+    // (null-signer) publishes all share a single 'anon' bucket, so an unsigned
+    // flood can't bypass the cap simply by not signing. (Once publish-key PoW is
+    // enforced — Stage 4b — open topics require a PoW-stamped signer and this
+    // 'anon' bucket goes away.)
     const quota = opts.quotaPerPublisher;
-    if (quota && entry.signerPubkey) {
-      let mine = cache.filter(e => e.signerPubkey === entry.signerPubkey);
+    if (quota) {
+      const quotaKey = entry.signerPubkey ?? 'anon';
+      let mine = cache.filter(e => (e.signerPubkey ?? 'anon') === quotaKey);
       while (mine.length > quota) {
         const victim = this._lowestOrdered(mine);
         cache.splice(cache.indexOf(victim), 1);
@@ -2112,9 +2121,17 @@ export class AxonaManager {
    * it locally when it is itself one of the K roots, instead of routing a
    * response to itself.
    */
-  _buildMetricsResp(payload, role, topicIdBig) {
+  _buildMetricsResp(payload, role, topicIdBig, fromId = null) {
     const { postHashes, requesterId } = payload;
-    const requesterBig = _wire(requesterId);
+    const requesterBig = requesterId != null ? _wire(requesterId) : null;
+    // C-3 (reflection/amplification): only ever answer the PROVEN sender.
+    // `fromId === null` ⇒ locally originated (self-query) ⇒ trusted; otherwise
+    // the claimed `requesterId` MUST equal the authenticated channel peer — the
+    // same proven-fromId invariant as the B-1 subscribe path. An attacker can
+    // therefore only aim a response at itself, never at a named victim. This
+    // also drops a relayed `metricsBroadcast` (it arrives from a root, so
+    // fromId ≠ requesterId).
+    if (fromId !== null && requesterBig !== fromId) return null;
     // Ownership gate. A topic is "owned" only when it is anchored at a real
     // identity — a publisher nodeId whose low 256 bits are the SHA-256 of a
     // pubkey. Two anchor shapes are therefore UNOWNED, and their metrics are
@@ -2130,6 +2147,13 @@ export class AxonaManager {
     if (owned && anchor !== requesterBig) {
       return null;
     }
+    // C-3 (fail-CLOSED): the subscriber count is the owner-sensitive field. With
+    // an empty replay cache the owner is INDETERMINATE (no cached post to
+    // establish the anchor), so the topic could be owned — withhold the count
+    // (`null`) rather than leak it. Non-sensitive counts are still returned, and
+    // sibling roots that hold the queue answer the real subscriber count via the
+    // metricsReq-k aggregation.
+    const ownershipKnown = (role.replayCache?.length ?? 0) > 0;
     const byTopic = this._counters.get(topicIdBig) || new Map();
     const wantedHashes = (postHashes && postHashes.length > 0)
       ? postHashes
@@ -2144,15 +2168,18 @@ export class AxonaManager {
       responderId:   toHex(this.nodeId),
       entries,
       current_count: this._liveCacheCount(role),
-      subscribers:   role.children?.size ?? 0,
+      subscribers:   ownershipKnown ? (role.children?.size ?? 0) : null,
       timestamp:     this._now(),
     };
   }
 
-  _maybeRespondMetrics(payload, role, topicIdBig) {
-    const resp = this._buildMetricsResp(payload, role, topicIdBig);
+  _maybeRespondMetrics(payload, role, topicIdBig, meta) {
+    const fromId = meta?.fromId == null ? null : _wire(meta.fromId);
+    const resp = this._buildMetricsResp(payload, role, topicIdBig, fromId);
     if (!resp) return false;
-    this.dht.sendDirect(_wire(payload.requesterId), 'pubsub:metricsResp', resp);
+    // Reply only to the proven sender (fromId); when vouched it equals
+    // requesterId. Never route a response to an attacker-named address.
+    this.dht.sendDirect(fromId ?? _wire(payload.requesterId), 'pubsub:metricsResp', resp);
     return true;
   }
 
@@ -2170,12 +2197,10 @@ export class AxonaManager {
     if (!role) return 'forward';
     if (this._markMetricsReqSeen(requestId)) return 'consumed';
 
-    if (!this._maybeRespondMetrics(payload, role, topicId)) return 'consumed';
-
-    for (const [childId] of role.children) {
-      if (childId === this.nodeId) continue;
-      this.dht.sendDirect(childId, 'pubsub:metricsBroadcast', payload);
-    }
+    // Reply only to the proven sender; no child fan-out (the requester queries
+    // the full K-closest root set directly via metricsReq-k, so the broadcast
+    // was pure amplification — and the C-3 vouch check now drops it anyway).
+    this._maybeRespondMetrics(payload, role, topicId, meta);
     return 'consumed';
   }
 
@@ -2192,28 +2217,20 @@ export class AxonaManager {
     const role = this.axonRoles.get(topicId);
     if (!role) return;
     if (this._markMetricsReqSeen(requestId)) return;
-    if (!this._maybeRespondMetrics(payload, role, topicId)) return;
-    for (const [childId] of role.children) {
-      if (childId === this.nodeId) continue;
-      this.dht.sendDirect(childId, 'pubsub:metricsBroadcast', payload);
-    }
+    this._maybeRespondMetrics(payload, role, topicId, meta);
   }
 
+  // Retained for backward-compat with peers that still emit metricsBroadcast.
+  // The C-3 vouch check makes it inert: a relayed request arrives from a root
+  // (fromId ≠ requesterId), so it never produces a response, and there is no
+  // further fan-out.
   _onMetricsBroadcast(payload, meta) {
     const topicId = _wire(payload.topicId);
     const { requestId } = payload;
     const role = this.axonRoles.get(topicId);
     if (!role) return;
     if (this._markMetricsReqSeen(requestId)) return;
-
-    if (!this._maybeRespondMetrics(payload, role, topicId)) return;
-
-    const fromId = _wire(meta.fromId);
-    for (const [childId] of role.children) {
-      if (childId === this.nodeId) continue;
-      if (childId === fromId) continue;
-      this.dht.sendDirect(childId, 'pubsub:metricsBroadcast', payload);
-    }
+    this._maybeRespondMetrics(payload, role, topicId, meta);
   }
 
   _onMetricsResp(payload, meta) {
@@ -2363,10 +2380,6 @@ export class AxonaManager {
                 current_count: resp.current_count,
                 subscribers:   resp.subscribers,
               });
-              for (const [childId] of role.children) {
-                if (childId === this.nodeId) continue;
-                this.dht.sendDirect(childId, 'pubsub:metricsBroadcast', reqPayload);
-              }
             }
           }
           continue;
