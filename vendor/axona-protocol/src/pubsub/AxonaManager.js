@@ -73,6 +73,13 @@ export const MAX_PUBLISH_BYTES = 256 * 1024;         // per-publish `json` paylo
 const MAX_SUBSCRIBER_BATCH     = 512;                // adopt-subscribers subscriberIds[] ceiling
 const MAX_PEER_ROOTS           = 32;                 // peerRoots[] ceiling (R is ~5)
 const MAX_REPLAY_BATCH         = DEFAULT_REPLAY_CACHE_SIZE; // replay-batch messages[] ceiling
+// Gap-safe replay: a subscriber reports the recent postHashes it HOLDS so a root
+// replays only what's actually missing. A single lastSeenTs high-water can't
+// represent a hole — once you receive anything newer than a gap, the gap is
+// masked forever (the "occasional missing message that never recovers" bug).
+// Sized a bit above the replay cache so steady-state subscribers report a
+// superset of any root's cache ⇒ nothing is re-sent.
+const MAX_HAVE                 = 256;
 
 // C-2: per-publisher seq reorder tolerance.  seq is wall-clock-seeded
 // (~ms units; see AxonaPeer._nextPubSeq), so this is effectively "reject a
@@ -100,6 +107,14 @@ const MAX_TOMBSTONES   = 4096;
 // proportional to recent retraction activity, never forever.
 const KILL_REGOSSIP_MS = 10 * 60 * 1000;
 const MAX_KILL_SYNC    = 64;            // kills per kill-sync message (ceiling)
+// Fix 2 — root-to-root message anti-entropy: roots exchange digests of held
+// postHashes with their K-closest siblings and pull what they're missing, so a
+// subscriber attached to ANY root gets every publisher's feed (closes the
+// publisher-local-K-closest divergence — a publish lands on the publisher's
+// K-closest, which need not be the subscriber's). Round-robin a few topics per
+// refresh tick to bound traffic; pulled messages are RE-VERIFIED (a sibling root
+// is not trusted). MAX_HAVE / MAX_REPLAY_BATCH bound the digest / response.
+const MSGSYNC_TOPICS_PER_TICK = 8;
 
 // Phase A #5: message hold time.  A message expires (is swept from replay
 // caches and no longer served/pulled) at its (signed, freshness-clamped)
@@ -179,6 +194,7 @@ export class AxonaManager {
     // BigInt topicId key.
     /** @type {Map<bigint, number>} */
     this._lastSeenTsByTopic = new Map();
+    this._haveByTopic = new Map();        // topicId → Set<postHash> recently received (gap-safe replay digest)
 
     // Set of publishIds this node has ever received, keyed by BigInt topicId.
     // publishId is a string (`${nodeId(decimal)}:counter` — not a DHT address).
@@ -213,6 +229,7 @@ export class AxonaManager {
     this._seenKills   = new Map();       // kill.signature -> insertedAt (ms) | {at,kill,topicId} once authorized
     this._seenKillCap = 4096;
     this._lastKillAt  = 0;               // newest authorized-kill ts → steady-state reconciliation skip
+    this._msgSyncCursor = 0;             // round-robin index into hosted topics for anti-entropy
     // Phase A #7 (touch): dedup set for touch objects already processed
     // (keyed by the touch's signature), same bound as kills.
     this._seenTouches   = new Map();     // touch.signature -> insertedAt (ms)
@@ -280,6 +297,8 @@ export class AxonaManager {
     dht.onRoutedMessage('pubsub:kill',         (p, m) => this._onKill(p, m));
     dht.onDirectMessage('pubsub:kill-k',       (p, m) => this._onKillDirect(p, m));
     dht.onDirectMessage('pubsub:kill-sync',    (p, m) => this._onKillSync(p, m));
+    dht.onDirectMessage('pubsub:msgsync',      (p, m) => this._onMsgSync(p, m));
+    dht.onDirectMessage('pubsub:msgsync-resp', (p, m) => this._onMsgSyncResp(p, m));
     dht.onRoutedMessage('pubsub:touch',        (p, m) => this._onTouch(p, m));
     dht.onDirectMessage('pubsub:touch-k',      (p, m) => this._onTouchDirect(p, m));
     dht.onRoutedMessage('pubsub:unpub',        (p, m) => this._onUnpub(p, m));
@@ -592,6 +611,7 @@ export class AxonaManager {
   async _asyncSubscribe(topicId, lastSeenTs) {
     const topicIdHex   = toHex(topicId);
     const selfHex      = toHex(this.nodeId);
+    const have         = this._haveFor(topicId);     // gap-safe digest: what we already hold
     if (this._useKClosestMode()) {
       const roots = await this._findKClosest(topicId, this.rootSetSize);
       if (roots.length > 0) {
@@ -600,7 +620,7 @@ export class AxonaManager {
         for (const peerId of roots) {
           this.dht.sendDirect(peerId, 'pubsub:subscribe-k', {
             topicId: topicIdHex, subscriberId: selfHex,
-            peerRoots: rootsHex, lastSeenTs,
+            peerRoots: rootsHex, lastSeenTs, have,
           });
         }
         return;
@@ -615,14 +635,14 @@ export class AxonaManager {
           if (target === this.nodeId) continue;
           this.dht.sendDirect(target, 'pubsub:subscribe-k', {
             topicId: topicIdHex, subscriberId: selfHex,
-            peerRoots: targetsHex, lastSeenTs,
+            peerRoots: targetsHex, lastSeenTs, have,
           });
         }
         return;
       }
     }
     this.dht.routeMessage(topicId, 'pubsub:subscribe', {
-      topicId: topicIdHex, subscriberId: selfHex, lastSeenTs,
+      topicId: topicIdHex, subscriberId: selfHex, lastSeenTs, have,
     });
   }
 
@@ -953,6 +973,85 @@ export class AxonaManager {
     }
   }
 
+  // ── Fix 2: root-to-root message anti-entropy ───────────────────────────
+
+  /**
+   * Ask the current K-closest sibling roots for whatever this topic's replay
+   * cache is MISSING, by sending each our digest of held postHashes. A sibling
+   * replies (pubsub:msgsync-resp) with the complement, which we re-verify and
+   * ingest. Steady-state (converged) ⇒ siblings reply with nothing.
+   */
+  async _antiEntropyTopic(topicId, role) {
+    if (!role || !(role.isRoot || role.isInRootSet)) return;
+    if (!this._useKClosestMode()) return;
+    const roots = await this._findKClosest(topicId, this.rootSetSize);
+    const siblings = roots.filter((r) => r !== this.nodeId);
+    if (siblings.length === 0) return;
+    const have = (role.replayCache || []).map((e) => e.postHash).filter(Boolean).slice(0, MAX_HAVE);
+    const payload = { topicId: toHex(topicId), have, requesterId: toHex(this.nodeId) };
+    for (const sib of siblings) this.dht.sendDirect(sib, 'pubsub:msgsync', payload);
+  }
+
+  /** Sibling asked what they're missing: reply with the cache entries whose
+   *  postHash isn't in their `have` digest (bounded, tombstones excluded). */
+  async _onMsgSync(payload, meta) {
+    const topicId = _wire(payload.topicId);
+    const role = this.axonRoles.get(topicId);
+    if (!role || !(role.isRoot || role.isInRootSet)) return;     // only a hosting root answers
+    const requester = meta?.fromId != null ? _wire(meta.fromId)
+                    : (typeof payload.requesterId === 'string' ? _wire(payload.requesterId) : null);
+    if (requester == null || requester === this.nodeId) return;
+    this._sweepRole(role, this._now());
+    const have = new Set(Array.isArray(payload.have) ? payload.have.slice(0, MAX_HAVE) : []);
+    const missing = (role.replayCache || [])
+      .filter((e) => e.postHash && !have.has(e.postHash) && !this._isTombstoned(e.postHash))
+      .slice(0, MAX_REPLAY_BATCH);
+    if (missing.length === 0) return;
+    this.dht.sendDirect(requester, 'pubsub:msgsync-resp', { topicId: toHex(topicId), messages: missing });
+  }
+
+  /** Sibling's reply: re-verify + ingest each message we were missing. */
+  async _onMsgSyncResp(payload, meta) {
+    const topicId = _wire(payload.topicId);
+    const role = this.axonRoles.get(topicId);
+    if (!role || !(role.isRoot || role.isInRootSet)) return;
+    const batch = Array.isArray(payload.messages) ? payload.messages.slice(0, MAX_REPLAY_BATCH) : [];
+    let added = 0;
+    for (const msg of batch) { if (await this._ingestSyncedMessage(topicId, role, msg)) added++; }
+    if (added) this._emitLog?.('debug', 'msgsync-ingested', { topicId: toHex(topicId), added });
+  }
+
+  /**
+   * Ingest a message pulled from a sibling root. SECURITY: a sibling root is NOT
+   * trusted — re-verify the publisher signature + postHash integrity (the same
+   * B-4 checks as live publish ingress). We deliberately SKIP the C-2 freshness/
+   * seq check: backfilling older messages is the whole point of anti-entropy,
+   * and signature + postHash already prove authenticity + integrity.
+   * @returns {Promise<boolean>} true if newly cached.
+   */
+  async _ingestSyncedMessage(topicId, role, msg) {
+    const { json, publishId, publishTs, postHash } = msg || {};
+    let { publisher } = msg || {};
+    if (typeof json !== 'string' || json.length > MAX_PUBLISH_BYTES) return false;
+    if (typeof postHash !== 'string' || postHash.length === 0) return false;
+    if (this._isTombstoned(postHash)) return false;
+    if ((role.replayCache || []).some((e) => e.postHash === postHash)) return false;   // already hold (by content)
+    if (!(await this._publishSignatureOk(json))) return false;          // forged signed envelope → drop
+    if (!(await this._postHashConsistent(json, postHash))) return false; // poisoned content address → drop
+    if (typeof publisher === 'string') { try { publisher = _wire(publisher); } catch { publisher = null; } }
+    this._addToReplayCache(role, { json, publishId, publishTs, postHash, publisher });
+    this._recordReceived(topicId, publishId, publishTs);
+    this._recordHave(topicId, postHash);
+    // Fan out to any local subscriber children that missed this publisher's feed.
+    const topicIdHex = toHex(topicId);
+    const publisherHex = publisher == null ? publisher : toHex(publisher);
+    for (const [childId] of role.children) {
+      if (childId === this.nodeId) { this._deliverToApp(topicId, json, publishId, publishTs); continue; }
+      this.dht.sendDirect(childId, 'pubsub:deliver', { topicId: topicIdHex, json, publishId, publishTs, postHash, publisher: publisherHex });
+    }
+    return true;
+  }
+
   // ── Touch (creator-only keep-alive, Phase A #7) ────────────────────────
 
   /** Routed touch ingress.  Returns a routing verdict ('consumed'|'forward'). */
@@ -1167,6 +1266,9 @@ export class AxonaManager {
     const topicId      = _wire(payload.topicId);
     const subscriberId = _wire(payload.subscriberId);
     const { lastSeenTs } = payload;
+    const have = Array.isArray(payload.have)
+      ? payload.have.slice(0, MAX_HAVE).filter(h => typeof h === 'string')
+      : null;
     // B-1 (routed reflection/amplification): enrolling `subscriberId` makes
     // this node relay the topic's full feed — plus a ≤100-message replay
     // blast — directly to that id by nodeId.  On the routed path `meta.fromId`
@@ -1188,7 +1290,7 @@ export class AxonaManager {
       if (subscriberId === this.nodeId) return 'forward';
       if (!vouchedFor) return 'forward';   // can't vouch for this id → keep routing, don't enroll
       await this._addOrRecruitChild(topicId, role, subscriberId, fromId);
-      await this._maybeSendReplay(topicId, role, subscriberId, lastSeenTs);
+      await this._maybeSendReplay(topicId, role, subscriberId, lastSeenTs, have);
       return 'consumed';
     }
 
@@ -1576,6 +1678,26 @@ export class AxonaManager {
     }
   }
 
+  // Note we HOLD this content (by postHash) so a future re-subscribe can tell a
+  // root exactly what to skip — gap-safe, unlike the lastSeenTs high-water.
+  _recordHave(topicId, postHash) {
+    if (!postHash) return;
+    let set = this._haveByTopic.get(topicId);
+    if (!set) { set = new Set(); this._haveByTopic.set(topicId, set); }
+    set.add(postHash);
+    if (set.size > MAX_HAVE) {                 // drop oldest (insertion-ordered Set)
+      const drop = set.size - MAX_HAVE;
+      let i = 0; for (const k of set) { if (i++ >= drop) break; set.delete(k); }
+    }
+  }
+
+  // The recent postHashes this node holds for `topicId` — sent on (re)subscribe
+  // so a root replays only the complement (what we're actually missing).
+  _haveFor(topicId) {
+    const set = this._haveByTopic.get(topicId);
+    return set ? [...set] : [];
+  }
+
   _alreadySeenPublish(publishId) {
     if (!publishId) return false;
     const now = this._now();
@@ -1613,6 +1735,7 @@ export class AxonaManager {
     if (this._alreadySeenPublish(publishId)) return;
 
     this._recordReceived(topicId, publishId, publishTs);
+    this._recordHave(topicId, postHash);
 
     const role = this.axonRoles.get(topicId);
     if (role) {
@@ -1753,6 +1876,10 @@ export class AxonaManager {
     const peerRoots = Array.isArray(peerRootsHex)
       ? peerRootsHex.slice(0, MAX_PEER_ROOTS).map(h => _wire(h)).filter(p => p !== this.nodeId)
       : [];
+    // D-1: cap the gap-safe digest (a legit `have` is ≤ the subscriber's cache).
+    const have = Array.isArray(payload.have)
+      ? payload.have.slice(0, MAX_HAVE).filter(h => typeof h === 'string')
+      : null;
     const now = this._now();
 
     let role = this.axonRoles.get(topicId);
@@ -1777,14 +1904,16 @@ export class AxonaManager {
     }
 
     await this._addOrRecruitChild(topicId, role, subscriberId, subscriberId);
-    await this._maybeSendReplay(topicId, role, subscriberId, lastSeenTs);
+    await this._maybeSendReplay(topicId, role, subscriberId, lastSeenTs, have);
   }
 
   /**
-   * Replay any cached publishes newer than lastSeenTs to a subscriber.
-   * subscriberId is BigInt; topicId is BigInt.
+   * Replay cached publishes a subscriber is missing. `have` (array of postHashes
+   * the subscriber holds) is gap-safe: we replay exactly the complement. Falls
+   * back to the lastSeenTs high-water only for pre-v2.37 subscribers that don't
+   * send `have` (back-compat). subscriberId/topicId are BigInt.
    */
-  async _maybeSendReplay(topicId, role, subscriberId, lastSeenTs) {
+  async _maybeSendReplay(topicId, role, subscriberId, lastSeenTs, have = null) {
     if (!subscriberId) return;
     // Phase A #5: never replay expired messages; sweep them first.
     this._sweepRole(role, this._now());
@@ -1814,9 +1943,17 @@ export class AxonaManager {
     // tombstoned, even if a stale cache entry lingers (defense in depth — the
     // receiver's own tombstone set is empty right after a reload).
     const fresh = cache.filter(m => !(m.postHash && this._isTombstoned(m.postHash)));
-    const missed = (lastSeenTs != null && lastSeenTs > 0)
-      ? fresh.filter(m => m.publishTs > lastSeenTs)
-      : fresh.slice();
+    let missed;
+    if (Array.isArray(have)) {
+      // Gap-safe: replay exactly what the subscriber doesn't already hold. An
+      // entry with no postHash can't be deduped by content, so always include it.
+      const haveSet = new Set(have);
+      missed = fresh.filter(m => !m.postHash || !haveSet.has(m.postHash));
+    } else if (lastSeenTs != null && lastSeenTs > 0) {
+      missed = fresh.filter(m => m.publishTs > lastSeenTs);   // legacy fallback (maskable; pre-v2.37 subscribers)
+    } else {
+      missed = fresh.slice();
+    }
     if (missed.length === 0) return;
     await this.dht.sendDirect(subscriberId, 'pubsub:replay-batch', {
       topicId: toHex(topicId),
@@ -1846,6 +1983,7 @@ export class AxonaManager {
       // The smoking gun: a root served us this message on (re)subscribe. If it
       // was previously killed, `from` names the replica that missed the kill.
       this._emitLog?.('debug', 'replay-serve', { from, msgId: postHash, publishId });
+      this._recordHave(topicId, postHash);     // now we hold it → won't re-request next time
       // App delivery is gated by _appDelivered (inside _deliverToApp), NOT by
       // the network-level _seenPublishes set. A node that relayed this publish
       // as a K-closest ROOT marked it in _seenPublishes WITHOUT delivering to
@@ -2005,6 +2143,20 @@ export class AxonaManager {
     if (now - this._lastKillAt < KILL_REGOSSIP_MS) {
       for (const [topicId, role] of this.axonRoles) {
         await this._syncKillsForTopic(topicId, role);
+      }
+    }
+
+    // Fix 2: root-to-root message anti-entropy. Round-robin a bounded slice of
+    // hosted topics each tick so every K-closest root converges on every
+    // publisher's feed (a publish only reached the PUBLISHER's K-closest set).
+    if (this._useKClosestMode()) {
+      const hosted = [...this.axonRoles.entries()].filter(([, r]) => r.isRoot || r.isInRootSet);
+      if (hosted.length > 0) {
+        for (let i = 0; i < Math.min(MSGSYNC_TOPICS_PER_TICK, hosted.length); i++) {
+          const [topicId, role] = hosted[(this._msgSyncCursor + i) % hosted.length];
+          await this._antiEntropyTopic(topicId, role);
+        }
+        this._msgSyncCursor = (this._msgSyncCursor + MSGSYNC_TOPICS_PER_TICK) % hosted.length;
       }
     }
 

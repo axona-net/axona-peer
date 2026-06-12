@@ -21,6 +21,8 @@
 import {
   generateKeyPair,
   exportPublicKey,
+  exportPrivateKeyPkcs8,
+  importPrivateKey,
   sign,
   verify,
 }                                       from '../pubsub/ed25519.js';
@@ -115,7 +117,7 @@ export async function deriveIdentity({ lat, lng, extractable = true }) {
 export async function dumpIdentity(identity) {
   let pkcs8;
   try {
-    pkcs8 = await crypto.subtle.exportKey('pkcs8', identity.privateKey);
+    pkcs8 = await exportPrivateKeyPkcs8(identity.privateKey);   // native or software key
   } catch (cause) {
     throw new IdentityError(ErrorCodes.IDENTITY_LOAD_FAILED,
       `dumpIdentity: privateKey export failed (${cause.message})`,
@@ -165,13 +167,7 @@ export async function loadIdentity(envelope) {
   const pubkeyBytes = hexToBytes(pubkey);
   let privateKey;
   try {
-    privateKey = await crypto.subtle.importKey(
-      'pkcs8',
-      bytesToBase64.decode(privkey),
-      ALGORITHM,
-      true,
-      ['sign'],
-    );
+    privateKey = await importPrivateKey(bytesToBase64.decode(privkey));   // native or software key
   } catch (cause) {
     throw new IdentityError(ErrorCodes.IDENTITY_LOAD_FAILED,
       `loadIdentity: privateKey import failed (${cause.message})`,
