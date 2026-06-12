@@ -44,7 +44,7 @@ echo "→ Syncing from ${PROTOCOL_SRC}"
 echo "  to            ${VENDOR_DST}"
 
 mkdir -p "${VENDOR_DST}"
-for dir in contracts dht identity persistence pow pubsub transport utils; do
+for dir in contracts crypto dht identity persistence pow pubsub transport utils; do
   if [ -d "${PROTOCOL_SRC}/${dir}" ]; then
     rm -rf "${VENDOR_DST}/${dir}"
     cp -r "${PROTOCOL_SRC}/${dir}" "${VENDOR_DST}/${dir}"
