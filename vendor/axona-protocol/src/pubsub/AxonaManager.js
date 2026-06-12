@@ -261,6 +261,26 @@ export class AxonaManager {
     /** @type {Map<bigint, TopicSub>} topicId(BigInt) → sub state for our own subs */
     this.mySubscriptions = new Map();
 
+    /**
+     * @type {Map<bigint, {hostedAt:number}>} topicId(BigInt) → host state.
+     * Topics this node HOSTS (stores + serves) without consuming. A hosted
+     * topic is announced into its K-closest set on the same subscribe-k
+     * heartbeat a subscriber uses — so the node is surfaced in neighbors'
+     * synaptomes and recruited as a root/replica — but it is deliberately
+     * NOT in mySubscriptions (no app delivery, no "my own feed" semantics).
+     * Decouples "I will host this for others" from "I want to receive this."
+     */
+    this._hostedTopics = new Map();
+
+    /**
+     * When true, this node volunteers as a host for its OWN keyspace
+     * neighborhood: each refresh it announces toward the ids closest to its
+     * nodeId, so publishers' findKClosest surface it and demand-driven
+     * recruitment makes it a root for whatever topics land near it. This is
+     * the "host whatever lands near me" relay primitive.
+     */
+    this._hostKeyspace = false;
+
     /** Delivery callback — registered by PubSubAdapter via onPubsubDelivery. */
     this._deliveryCallback = null;
 
@@ -396,6 +416,8 @@ export class AxonaManager {
   resetState() {
     this.axonRoles.clear();
     this.mySubscriptions.clear();
+    this._hostedTopics.clear();
+    this._hostKeyspace = false;
     this._lastSeenTsByTopic.clear();
     this._receivedPublishIds.clear();
     this._seenPublishes.clear();
@@ -678,6 +700,84 @@ export class AxonaManager {
   /** True when the underlying transport supports K-closest lookup. */
   _useKClosestMode() {
     return this.rootSetSize > 0 && typeof this.dht.findKClosest === 'function';
+  }
+
+  /**
+   * Host a topic (store + serve for others) WITHOUT subscribing as a
+   * consumer. Announces this node into the topic's K-closest set using the
+   * SAME `pubsub:subscribe-k` heartbeat a subscriber uses — so the node is
+   * surfaced in neighbors' synaptomes and recruited as a root/replica, and
+   * the roots backfill it (via the `have` digest in `_asyncSubscribe`) so it
+   * can serve replays. The difference from `pubsubSubscribe` is purely local:
+   * the topic is tracked in `_hostedTopics` (re-announced every refresh) and
+   * NOT in `mySubscriptions`, and the AxonaPeer layer registers no
+   * Subscription/handler — so nothing is delivered to a local application.
+   *
+   * Wire-compatible with every existing kernel: a root processing our
+   * subscribe-k can't tell a host from a subscriber, so no flag day.
+   *
+   * @param {bigint} topicId
+   */
+  pubsubHost(topicId) {
+    if (typeof topicId !== 'bigint') {
+      throw new TypeError(`AxonaManager.pubsubHost: topicId must be bigint, got ${typeof topicId}`);
+    }
+    this._hostedTopics.set(topicId, { hostedAt: this._now() });
+    const lastSeenTs = this._lastSeenTsByTopic.get(topicId);
+    this._asyncSubscribe(topicId, lastSeenTs)
+      .catch(err => console.error('AxonaManager: host failed:', err));
+  }
+
+  /**
+   * Stop hosting a topic. Best-effort tells the root set to drop us
+   * (unsubscribe-k removes only our OWN id — the B-1 invariant), and the
+   * recruited role lapses naturally once traffic stops reaching us.
+   * @param {bigint} topicId
+   */
+  pubsubUnhost(topicId) {
+    if (typeof topicId !== 'bigint') {
+      throw new TypeError(`AxonaManager.pubsubUnhost: topicId must be bigint, got ${typeof topicId}`);
+    }
+    this._hostedTopics.delete(topicId);
+    this._asyncUnsubscribe(topicId).catch(() => { /* best-effort */ });
+  }
+
+  /**
+   * Toggle keyspace hosting — volunteer as a host for whatever topics land
+   * near this node's id. When on, `_announceKeyspace` runs now and on every
+   * refresh tick.
+   * @param {boolean} [on=true]
+   */
+  pubsubHostKeyspace(on = true) {
+    this._hostKeyspace = !!on;
+    if (this._hostKeyspace) {
+      this._announceKeyspace().catch(err => console.error('AxonaManager: host-keyspace failed:', err));
+    }
+  }
+
+  /**
+   * Announce this node toward its own keyspace neighborhood so neighbors keep
+   * it in their synaptome and surface it in find_closest_set responses — the
+   * prerequisite for demand-driven recruitment as a root for nearby topics.
+   * Reuses subscribe-k under topicId = our own nodeId (a self-anchored,
+   * never-published "topic"); the role neighbors create for it is harmless
+   * keyspace bookkeeping that TTLs out, while the side effect — being known —
+   * is exactly what gets us recruited for the REAL topics near us.
+   * @private
+   */
+  async _announceKeyspace() {
+    if (!this._useKClosestMode()) return;
+    const selfHex   = toHex(this.nodeId);
+    const neighbors = await this._findKClosest(this.nodeId, this.rootSetSize);
+    if (!neighbors || neighbors.length === 0) return;
+    const neighborsHex = neighbors.map(r => typeof r === 'bigint' ? toHex(r) : r);
+    for (const peerId of neighbors) {
+      if (peerId === this.nodeId) continue;
+      const p = this.dht.sendDirect(peerId, 'pubsub:subscribe-k', {
+        topicId: selfHex, subscriberId: selfHex, peerRoots: neighborsHex,
+      });
+      if (p?.catch) p.catch(() => {});
+    }
   }
 
   /**
@@ -2259,6 +2359,18 @@ export class AxonaManager {
       const lastSeenTs = this._lastSeenTsByTopic.get(topicId);
       issueSubscribe(topicId, lastSeenTs, null);
     }
+    // Host heartbeat: re-announce explicitly-hosted topics (same wire as a
+    // subscriber, no local delivery) so the root set keeps us in its serving
+    // tree, and announce our keyspace so we keep getting recruited for
+    // whatever lands near us.
+    for (const topicId of this._hostedTopics.keys()) {
+      if (this.mySubscriptions.has(topicId)) continue;   // already announced above
+      const lastSeenTs = this._lastSeenTsByTopic.get(topicId);
+      issueSubscribe(topicId, lastSeenTs, null);
+    }
+    if (this._hostKeyspace) {
+      this._announceKeyspace().catch(() => { /* best-effort */ });
+    }
     for (const [topicId, role] of this.axonRoles) {
       if (role.children.size === 0) continue;
       const lastSeenTs = this._lastSeenTsByTopic.get(topicId);
@@ -2692,11 +2804,24 @@ export class AxonaManager {
     return out;
   }
 
+  /**
+   * Host-mode introspection for health()/the relay TUI.
+   * @returns {{keyspace:boolean, topics:string[]}}
+   */
+  inspectHosting() {
+    return {
+      keyspace: this._hostKeyspace,
+      topics:   [...this._hostedTopics.keys()].map(t => typeof t === 'bigint' ? toHex(t) : t),
+    };
+  }
+
   /** Clean shutdown — stop the timer. */
   destroy() {
     this.stop();
     this.axonRoles.clear();
     this.mySubscriptions.clear();
+    this._hostedTopics.clear();
+    this._hostKeyspace = false;
     this._deliveryCallback = null;
   }
 }

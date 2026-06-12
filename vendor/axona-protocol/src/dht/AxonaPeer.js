@@ -1689,6 +1689,82 @@ export class AxonaPeer extends DHT {
     return { ok: true, removed: subs.length };
   }
 
+  /**
+   * Host a topic — store and serve it for other peers WITHOUT subscribing as
+   * a consumer. This is the relay/infrastructure primitive: it makes the node
+   * a willing root/replica so publishes land on it and subscribers can pull
+   * replays from it, but it registers NO handler and delivers nothing to a
+   * local application. Decoupled from `sub()` on purpose — hosting is "I'll
+   * serve this for others," subscribing is "I want to receive this."
+   *
+   * Two forms:
+   *   • `host()`           — host this node's own keyspace neighborhood: get
+   *                          recruited as a root for whatever topics land near
+   *                          this node's id ("host whatever lands near me").
+   *   • `host(topic, opts)` — host one specific topic. `opts.publisher` selects
+   *                          the topic-id derivation exactly like `sub()`
+   *                          (default = this node's feed, `null` = public
+   *                          topic, hex = someone else's feed).
+   *
+   * Wire-compatible with every existing kernel (reuses `subscribe-k`), so it
+   * needs no flag day. Idempotent.
+   *
+   * @param {string} [topic]
+   * @param {object} [opts]
+   * @param {string|null} [opts.publisher]
+   * @returns {Promise<{ ok: boolean, scope: 'keyspace'|'topic', topicId?: string }>}
+   */
+  async host(topic, opts = {}) {
+    const am = this._requireAxonaManager('host');
+    if (topic === undefined) {
+      am.pubsubHostKeyspace(true);
+      this._markPersistDirty('hosting');
+      return { ok: true, scope: 'keyspace' };
+    }
+    if (typeof topic !== 'string' || topic.length === 0) {
+      throw new SubscribeError(ErrorCodes.SUBSCRIBE_INVALID_TOPIC,
+        `peer.host: topic must be a non-empty string (or omitted for keyspace), got ${typeof topic}`,
+        { context: { topic } });
+    }
+    const publisherId  = 'publisher' in opts ? opts.publisher : this._nodeIdHex();
+    const publisherBig = publisherId === null ? null : fromHex(publisherId);
+    const topicIdBig   = await deriveTopicIdBig(publisherBig, topic);
+    this._applySince(am, topicIdBig, opts.since);
+    am.pubsubHost(topicIdBig);
+    this._markPersistDirty('hosting');
+    return { ok: true, scope: 'topic', topicId: toHex(topicIdBig) };
+  }
+
+  /**
+   * Stop hosting — the counterpart to `host()`. `unhost()` with no topic
+   * turns off keyspace hosting; `unhost(topic)` drops one hosted topic.
+   * Does NOT touch your subscriptions. Idempotent.
+   *
+   * @param {string} [topic]
+   * @param {object} [opts]
+   * @param {string|null} [opts.publisher]
+   * @returns {Promise<{ ok: boolean, scope: 'keyspace'|'topic' }>}
+   */
+  async unhost(topic, opts = {}) {
+    const am = this._requireAxonaManager('unhost');
+    if (topic === undefined) {
+      am.pubsubHostKeyspace(false);
+      this._markPersistDirty('hosting');
+      return { ok: true, scope: 'keyspace' };
+    }
+    if (typeof topic !== 'string' || topic.length === 0) {
+      throw new SubscribeError(ErrorCodes.SUBSCRIBE_INVALID_TOPIC,
+        `peer.unhost: topic must be a non-empty string (or omitted), got ${typeof topic}`,
+        { context: { topic } });
+    }
+    const publisherId  = 'publisher' in opts ? opts.publisher : this._nodeIdHex();
+    const publisherBig = publisherId === null ? null : fromHex(publisherId);
+    const topicIdBig   = await deriveTopicIdBig(publisherBig, topic);
+    am.pubsubUnhost(topicIdBig);
+    this._markPersistDirty('hosting');
+    return { ok: true, scope: 'topic' };
+  }
+
   /** @internal — called by Subscription.stop() */
   async _unsubscribeInternal(sub) {
     // sub._topicId is the BigInt key (kernel form); sub.topicId getter
@@ -2024,6 +2100,10 @@ export class AxonaPeer extends DHT {
         }
       } catch { /* best-effort */ }
     }
+    let hosting = null;
+    if (am && typeof am.inspectHosting === 'function') {
+      try { hosting = am.inspectHosting(); } catch { /* best-effort */ }
+    }
     // ── transport / routing-truth observability ──────────────────────
     // Web transport exposes boundPeers() (authenticated nodeIds), .mesh
     // (DC-level peer snapshot), and .webrtc (mesh-only bind set).  Sim
@@ -2069,6 +2149,7 @@ export class AxonaPeer extends DHT {
       peers:         this.peers(),
       subscriptions: this._subscriptions.size,
       axonRoles,
+      hosting,
       wireVersion:   this._transport?.wireVersion ?? null,
       started:       this._started === true,
       transport,
