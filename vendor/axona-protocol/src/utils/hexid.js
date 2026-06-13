@@ -59,15 +59,22 @@ export function toHex(id) {
  * @param {string} hex
  * @returns {bigint}
  */
+// Stable marker on every "this isn't a valid id" error fromHex throws, so a
+// caller (e.g. a transport dispatch boundary) can classify a malformed-frame
+// drop — an expected, low-severity condition during churn/shutdown — apart from
+// a genuine bug, WITHOUT string-matching the message text.
+export const BAD_ID_CODE = 'AXONA_BAD_ID';
+const badId = (err) => { err.code = BAD_ID_CODE; return err; };
+
 export function fromHex(hex) {
   if (typeof hex !== 'string') {
-    throw new TypeError(`fromHex expects string, got ${typeof hex}`);
+    throw badId(new TypeError(`fromHex expects string, got ${typeof hex}`));
   }
   if (hex.length !== HEX_CHARS) {
-    throw new RangeError(`hex id must be ${HEX_CHARS} chars, got ${hex.length}`);
+    throw badId(new RangeError(`hex id must be ${HEX_CHARS} chars, got ${hex.length}`));
   }
   if (!/^[0-9a-fA-F]+$/.test(hex)) {
-    throw new RangeError(`hex id contains non-hex chars`);
+    throw badId(new RangeError(`hex id contains non-hex chars`));
   }
   return BigInt('0x' + hex);
 }

@@ -40,7 +40,7 @@
 import { DHT }            from '../contracts/DHT.js';
 import { Synapse }        from './Synapse.js';
 import { Subscription }   from './Subscription.js';
-import { clz264, toHex, fromHex, isHexId } from '../utils/hexid.js';
+import { clz264, toHex, fromHex, isHexId, BAD_ID_CODE } from '../utils/hexid.js';
 import { deriveTopicId, deriveTopicIdBig } from '../pubsub/post.js';
 import { buildEnvelope }  from '../pubsub/envelope.js';
 import { buildKill }      from '../pubsub/kill.js';
@@ -3364,9 +3364,26 @@ export class AxonaPeer extends DHT {
       const result = await handler(payload, meta);
       return result || 'forward';
     } catch (err) {
-      console.error(`AxonaPeer routed handler error at ${node.id} for '${type}':`, err);
+      this._onHandlerError('routed', type, err);
       return 'forward';
     }
+  }
+
+  /**
+   * Single sink for any error a pub/sub message handler throws (sync or async,
+   * direct or routed). A malformed-id error (`BAD_ID_CODE` — a truncated id from
+   * a peer mid-teardown reaching a field the transport-level fromId check didn't
+   * cover) is an EXPECTED churn-time drop, logged at debug; anything else is a
+   * genuine bug, logged loudly. This is the one place that makes "a malformed
+   * frame can never crash or spam a node" true for every handler and every id
+   * field — no per-handler or per-registration guard required.
+   */
+  _onHandlerError(kind, type, err) {
+    if (err && err.code === BAD_ID_CODE) {
+      this._emitLog?.('debug', 'drop-malformed-frame', { kind, type, reason: err.message });
+      return;
+    }
+    console.error(`AxonaPeer ${kind} handler error at ${this._node?.id} for '${type}':`, err);
   }
 
   /**
@@ -3488,17 +3505,26 @@ export class AxonaPeer extends DHT {
         const h = this._directHandlers.get(type);
         if (!h) return;
         const fromHex = (typeof fromId === 'bigint') ? nodeIdToHex(fromId) : fromId;
-        const onErr = (err) => console.error(`AxonaPeer direct handler error at ${node.id} for '${type}':`, err);
+        // A node id is ALWAYS 66 hex chars. A present-but-malformed sender id
+        // (e.g. a 3-char `fromId` from a peer tearing down mid-shutdown) is a
+        // corrupt frame for every subsystem, not just pub/sub — drop it once,
+        // here, rather than letting each handler re-discover it by throwing.
+        // (null/undefined fromId = locally-originated ⇒ allowed.)
+        if (typeof fromHex === 'string' && fromHex.length > 0 && !isHexId(fromHex)) {
+          this._emitLog?.('debug', 'drop-malformed-frame', { type, reason: 'bad-fromId' });
+          return;
+        }
         try {
           // Handlers are frequently async: a *synchronous* throw inside one (e.g.
-          // parsing a malformed id from an untrusted frame) becomes a REJECTED
-          // PROMISE that this synchronous try/catch cannot see — on Node that
-          // escalates to a process-killing unhandledRejection. Catch both the
-          // sync throw and the async rejection, exactly as _deliverRouted does.
+          // parsing a malformed id from a frame) becomes a REJECTED PROMISE that
+          // this synchronous try/catch cannot see — on Node that escalates to a
+          // process-killing unhandledRejection. Catch both the sync throw and the
+          // async rejection (as _deliverRouted does), and treat a malformed-id
+          // error as an expected drop, not a loud bug.
           const r = h(payload, { fromId: fromHex, type });
-          if (r && typeof r.then === 'function') r.catch(onErr);
+          if (r && typeof r.then === 'function') r.catch((err) => this._onHandlerError('direct', type, err));
         } catch (err) {
-          onErr(err);
+          this._onHandlerError('direct', type, err);
         }
       });
     }
