@@ -324,36 +324,54 @@ export class AxonaManager {
     this._seenMetricsReqCap  = 1024;
 
     // Register handlers with the DHT.
-    dht.onRoutedMessage('pubsub:subscribe',    (p, m) => this._onSubscribe(p, m));
-    dht.onRoutedMessage('pubsub:unsubscribe',  (p, m) => this._onUnsubscribe(p, m));
-    dht.onRoutedMessage('pubsub:publish',      (p, m) => this._onPublish(p, m));
-    dht.onRoutedMessage('pubsub:kill',         (p, m) => this._onKill(p, m));
-    dht.onDirectMessage('pubsub:kill-k',       (p, m) => this._onKillDirect(p, m));
-    dht.onDirectMessage('pubsub:kill-sync',    (p, m) => this._onKillSync(p, m));
-    dht.onDirectMessage('pubsub:msgsync',      (p, m) => this._onMsgSync(p, m));
-    dht.onDirectMessage('pubsub:msgsync-resp', (p, m) => this._onMsgSyncResp(p, m));
-    dht.onRoutedMessage('pubsub:touch',        (p, m) => this._onTouch(p, m));
-    dht.onDirectMessage('pubsub:touch-k',      (p, m) => this._onTouchDirect(p, m));
-    dht.onRoutedMessage('pubsub:unpub',        (p, m) => this._onUnpub(p, m));
-    dht.onDirectMessage('pubsub:unpub-k',      (p, m) => this._onUnpubDirect(p, m));
-    dht.onDirectMessage('pubsub:deliver',      (p, m) => this._onDeliver(p, m));
-    dht.onDirectMessage('pubsub:promote-axon',     (p, m) => this._onPromoteAxon(p, m));
-    dht.onDirectMessage('pubsub:adopt-subscribers',(p, m) => this._onAdoptSubscribers(p, m));
-    dht.onDirectMessage('pubsub:dissolve-hint',    (p, m) => this._onDissolveHint(p, m));
-    dht.onDirectMessage('pubsub:replay-batch',     (p, m) => this._onReplayBatch(p, m));
+    //
+    // Robustness guard: drop a frame whose routing id is malformed BEFORE the
+    // handler parses it. A peer tearing down mid-shutdown can deliver a truncated
+    // `fromId`/`topicId` (e.g. 3 chars); `fromHex` throws on it, and in an async
+    // handler that synchronous throw becomes a rejected promise that escapes the
+    // dispatch try/catch (a process-killing unhandledRejection on Node). We must
+    // DROP such a frame, NOT coerce the id to null — several handlers treat a
+    // null `fromId` as "locally originated ⇒ trusted", so a malformed *remote*
+    // fromId must never become null. Absent ids are fine (genuinely local); only
+    // present-but-malformed ids are rejected here.
+    const _idMalformed = (v) => v !== null && v !== undefined && _wireSafe(v) == null;
+    const guard = (fn) => (p, m) => {
+      if (p && _idMalformed(p.topicId)) return undefined;   // routed → undefined ⇒ 'forward'; direct → ignored
+      if (m && _idMalformed(m.fromId))  return undefined;
+      return fn(p, m);
+    };
+    const orm = (type, fn) => dht.onRoutedMessage(type, guard(fn));
+    const od  = (type, fn) => dht.onDirectMessage(type, guard(fn));
+    orm('pubsub:subscribe',    (p, m) => this._onSubscribe(p, m));
+    orm('pubsub:unsubscribe',  (p, m) => this._onUnsubscribe(p, m));
+    orm('pubsub:publish',      (p, m) => this._onPublish(p, m));
+    orm('pubsub:kill',         (p, m) => this._onKill(p, m));
+    od('pubsub:kill-k',       (p, m) => this._onKillDirect(p, m));
+    od('pubsub:kill-sync',    (p, m) => this._onKillSync(p, m));
+    od('pubsub:msgsync',      (p, m) => this._onMsgSync(p, m));
+    od('pubsub:msgsync-resp', (p, m) => this._onMsgSyncResp(p, m));
+    orm('pubsub:touch',        (p, m) => this._onTouch(p, m));
+    od('pubsub:touch-k',      (p, m) => this._onTouchDirect(p, m));
+    orm('pubsub:unpub',        (p, m) => this._onUnpub(p, m));
+    od('pubsub:unpub-k',      (p, m) => this._onUnpubDirect(p, m));
+    od('pubsub:deliver',      (p, m) => this._onDeliver(p, m));
+    od('pubsub:promote-axon',     (p, m) => this._onPromoteAxon(p, m));
+    od('pubsub:adopt-subscribers',(p, m) => this._onAdoptSubscribers(p, m));
+    od('pubsub:dissolve-hint',    (p, m) => this._onDissolveHint(p, m));
+    od('pubsub:replay-batch',     (p, m) => this._onReplayBatch(p, m));
     // K-closest mode (available when dht.findKClosest exists).
-    dht.onDirectMessage('pubsub:subscribe-k',  (p, m) => this._onSubscribeDirect(p, m));
-    dht.onDirectMessage('pubsub:publish-k',    (p, m) => this._onPublishDirect(p, m));
-    dht.onDirectMessage('pubsub:unsubscribe-k',(p, m) => this._onUnsubscribeDirect(p, m));
+    od('pubsub:subscribe-k',  (p, m) => this._onSubscribeDirect(p, m));
+    od('pubsub:publish-k',    (p, m) => this._onPublishDirect(p, m));
+    od('pubsub:unsubscribe-k',(p, m) => this._onUnsubscribeDirect(p, m));
     // ── Post-level metrics.
-    dht.onRoutedMessage('pubsub:metricsReq',       (p, m) => this._onMetricsReq(p, m));
-    dht.onDirectMessage('pubsub:metricsReq-k',     (p, m) => this._onMetricsReqDirect(p, m));
-    dht.onDirectMessage('pubsub:metricsBroadcast', (p, m) => this._onMetricsBroadcast(p, m));
-    dht.onDirectMessage('pubsub:metricsResp',      (p, m) => this._onMetricsResp(p, m));
+    orm('pubsub:metricsReq',       (p, m) => this._onMetricsReq(p, m));
+    od('pubsub:metricsReq-k',     (p, m) => this._onMetricsReqDirect(p, m));
+    od('pubsub:metricsBroadcast', (p, m) => this._onMetricsBroadcast(p, m));
+    od('pubsub:metricsResp',      (p, m) => this._onMetricsResp(p, m));
     // ── Pull (on-demand fetch by post_hash) and reshare notifications.
-    dht.onRoutedMessage('pubsub:pullReq',       (p, m) => this._onPullReq(p, m));
-    dht.onDirectMessage('pubsub:pullResp',      (p, m) => this._onPullResp(p, m));
-    dht.onRoutedMessage('pubsub:reshareNotify', (p, m) => this._onReshareNotify(p, m));
+    orm('pubsub:pullReq',       (p, m) => this._onPullReq(p, m));
+    od('pubsub:pullResp',      (p, m) => this._onPullResp(p, m));
+    orm('pubsub:reshareNotify', (p, m) => this._onReshareNotify(p, m));
 
     this._timer = null;
   }
