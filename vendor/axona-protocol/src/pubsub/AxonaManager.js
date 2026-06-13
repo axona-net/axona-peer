@@ -138,6 +138,19 @@ function _wire(hex) {
   return fromHex(hex);
 }
 
+/**
+ * Like `_wire`, but tolerant of malformed inbound wire data: returns `null`
+ * instead of throwing on a non-hex / wrong-length id. Untrusted ingress must
+ * never crash a handler — e.g. a peer tearing down mid-shutdown can deliver a
+ * truncated `fromId`/`topicId`, and in an *async* handler a synchronous throw
+ * becomes a rejected promise that escalates to a process-killing
+ * unhandledRejection on Node. Use this for any id parsed from a received frame.
+ */
+function _wireSafe(hex) {
+  if (hex === null || hex === undefined) return null;
+  try { return _wire(hex); } catch { return null; }
+}
+
 // ── AxonaManager ────────────────────────────────────────────────────────────
 
 export class AxonaManager {
@@ -1039,7 +1052,8 @@ export class AxonaManager {
    * _handleKill exactly as on the primary path, so this is not a censorship lever.
    */
   async _onKillSync(payload, meta) {
-    const topicId = _wire(payload.topicId);
+    const topicId = _wireSafe(payload?.topicId);
+    if (topicId == null) return;                                 // malformed frame → drop, never throw
     const kills = Array.isArray(payload?.kills) ? payload.kills.slice(0, MAX_KILL_SYNC) : [];
     for (const kill of kills) {
       try { await this._handleKill(topicId, kill); } catch { /* per-kill best effort */ }
@@ -1095,11 +1109,11 @@ export class AxonaManager {
   /** Sibling asked what they're missing: reply with the cache entries whose
    *  postHash isn't in their `have` digest (bounded, tombstones excluded). */
   async _onMsgSync(payload, meta) {
-    const topicId = _wire(payload.topicId);
+    const topicId = _wireSafe(payload?.topicId);
+    if (topicId == null) return;                                 // malformed frame → drop, never throw
     const role = this.axonRoles.get(topicId);
     if (!role || !(role.isRoot || role.isInRootSet)) return;     // only a hosting root answers
-    const requester = meta?.fromId != null ? _wire(meta.fromId)
-                    : (typeof payload.requesterId === 'string' ? _wire(payload.requesterId) : null);
+    const requester = _wireSafe(meta?.fromId) ?? _wireSafe(payload?.requesterId);
     if (requester == null || requester === this.nodeId) return;
     this._sweepRole(role, this._now());
     const have = new Set(Array.isArray(payload.have) ? payload.have.slice(0, MAX_HAVE) : []);
@@ -1112,7 +1126,8 @@ export class AxonaManager {
 
   /** Sibling's reply: re-verify + ingest each message we were missing. */
   async _onMsgSyncResp(payload, meta) {
-    const topicId = _wire(payload.topicId);
+    const topicId = _wireSafe(payload?.topicId);
+    if (topicId == null) return;                                 // malformed frame → drop, never throw
     const role = this.axonRoles.get(topicId);
     if (!role || !(role.isRoot || role.isInRootSet)) return;
     const batch = Array.isArray(payload.messages) ? payload.messages.slice(0, MAX_REPLAY_BATCH) : [];

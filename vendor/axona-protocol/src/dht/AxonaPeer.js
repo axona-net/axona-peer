@@ -3488,10 +3488,17 @@ export class AxonaPeer extends DHT {
         const h = this._directHandlers.get(type);
         if (!h) return;
         const fromHex = (typeof fromId === 'bigint') ? nodeIdToHex(fromId) : fromId;
+        const onErr = (err) => console.error(`AxonaPeer direct handler error at ${node.id} for '${type}':`, err);
         try {
-          h(payload, { fromId: fromHex, type });
+          // Handlers are frequently async: a *synchronous* throw inside one (e.g.
+          // parsing a malformed id from an untrusted frame) becomes a REJECTED
+          // PROMISE that this synchronous try/catch cannot see — on Node that
+          // escalates to a process-killing unhandledRejection. Catch both the
+          // sync throw and the async rejection, exactly as _deliverRouted does.
+          const r = h(payload, { fromId: fromHex, type });
+          if (r && typeof r.then === 'function') r.catch(onErr);
         } catch (err) {
-          console.error(`AxonaPeer direct handler error at ${node.id} for '${type}':`, err);
+          onErr(err);
         }
       });
     }
