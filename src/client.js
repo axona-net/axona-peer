@@ -38,6 +38,10 @@ import {
 // standard-S2 partition, kernel v2.0+) become naturally XOR-closest
 // to us-east topics.
 import { geoCellId }   from '../vendor/axona-protocol/src/utils/s2.js';
+// Bridge directory: discover alternate bridges + fail over to a saved one
+// when the configured primary is unreachable (see bridgeBook.js).
+import { BRIDGE_DIRECTORY_TOPIC } from '../vendor/axona-protocol/src/bridgeDirectory.js';
+import * as bridgeBook from './bridgeBook.js';
 // I3: pub/sub now uses the kernel's unified API via peer.pub /
 // peer.sub.  Topics are public-mode strings (anyone-can-publish,
 // anyone-can-subscribe) shaped as `${regionId}/${eventName}` so the
@@ -50,7 +54,7 @@ import { geoCellId }   from '../vendor/axona-protocol/src/utils/s2.js';
 // where the bfcache can serve a stale module set for ages).  The
 // bridge version arrives separately in its `welcome` message; the
 // "version" row in the me panel shows both side by side.
-const PEER_VERSION = '3.33.0';
+const PEER_VERSION = '3.34.0';
 
 // webTransport() now owns the bridge WebSocket lifecycle (ping cadence,
 // stale window, reconnect backoff, uptime), so those constants moved
@@ -108,8 +112,72 @@ function getBridgeUrl() {
   if (location.hostname === 'testnet.axona.net') return 'wss://testnet.axona.net';
   return 'wss://bridge.axona.net';
 }
-const bridgeUrl = getBridgeUrl();
+// The configured primary (root) — `?bridge=`, testnet, or production.
+// Failover only ever ADDS alternates from the saved directory; the primary
+// is never auto-replaced. The testnet host runs an independent fleet, so it
+// skips the directory mechanism entirely.
+const PRIMARY_BRIDGE = getBridgeUrl();
+const IS_TESTNET = location.hostname === 'testnet.axona.net' || location.hostname.includes('testnet');
+let bridgeUrl = PRIMARY_BRIDGE;          // updated by selectBridge() at boot
 $bridgeUrl.textContent = bridgeUrl;
+
+// Lightweight reachability probe: can we open a WebSocket to `url` at all?
+// (We don't run the auth handshake here — "the socket opens" is a good
+// proxy for "this bridge is up," enough to decide whether to fail over.)
+function probeBridge(url, timeoutMs = 3500) {
+  return new Promise((resolve) => {
+    let done = false, ws;
+    const finish = (ok) => { if (done) return; done = true; try { ws && ws.close(); } catch {} resolve(ok); };
+    try { ws = new WebSocket(url); } catch { resolve(false); return; }
+    const t = setTimeout(() => finish(false), timeoutMs);
+    ws.onopen  = () => { clearTimeout(t); finish(true); };
+    ws.onerror = () => { clearTimeout(t); finish(false); };
+    ws.onclose = () => { clearTimeout(t); finish(false); };
+  });
+}
+
+// Pick a reachable bridge: try the primary first, then saved alternates in
+// ranked order. Returns the primary unchanged on the testnet host or when
+// nothing probes reachable (let the transport's own backoff keep retrying).
+async function selectBridge(self) {
+  if (IS_TESTNET) return PRIMARY_BRIDGE;
+  const cands = bridgeBook.candidates({ roots: [PRIMARY_BRIDGE], self });
+  for (const url of cands) {
+    if (await probeBridge(url)) {
+      if (url !== PRIMARY_BRIDGE) appendLog('bridge:failover', `primary unreachable → ${url}`, 'warn');
+      return url;
+    }
+    bridgeBook.recordOutcome(url, { ok: false });
+    appendLog('bridge:unreachable', url, 'warn');
+  }
+  return PRIMARY_BRIDGE;
+}
+
+// One-shot directory refresh: after the mesh is ready, subscribe to the
+// public bridge-directory topic, collect current entries for a few seconds,
+// merge them into the local book, then unsubscribe. We do NOT renew — the
+// saved list is consulted on the NEXT launch.
+async function refreshBridgeDirectory(connectedUrl, timeToMeshMs) {
+  if (IS_TESTNET) return;
+  bridgeBook.recordOutcome(connectedUrl, { ok: true, timeToMeshMs });
+  const collected = [];
+  let sub = null;
+  try {
+    sub = await peer.sub(BRIDGE_DIRECTORY_TOPIC, (env) => {
+      if (!env || env.deleted || !env.signerPubkey) return;
+      collected.push({ entry: env.message, signerKey: env.signerPubkey });
+    }, { publisher: null, since: 'all' });
+    await new Promise((r) => setTimeout(r, 4000));
+  } catch (err) {
+    appendLog('directory:refresh-failed', err.message ?? String(err), 'warn');
+  } finally {
+    try { await sub?.stop?.(); } catch {}
+  }
+  if (collected.length) {
+    const entries = bridgeBook.mergeDirectory(collected);
+    appendLog('directory:saved', `${Object.keys(entries).length} bridge(s) known`, 'ok');
+  }
+}
 
 // ── Share QR ─────────────────────────────────────────────────────────
 // Encode the current full URL — including any ?bridge= override — so a
@@ -704,12 +772,19 @@ async function waitForMeshReady() {
 }
 
 async function bootAxonaNode(opts = {}) {
+  const bootStartedAt = Date.now();
   const identity = await deriveIdentity(opts);
   $axonaId.textContent     = fmtNodeId(identity.id);
   $axonaRegion.textContent = identity.region?.label
     ?? identity.region?.id
     ?? identity.region?.source
     ?? '—';
+
+  // Choose a reachable bridge: the configured primary first, then any saved
+  // alternate from the directory if the primary won't open. Updates the
+  // module `bridgeUrl` the transport build below reads.
+  bridgeUrl = await selectBridge({ lat: identity.region?.lat, lng: identity.region?.lng });
+  $bridgeUrl.textContent = bridgeUrl;
 
   // ── Build the kernel stack ───────────────────────────────────────
   //
@@ -905,6 +980,10 @@ async function bootAxonaNode(opts = {}) {
   // axon set forever.  Waiting until we know multiple peers makes
   // that first cache populate with a wide, stable set.
   await waitForMeshReady();
+
+  // One-shot: record this bootstrap's outcome and learn/save alternate
+  // bridges for next-launch failover. Fire-and-forget — never blocks subs.
+  refreshBridgeDirectory(bridgeUrl, Date.now() - bootStartedAt).catch(() => {});
 
   const persisted = loadPersistedSubscriptions();
   for (const s of persisted) {

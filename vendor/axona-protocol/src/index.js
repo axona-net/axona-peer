@@ -124,6 +124,16 @@ export {
   canonical,
   sha256Hex,
 } from './pubsub/post.js';
+
+// ── Bridge directory (discovery + failover ranking) ────────────────
+export {
+  BRIDGE_DIRECTORY_TOPIC,
+  BRIDGE_ENTRY_MAX_AGE_MS,
+  buildBridgeEntry,
+  validateBridgeEntry,
+  rankBridges,
+  haversineKm,
+} from './bridgeDirectory.js';
 export {
   buildEnvelope,
   verifyEnvelope,
