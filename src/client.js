@@ -167,7 +167,7 @@ async function refreshBridgeDirectory(connectedUrl, timeToMeshMs) {
       if (!env || env.deleted || !env.signerPubkey) return;
       collected.push({ entry: env.message, signerKey: env.signerPubkey });
     }, { publisher: null, since: 'all' });
-    await new Promise((r) => setTimeout(r, 4000));
+    await new Promise((r) => setTimeout(r, 5000));
   } catch (err) {
     appendLog('directory:refresh-failed', err.message ?? String(err), 'warn');
   } finally {
