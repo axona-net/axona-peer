@@ -691,8 +691,45 @@ export class AxonaManager {
       throw new TypeError(`AxonaManager.pubsubUnsubscribe: topicId must be bigint, got ${typeof topicId}`);
     }
     this.mySubscriptions.delete(topicId);
+    // Forget this node's consumption state so a later since:'all' resubscribe
+    // truly replays + re-delivers (the "re-subscribed hashtag never reappears"
+    // bug). Safe even if we still HOST the topic — only subscriber-side state.
+    this.pubsubResetTopicConsumption(topicId);
     this._asyncUnsubscribe(topicId)
       .catch(err => console.error('AxonaManager: unsubscribe failed:', err));
+  }
+
+  /**
+   * Forget this node's CONSUMPTION state for a topic so a subsequent
+   * `since:'all'` subscribe truly replays from the roots AND re-delivers to the
+   * app. Three per-topic structures otherwise survive an unsub and each one
+   * silently suppresses redelivery:
+   *
+   *   - `_haveByTopic`        — the gap-safe digest we send on (re)subscribe. If
+   *     retained, the roots compute `missed = []` (we claim to already hold
+   *     everything) and replay NOTHING. This is the dominant masking layer:
+   *     it overrides even a `lastSeenTs = 0` floor, because the root's
+   *     `Array.isArray(have)` branch takes precedence over the ts branch.
+   *   - `_lastSeenTsByTopic`  — the legacy replay-floor timestamp.
+   *   - `_appDelivered` (this topic's entries) — the exactly-once app gate; a
+   *     replayed message whose publishId was delivered before the unsub is
+   *     dropped in `_deliverToApp` before it reaches the handler.
+   *
+   * Does NOT touch the node's ROOT/host role (`axonRoles`/`replayCache`) — only
+   * its subscriber-side delivery state — so a node that also hosts the topic
+   * keeps serving others. Wire-compatible: it changes only what THIS node asks
+   * for on its next subscribe.
+   *
+   * @param {bigint} topicId
+   */
+  pubsubResetTopicConsumption(topicId) {
+    if (typeof topicId !== 'bigint') return;
+    this._haveByTopic.delete(topicId);
+    this._lastSeenTsByTopic.delete(topicId);
+    const prefix = `${topicId}:`;
+    for (const k of this._appDelivered.keys()) {
+      if (typeof k === 'string' && k.startsWith(prefix)) this._appDelivered.delete(k);
+    }
   }
 
   /** @private — burst-send pattern. */
@@ -1837,8 +1874,12 @@ export class AxonaManager {
   _deliverToApp(topicId, json, publishId, publishTs) {
     if (!this._deliveryCallback) return;
     if (publishId) {
-      if (this._appDelivered.has(publishId)) return;     // already delivered locally
-      this._appDelivered.set(publishId, this._now());
+      // TOPIC-SCOPED dedup key: lets pubsubResetTopicConsumption() forget
+      // exactly one topic's deliveries (on unsub / since:'all' resubscribe) so
+      // a fresh subscribe re-delivers, without disturbing other topics.
+      const dkey = `${topicId}:${publishId}`;
+      if (this._appDelivered.has(dkey)) return;     // already delivered locally
+      this._appDelivered.set(dkey, this._now());
       this._capStore(this._appDelivered, this._appDeliveredCap);
     }
     try {

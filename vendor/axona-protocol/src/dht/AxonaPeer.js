@@ -2517,7 +2517,18 @@ export class AxonaPeer extends DHT {
       return;
     }
     if (since === 'all') {
-      am._lastSeenTsByTopic.set(topicId, 0);
+      // Full replay: forget ALL retained per-topic consumption state, not just
+      // the ts floor. Zeroing lastSeenTs alone is silently overridden by a
+      // retained `have` digest (roots then replay nothing) and by the
+      // _appDelivered dedup (replayed messages dropped before the handler) —
+      // the "re-subscribed topic never re-delivers" / "missed alert until
+      // reload" bug. pubsubResetTopicConsumption clears have + ts + this
+      // topic's app-dedup together.
+      if (typeof am.pubsubResetTopicConsumption === 'function') {
+        am.pubsubResetTopicConsumption(topicId);
+      } else {
+        am._lastSeenTsByTopic.set(topicId, 0);     // older kernel: best-effort
+      }
       return;
     }
     if (since === 'latest') {

@@ -49,6 +49,12 @@ export class CompositeTransport extends Transport {
     /** @type {Map<string, Function>} */ this._reqHandlers = new Map();
     /** @type {Map<string, Function>} */ this._ntfHandlers = new Map();
     /** @type {Function[]}            */ this._peerDiedHandlers = [];
+    // onPeerBound is registered per-handler via a registrar closure so a
+    // sub-transport added AFTER onPeerBound() was called (e.g. an uplink added
+    // post-start) still propagates its bound peers. Without this, late subs
+    // never reach the routing layer and their mesh peers never enter the
+    // synaptome.
+    /** @type {Array<(t: Transport) => void>} */ this._peerBoundRegistrars = [];
 
     this._started = false;
   }
@@ -64,6 +70,7 @@ export class CompositeTransport extends Transport {
     for (const [type, h] of this._reqHandlers) t.onRequest(type, h);
     for (const [type, h] of this._ntfHandlers) t.onNotification(type, h);
     for (const h of this._peerDiedHandlers)    t.onPeerDied(h);
+    for (const reg of this._peerBoundRegistrars) reg(t);
   }
 
   async start(localNodeId) {
@@ -155,11 +162,20 @@ export class CompositeTransport extends Transport {
     };
     const rearm = (nodeIdBig) => { if (typeof nodeIdBig === 'bigint') seen.delete(nodeIdBig); };
     const unsubs = [];
-    for (const t of this._subs) {
+    // A registrar wires this handler onto one sub-transport. Stored so that
+    // subs added later (addSubtransport) inherit it too — same `seen` set, so
+    // dedup stays correct across all subs including late ones.
+    const register = (t) => {
       if (typeof t.onPeerBound === 'function') unsubs.push(t.onPeerBound(wrapped));
       if (typeof t.onPeerDied  === 'function') unsubs.push(t.onPeerDied(rearm));
-    }
-    return () => { for (const u of unsubs) try { u(); } catch { /* swallow */ } };
+    };
+    this._peerBoundRegistrars.push(register);
+    for (const t of this._subs) register(t);
+    return () => {
+      const i = this._peerBoundRegistrars.indexOf(register);
+      if (i >= 0) this._peerBoundRegistrars.splice(i, 1);
+      for (const u of unsubs) try { u(); } catch { /* swallow */ }
+    };
   }
 
   // ── Channel pool ────────────────────────────────────────────────────
