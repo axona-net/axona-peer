@@ -46,7 +46,7 @@ import { buildEnvelope }  from '../pubsub/envelope.js';
 import { buildKill }      from '../pubsub/kill.js';
 import { buildTouch }     from '../pubsub/touch.js';
 import { buildUnpub }     from '../pubsub/unpub.js';
-import { AxonaManager, MAX_PUBLISH_BYTES } from '../pubsub/AxonaManager.js';
+import { AxonaManager, MAX_PUBLISH_BYTES, MAX_RELIABLE_PUBLISH_BYTES } from '../pubsub/AxonaManager.js';
 import { PublishError, SubscribeError, KillError, UnpubError, TouchError, PullError, MetricsError, ErrorCodes } from '../errors.js';
 
 // ── B-3 (eclipse prevention) tunables ───────────────────────────────
@@ -99,9 +99,14 @@ export class AxonaPeer extends DHT {
    *        signed publishes (the default).  Apps that only call
    *        `peer.pub(topic, message, { sign: false })` can omit it.
    */
-  constructor({ engine = null, domain = null, node, axonaManager = null, identity = null, transport = null, persist = null }) {
+  constructor({ engine = null, domain = null, node, axonaManager = null, identity = null, transport = null, persist = null, maxPublishBytes = null }) {
     super();
     if (!node) throw new Error('AxonaPeer: node is required');
+    // O-5: a publish must be RECEIVABLE by any peer on any browser across any
+    // path → default the per-publish limit to the WebRTC-interop floor (16 KiB),
+    // never above the absolute ingress cap. Override only for controlled,
+    // known-homogeneous deployments (e.g. node-only relay fleets).
+    this._maxPublishBytes = Math.min(maxPublishBytes ?? MAX_RELIABLE_PUBLISH_BYTES, MAX_PUBLISH_BYTES);
 
     // Phase 5d (kernel cleanup): engine is optional now.  A peer can
     // be constructed against:
@@ -1368,14 +1373,18 @@ export class AxonaPeer extends DHT {
         `peer.pub: message is not JSON-serializable (${cause.message})`,
         { cause, context: { topic } });
     }
-    // Fail fast on oversize — same 256 KiB cap the root axon enforces at
-    // ingress (MAX_PUBLISH_BYTES), but checked here so the publisher gets a
-    // clear error instead of a message that's silently dropped network-side.
-    if (json.length > MAX_PUBLISH_BYTES) {
+    // Fail LOUD on oversize (O-5). A larger enveloped message is not guaranteed
+    // RECEIVABLE — WebRTC SCTP maxMessageSize is negotiated per connection and
+    // floored by the weakest hop + the receiving browser (measured: some stacks
+    // silently drop ≥64 KB). Above the interop-safe 16 KiB the publisher gets a
+    // clear error here instead of a message that vanishes mid-mesh. Large
+    // payloads must be chunked — see @axona/protocol/std/chunk.
+    if (json.length > this._maxPublishBytes) {
       throw new PublishError(ErrorCodes.PUBLISH_PAYLOAD_TOO_LARGE,
-        `peer.pub: message too large — ${json.length} chars > ${MAX_PUBLISH_BYTES} cap. ` +
-        `Use a content reference + out-of-band transfer for large content.`,
-        { context: { topic, size: json.length, max: MAX_PUBLISH_BYTES } });
+        `peer.pub: enveloped message ${json.length}B exceeds the reliable-delivery limit ${this._maxPublishBytes}B ` +
+        `(WebRTC-interoperable floor; a larger message may not be receivable by every peer/browser). ` +
+        `Chunk large payloads with @axona/protocol/std/chunk (publishChunkedBytes).`,
+        { context: { topic, size: json.length, max: this._maxPublishBytes } });
     }
 
     // AxonaManager generates its own publishId for network routing/
@@ -1385,6 +1394,7 @@ export class AxonaPeer extends DHT {
     am.pubsubPublish(topicIdBig, json, {
       publisher: publisherId,
       postHash:  envelope.msgId,
+      publishId: opts.publishId,   // optional app-supplied dedup token (e.g. std/publisher); kernel mints one if absent
     });
     return envelope.msgId;
   }

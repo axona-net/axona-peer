@@ -54,14 +54,37 @@ const DEFAULT_REFRESH_INTERVAL_MS    = 10_000;       // §5.5
 const DEFAULT_MAX_SUBSCRIPTION_AGE_MS = 30_000;      // §5.7 — 3× refresh
 const DEFAULT_ROOT_GRACE_MS          = 60_000;       // §5.7 — 6× refresh
 const DEFAULT_ROOT_SET_SIZE          = 5;            // R — root-set size (pub/sub replication factor)
-const DEFAULT_REPLAY_CACHE_SIZE      = 100;          // per-role bounded ring (§7.8 replay)
+const DEFAULT_REPLAY_CACHE_SIZE      = 1024;         // per-role bounded ring, COUNT cap (§7.8 replay)
+// Raised from 100 so a chunked file survives replay: a 2 MB image at ~11.5 KB
+// chunks ≈ 175 messages, far over the old 100. Paired with a BYTE cap so a count
+// of 1024 × up-to-16 KB entries can't OOM a small relay — eviction honors both
+// (count OR bytes, whichever binds). Small-message topics get deep history
+// cheaply; large-message (file) topics are bounded by memory, not the count.
+const DEFAULT_REPLAY_CACHE_BYTES     = 16 * 1024 * 1024;  // per-role byte cap (16 MB)
 
 // ── Inbound caps (D-1: bound attacker-controlled payloads) ─────────────────
 // A peer must not be able to make us allocate unbounded memory from a
 // single inbound message.  These cap the attacker-controlled arrays /
 // payload sizes on the network-facing handlers; legitimate traffic is
 // comfortably under each bound.
-export const MAX_PUBLISH_BYTES = 256 * 1024;         // per-publish `json` payload ceiling (chars; see note)
+export const MAX_PUBLISH_BYTES = 256 * 1024;         // absolute hard ceiling (chars; see note)
+// RELIABLE-delivery ceiling (finding O-5). A publish must be RECEIVABLE by an
+// arbitrary peer on an arbitrary browser, across arbitrary intermediate hops —
+// and the WebRTC SCTP maxMessageSize is negotiated per-connection, floored by
+// the weakest hop and the receiving stack. The only size guaranteed receivable
+// by every conformant implementation is the WebRTC-interoperable 16 KiB. Above
+// it, delivery is a gamble on the receiver's browser (measured: node-datachannel
+// silently drops ≥64 KB; Chrome tolerates ~256 KB — so a sender-side or
+// single-hop measurement is NOT a safe bound). peer.pub rejects above this by
+// default so oversize fails LOUD at the publisher instead of vanishing en route;
+// larger payloads must go through @axona/protocol/std/chunk. Overridable per
+// AxonaPeer only for controlled, known-homogeneous deployments (e.g. node-only
+// relay fleets) — never the browser default.
+// Set just under the 16 KiB interop floor: the enveloped publish is re-wrapped
+// once more in a deliver/replay frame ({topicId,json,publishId,postHash,...},
+// ~0.5 KB) before it hits the wire, so the guard leaves ~1 KiB of headroom so
+// that OUTER frame still fits 16 KiB. std/chunk targets the same number.
+export const MAX_RELIABLE_PUBLISH_BYTES = 15 * 1024;
 // NOTE: this is the small/medium-message lane, not a blob channel. Large
 // binary content (images/documents) should ride a content-reference manifest
 // + out-of-band transfer (Tier 2: a DHT content store keyed by content hash),
@@ -72,14 +95,25 @@ export const MAX_PUBLISH_BYTES = 256 * 1024;         // per-publish `json` paylo
 // message must still fit the WebRTC data-channel max-message size downstream.
 const MAX_SUBSCRIBER_BATCH     = 512;                // adopt-subscribers subscriberIds[] ceiling
 const MAX_PEER_ROOTS           = 32;                 // peerRoots[] ceiling (R is ~5)
-const MAX_REPLAY_BATCH         = DEFAULT_REPLAY_CACHE_SIZE; // replay-batch messages[] ceiling
+// Replay-batch framing: each replay frame must itself fit the 16 KiB wire limit
+// (O-5), so we DECOUPLE it from the cache size — a 1024-entry cache replays as
+// MANY frames, each byte-bounded below, never one giant undeliverable frame.
+// MAX_REPLAY_BATCH is the per-FRAME message-count ceiling (inbound D-1 guard);
+// REPLAY_FRAME_BYTES is the per-frame serialized-bytes budget the SENDER honors.
+const MAX_REPLAY_BATCH         = 256;                // messages[] ceiling PER FRAME (was = cache size)
+const REPLAY_FRAME_BYTES       = 14 * 1024;          // sender's per-frame byte budget (< 16 KiB incl. wrapper)
 // Gap-safe replay: a subscriber reports the recent postHashes it HOLDS so a root
 // replays only what's actually missing. A single lastSeenTs high-water can't
 // represent a hole — once you receive anything newer than a gap, the gap is
 // masked forever (the "occasional missing message that never recovers" bug).
 // Sized a bit above the replay cache so steady-state subscribers report a
 // superset of any root's cache ⇒ nothing is re-sent.
-const MAX_HAVE                 = 256;
+// Capped so the subscribe-k frame carrying the digest (have[] of 66-char
+// postHashes) stays under the 16 KiB wire limit even at the larger cache size:
+// 200 × 66 ≈ 13 KB. (A compact digest that scales to the full cache is a
+// follow-up; until then a re-subscriber holding >MAX_HAVE just gets a few
+// already-held entries re-sent, which dedup drops.)
+const MAX_HAVE                 = 200;
 
 // C-2: per-publisher seq reorder tolerance.  seq is wall-clock-seeded
 // (~ms units; see AxonaPeer._nextPubSeq), so this is effectively "reject a
@@ -115,6 +149,15 @@ const MAX_KILL_SYNC    = 64;            // kills per kill-sync message (ceiling)
 // refresh tick to bound traffic; pulled messages are RE-VERIFIED (a sibling root
 // is not trusted). MAX_HAVE / MAX_REPLAY_BATCH bound the digest / response.
 const MSGSYNC_TOPICS_PER_TICK = 8;
+// Cold-start drain: a freshly (re)started or newly-recruited root holds an EMPTY
+// replay cache for every topic it hosts.  Steady-state round-robin (8/tick) would
+// take minutes to backfill a keyspace host with hundreds of topics — during which
+// it advertises as a root but answers replays empty (the "reload → 0 / partial"
+// window after a relay restart).  So roles not yet reconciled even once ("cold")
+// are drained with a much larger per-tick budget, ahead of the steady round-robin,
+// so a restarted host converges in seconds.  Costs nothing in steady state (no
+// cold roles); a one-time burst of ≤ this many msgsync exchanges after (re)join.
+const MSGSYNC_COLD_BUDGET     = 64;
 
 // Phase A #5: message hold time.  A message expires (is swept from replay
 // caches and no longer served/pulled) at its (signed, freshness-clamped)
@@ -173,7 +216,8 @@ export class AxonaManager {
     rootGraceMs          = DEFAULT_ROOT_GRACE_MS,
     rootSetSize          = DEFAULT_ROOT_SET_SIZE,    // R — root-set size (pub/sub replication factor)
     crossFragmentRoots   = 4,                        // NX-17: number of alternate-root direct copies per publish/subscribe.
-    replayCacheSize      = DEFAULT_REPLAY_CACHE_SIZE, // per-role bounded ring
+    replayCacheSize      = DEFAULT_REPLAY_CACHE_SIZE, // per-role bounded ring (count cap)
+    replayCacheBytes     = DEFAULT_REPLAY_CACHE_BYTES, // per-role byte cap (memory bound)
     pickRecruitPeer      = null,   // protocol-specific override (§5.9)
     pickRelayPeer        = null,   // NX-17+ batch-adoption path override
     shouldRecruitSubAxon = null,   // protocol-specific override
@@ -194,6 +238,7 @@ export class AxonaManager {
     this.rootSetSize           = rootSetSize;
     this.crossFragmentRoots    = crossFragmentRoots;
     this.replayCacheSize       = replayCacheSize;
+    this.replayCacheBytes      = replayCacheBytes;
     this._now                  = now;
     // Security/observability log sink. Until this is wired (see setLogSink),
     // the 24 `this._emitLog?.(...)` drop-path calls — bad-signature, stale,
@@ -464,11 +509,31 @@ export class AxonaManager {
     if (typeof topicId !== 'bigint') {
       throw new TypeError(`AxonaManager.pubsubPublish: topicId must be bigint, got ${typeof topicId}`);
     }
-    const publishId = `${this.nodeId}:${++this._publishCounter}`;
+    // publishId is the routing/exactly-once dedup key — OPAQUE, decoupled from
+    // the transport id (which is now always ephemeral). The app may supply its
+    // own (e.g. a persisted std/publisher stream id, for continuity across a
+    // rotated transport id or idempotent re-publish); otherwise we mint a
+    // random, collision-safe token. NOT `nodeId:counter` — that embedded the
+    // (ephemeral) transport id's S2 prefix and reused values when the counter
+    // reset to 0 on restart, letting a peer drop a genuinely-new publish as a dup.
+    const publishId = (typeof meta?.publishId === 'string' && meta.publishId)
+      ? meta.publishId
+      : this._mintPublishId();
     const publishTs = this._now();
     this._asyncPublish(topicId, json, publishId, publishTs, meta)
       .catch(err => console.error('AxonaManager: publish failed:', err));
     return publishId;
+  }
+
+  /** Mint a random, S2-free, collision-safe publishId (opaque dedup token). */
+  _mintPublishId() {
+    const c = globalThis.crypto;
+    if (c?.randomUUID) return 'p_' + c.randomUUID().replace(/-/g, '');
+    if (c?.getRandomValues) {
+      const b = c.getRandomValues(new Uint8Array(16));
+      return 'p_' + Array.from(b, (x) => x.toString(16).padStart(2, '0')).join('');
+    }
+    return 'p_' + this._now().toString(36) + Math.random().toString(36).slice(2);
   }
 
   /**
@@ -1146,6 +1211,11 @@ export class AxonaManager {
     const have = (role.replayCache || []).map((e) => e.postHash).filter(Boolean).slice(0, MAX_HAVE);
     const payload = { topicId: toHex(topicId), have, requesterId: toHex(this.nodeId) };
     for (const sib of siblings) this.dht.sendDirect(sib, 'pubsub:msgsync', payload);
+    // No longer cold: we've initiated reconciliation against the current sibling
+    // set, so the cold-drain stops prioritizing this role and the steady
+    // round-robin carries it from here. (Only set once we HAD siblings to ask —
+    // the early-return above leaves a siblingless role cold so it retries.)
+    role.synced = true;
   }
 
   /** Sibling asked what they're missing: reply with the cache entries whose
@@ -1163,7 +1233,10 @@ export class AxonaManager {
       .filter((e) => e.postHash && !have.has(e.postHash) && !this._isTombstoned(e.postHash))
       .slice(0, MAX_REPLAY_BATCH);
     if (missing.length === 0) return;
-    this.dht.sendDirect(requester, 'pubsub:msgsync-resp', { topicId: toHex(topicId), messages: missing });
+    // Same 16 KiB per-frame bound as replay (O-5) — large chunked content
+    // backfills between roots as multiple frames, not one oversize one.
+    await this._sendFramedMessages(requester, 'pubsub:msgsync-resp', toHex(topicId), missing,
+      (topicHex, batch) => ({ topicId: topicHex, messages: batch }));
   }
 
   /** Sibling's reply: re-verify + ingest each message we were missing. */
@@ -1773,10 +1846,20 @@ export class AxonaManager {
         mine = mine.filter(e => e !== victim);
       }
     }
-    // Global bound: evict the lowest-ordered until within maxMessages.
-    while (cache.length > max) {
+    // Global bound: evict the lowest-ordered until within BOTH the count cap
+    // and the byte cap (whichever binds first). The byte cap keeps a large
+    // count (1024) from OOMing a relay when entries are big (16 KB chunks):
+    // 1024 small messages cost little, but 1024 × 16 KB would be ~16 MB/topic,
+    // so file topics are bounded by bytes, small-message topics by count.
+    const maxBytes = role.maxBytes || this.replayCacheBytes || Infinity;
+    const sizeOf = (e) => (typeof e.json === 'string' ? e.json.length : 0);
+    let bytes = 0; for (const e of cache) bytes += sizeOf(e);
+    while (cache.length > max || (bytes > maxBytes && cache.length > 1)) {
       const victim = this._lowestOrdered(cache);
-      cache.splice(cache.indexOf(victim), 1);
+      const idx = cache.indexOf(victim);
+      if (idx < 0) break;
+      bytes -= sizeOf(victim);
+      cache.splice(idx, 1);
     }
   }
 
@@ -2116,11 +2199,32 @@ export class AxonaManager {
       missed = fresh.slice();
     }
     if (missed.length === 0) return;
-    await this.dht.sendDirect(subscriberId, 'pubsub:replay-batch', {
-      topicId: toHex(topicId),
-      responderId: toHex(this.nodeId),     // diagnostic: which root served this replay (replica-divergence hunt)
-      messages: missed,
-    });
+    // Byte-bound the replay into MANY frames each < 16 KiB (O-5): the old
+    // single-frame send was why a ≥64 KB-per-message topic returned nothing on
+    // reload. responderId: which root served this (replica-divergence hunt).
+    const responderId = toHex(this.nodeId);
+    await this._sendFramedMessages(subscriberId, 'pubsub:replay-batch', toHex(topicId), missed,
+      (topicHex, batch) => ({ topicId: topicHex, responderId, messages: batch }));
+  }
+
+  /**
+   * Send `messages` to a peer as multiple frames, each bounded by
+   * REPLAY_FRAME_BYTES and MAX_REPLAY_BATCH so no single frame exceeds the
+   * 16 KiB WebRTC wire limit (O-5). Shared by replay-batch and msgsync-resp.
+   */
+  async _sendFramedMessages(target, type, topicHex, messages, makePayload) {
+    let frame = [], bytes = 0;
+    const flush = async () => {
+      if (frame.length === 0) return;
+      const batch = frame; frame = []; bytes = 0;
+      await this.dht.sendDirect(target, type, makePayload(topicHex, batch));
+    };
+    for (const m of messages) {
+      const sz = (typeof m.json === 'string' ? m.json.length : 0) + 256;   // entry + per-entry wrapper estimate
+      if (frame.length > 0 && (bytes + sz > REPLAY_FRAME_BYTES || frame.length >= MAX_REPLAY_BATCH)) await flush();
+      frame.push(m); bytes += sz;
+    }
+    await flush();
   }
 
   _onReplayBatch(payload, meta) {
@@ -2313,6 +2417,17 @@ export class AxonaManager {
     if (this._useKClosestMode()) {
       const hosted = [...this.axonRoles.entries()].filter(([, r]) => r.isRoot || r.isInRootSet);
       if (hosted.length > 0) {
+        // Cold-start drain first: roles never reconciled (e.g. right after a
+        // restart/rejoin — empty caches) get backfilled with a large budget so
+        // the host converges in a tick or two instead of the slow round-robin.
+        let coldBudget = MSGSYNC_COLD_BUDGET;
+        for (const [topicId, role] of hosted) {
+          if (coldBudget <= 0) break;
+          if (role.synced) continue;
+          coldBudget--;
+          await this._antiEntropyTopic(topicId, role);   // sets role.synced = true
+        }
+        // Steady-state round-robin (warm convergence + churn healing).
         for (let i = 0; i < Math.min(MSGSYNC_TOPICS_PER_TICK, hosted.length); i++) {
           const [topicId, role] = hosted[(this._msgSyncCursor + i) % hosted.length];
           await this._antiEntropyTopic(topicId, role);

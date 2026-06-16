@@ -36,8 +36,12 @@
 //
 // The directory is a PUBLIC pub/sub topic (`publisher: null`) every
 // participant derives identically. A bridge publishes a SIGNED entry on
-// launch and once a day; the signature's `signerPubkey` is the bridge's
-// stable identity — the key a client dedupes and builds reputation on.
+// launch and once a day. Clients dedup + rank + build reputation on the
+// entry's `url` (the stable handle), NOT the signer: a bridge's transport id
+// is EPHEMERAL (re-minted every restart, Phase 2), so the signer rotates — the
+// signature still proves the entry wasn't tampered in transit, but identity/
+// trust is URL- and first-party-experience-based. mergeDirectory keeps the
+// latest entry per url, so a restarted bridge cleanly replaces its own.
 //
 // THE TRUST MODEL IS LAYERED + FIRST-PARTY (see rankBridges): a small set
 // of configured/trusted roots first, then bridges this client has
