@@ -774,6 +774,11 @@ async function waitForMeshReady() {
 async function bootAxonaNode(opts = {}) {
   const bootStartedAt = Date.now();
   const identity = await deriveIdentity(opts);
+  // Key separation (kernel v2.51): publishes are signed by a PUBLISH identity,
+  // never the transport `identity`. A distinct keypair, minted per session (this
+  // demo doesn't persist authorship; an app that wants durable authorship would
+  // dumpIdentity/loadIdentity it instead).
+  const publishIdentity = await deriveIdentity(opts);
   $axonaId.textContent     = fmtNodeId(identity.id);
   $axonaRegion.textContent = identity.region?.label
     ?? identity.region?.id
@@ -811,7 +816,7 @@ async function bootAxonaNode(opts = {}) {
   node.transport = transport;
 
   const domain = new AxonaDomain({ k: 20 });
-  peer = new AxonaPeer({ domain, node, identity, transport });
+  peer = new AxonaPeer({ domain, node, identity, transport, publishIdentity });   // publishes signed by publishIdentity (not the transport key)
 
   // ── Wire UI events BEFORE start so we don't miss the first welcome
   //    / state transition that lands during the handshake. ──────────
