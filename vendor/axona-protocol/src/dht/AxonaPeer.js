@@ -146,11 +146,12 @@ export class AxonaPeer extends DHT {
     this._node   = node;
     this._axonaManager = axonaManager;
     this._identity = identity;
-    // Optional default PUBLISH identity — a signing keypair distinct from the
-    // (ephemeral) transport `identity`. When set, signed publishes sign with it
+    // Default PUBLISH identity — the signing keypair for publishes, separate from
+    // the (ephemeral) transport `identity`. signed publishes sign with it
     // (signerPubkey = its pubkey) so authorship is durable + unlinkable to the
-    // transport id. Apps run several by passing a per-call { signWith }. Omitted
-    // ⇒ publishes sign with `identity` (historical single-key behavior).
+    // transport id. Apps run several by passing a per-call { signWith }. If a peer
+    // publishes signed messages it MUST have a publish identity here or pass
+    // { signWith } — the transport key is never used implicitly (key separation).
     this._publishIdentity = publishIdentity;
     this._transport = transport;
     this._persist  = persist;
@@ -1351,17 +1352,28 @@ export class AxonaPeer extends DHT {
     const publisherBig = publisherId === null ? null : fromHex(publisherId);
     const topicIdBig  = await deriveTopicIdBig(publisherBig, topic);
 
-    // Signing identity for THIS publish (the PUBLISH identity — may differ from
-    // the ephemeral transport `identity`). Precedence:
-    //   per-call opts.signWith → peer default this._publishIdentity → this._identity.
-    // Run MANY publish identities through one peer by varying { signWith } per call;
-    // signerPubkey on the envelope is this key's pubkey, so authorship is keyed to
-    // it (verification, per-publisher seq, kill/unpub ownership all follow signer).
-    const signId = sign ? (opts.signWith ?? this._publishIdentity ?? this._identity) : null;
-    if (sign && (!signId || !signId.privateKey || typeof signId.pubkeyHex !== 'string')) {
+    // Signing identity for THIS publish — the PUBLISH identity. KEY SEPARATION:
+    // publishes are signed by a publish keypair, NEVER implicitly by the transport
+    // `identity`. Precedence is per-call opts.signWith → peer default
+    // this._publishIdentity. There is intentionally NO fallback to the transport
+    // identity: reusing one keypair for both the connection and authorship is a
+    // key-reuse violation. signerPubkey on the envelope is this key's pubkey, so
+    // authorship (verification, per-publisher seq, kill/unpub ownership) follows it.
+    // Run MANY publish identities through one peer by varying { signWith } per call.
+    // (Signing with the transport key remains possible but only EXPLICITLY — pass it
+    // as { signWith }; that's an intentional, discouraged choice, never the default.)
+    const signId = sign ? (opts.signWith ?? this._publishIdentity) : null;
+    if (sign && !signId) {
+      throw new PublishError(ErrorCodes.PUBLISH_NO_PUBLISH_IDENTITY,
+        'peer.pub: a publish identity is required to sign a publish. Pass { publishIdentity } to ' +
+        'AxonaPeer (or a per-call { signWith }). The transport identity must not sign publishes ' +
+        '(key separation); to do so intentionally, pass it explicitly as { signWith }. For an ' +
+        'unsigned/anonymous publish use { sign: false }.',
+        { context: { topic } });
+    }
+    if (sign && (!signId.privateKey || typeof signId.pubkeyHex !== 'string')) {
       throw new PublishError(ErrorCodes.PUBLISH_SIGN_FAILED,
-        'peer.pub: a signing identity is required for a signed publish — pass {identity} or ' +
-        '{publishIdentity} to AxonaPeer, a per-call { signWith }, or { sign: false } for anonymous publish',
+        'peer.pub: the signing identity ({ signWith } / { publishIdentity }) must expose privateKey + pubkeyHex',
         { context: { topic } });
     }
 
