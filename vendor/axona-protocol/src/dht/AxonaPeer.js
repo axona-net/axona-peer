@@ -99,7 +99,7 @@ export class AxonaPeer extends DHT {
    *        signed publishes (the default).  Apps that only call
    *        `peer.pub(topic, message, { sign: false })` can omit it.
    */
-  constructor({ engine = null, domain = null, node, axonaManager = null, identity = null, transport = null, persist = null, maxPublishBytes = null }) {
+  constructor({ engine = null, domain = null, node, axonaManager = null, identity = null, publishIdentity = null, transport = null, persist = null, maxPublishBytes = null }) {
     super();
     if (!node) throw new Error('AxonaPeer: node is required');
     // O-5: a publish must be RECEIVABLE by any peer on any browser across any
@@ -146,6 +146,12 @@ export class AxonaPeer extends DHT {
     this._node   = node;
     this._axonaManager = axonaManager;
     this._identity = identity;
+    // Optional default PUBLISH identity — a signing keypair distinct from the
+    // (ephemeral) transport `identity`. When set, signed publishes sign with it
+    // (signerPubkey = its pubkey) so authorship is durable + unlinkable to the
+    // transport id. Apps run several by passing a per-call { signWith }. Omitted
+    // ⇒ publishes sign with `identity` (historical single-key behavior).
+    this._publishIdentity = publishIdentity;
     this._transport = transport;
     this._persist  = persist;
     this._started = false;
@@ -1345,10 +1351,17 @@ export class AxonaPeer extends DHT {
     const publisherBig = publisherId === null ? null : fromHex(publisherId);
     const topicIdBig  = await deriveTopicIdBig(publisherBig, topic);
 
-    if (sign && !this._identity) {
+    // Signing identity for THIS publish (the PUBLISH identity — may differ from
+    // the ephemeral transport `identity`). Precedence:
+    //   per-call opts.signWith → peer default this._publishIdentity → this._identity.
+    // Run MANY publish identities through one peer by varying { signWith } per call;
+    // signerPubkey on the envelope is this key's pubkey, so authorship is keyed to
+    // it (verification, per-publisher seq, kill/unpub ownership all follow signer).
+    const signId = sign ? (opts.signWith ?? this._publishIdentity ?? this._identity) : null;
+    if (sign && (!signId || !signId.privateKey || typeof signId.pubkeyHex !== 'string')) {
       throw new PublishError(ErrorCodes.PUBLISH_SIGN_FAILED,
-        'peer.pub: identity required for signed publish; pass {identity} to AxonaPeer ' +
-        'or call peer.pub(topic, msg, { sign: false }) for anonymous publish',
+        'peer.pub: a signing identity is required for a signed publish — pass {identity} or ' +
+        '{publishIdentity} to AxonaPeer, a per-call { signWith }, or { sign: false } for anonymous publish',
         { context: { topic } });
     }
 
@@ -1357,7 +1370,7 @@ export class AxonaPeer extends DHT {
       envelope = await buildEnvelope({
         topic, message,
         seq: this._nextPubSeq(),
-        identity: this._identity,
+        identity: signId,
         sign,
       });
     } catch (cause) {
