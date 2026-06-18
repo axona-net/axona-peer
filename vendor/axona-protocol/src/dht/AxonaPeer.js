@@ -41,7 +41,15 @@ import { DHT }            from '../contracts/DHT.js';
 import { Synapse }        from './Synapse.js';
 import { Subscription }   from './Subscription.js';
 import { clz264, toHex, fromHex, isHexId, BAD_ID_CODE } from '../utils/hexid.js';
-import { deriveTopicId, deriveTopicIdBig } from '../pubsub/post.js';
+import { resolveTopic, deriveTopicId, deriveTopicIdBig } from '../pubsub/post.js';
+
+/**
+ * Sentinel for an intentionally UNSIGNED (anonymous) publish:
+ *   peer.pub(topic, msg, { signWith: ANONYMOUS })
+ * Anonymity must be explicit — omitting a signer is an error, never silent
+ * anonymity (design v0.3 §6). Importable from '@axona/protocol'.
+ */
+export const ANONYMOUS = Symbol.for('axona.publish.anonymous');
 import { buildEnvelope }  from '../pubsub/envelope.js';
 import { buildKill }      from '../pubsub/kill.js';
 import { buildTouch }     from '../pubsub/touch.js';
@@ -99,7 +107,7 @@ export class AxonaPeer extends DHT {
    *        signed publishes (the default).  Apps that only call
    *        `peer.pub(topic, message, { sign: false })` can omit it.
    */
-  constructor({ engine = null, domain = null, node, axonaManager = null, identity = null, publishIdentity = null, transport = null, persist = null, maxPublishBytes = null }) {
+  constructor({ engine = null, domain = null, node, axonaManager = null, nodeIdentity = null, transport = null, persist = null, maxPublishBytes = null }) {
     super();
     if (!node) throw new Error('AxonaPeer: node is required');
     // O-5: a publish must be RECEIVABLE by any peer on any browser across any
@@ -145,14 +153,12 @@ export class AxonaPeer extends DHT {
     this._domain = domain ?? engine;
     this._node   = node;
     this._axonaManager = axonaManager;
-    this._identity = identity;
-    // Default PUBLISH identity — the signing keypair for publishes, separate from
-    // the (ephemeral) transport `identity`. signed publishes sign with it
-    // (signerPubkey = its pubkey) so authorship is durable + unlinkable to the
-    // transport id. Apps run several by passing a per-call { signWith }. If a peer
-    // publishes signed messages it MUST have a publish identity here or pass
-    // { signWith } — the transport key is never used implicitly (key separation).
-    this._publishIdentity = publishIdentity;
+    // The NODE identity — the connection/transport keypair (its pubkey forms the
+    // nodeId). Used for the handshake, routing, subscribing, and signing kill/unpub
+    // of the node's OWN node-level actions. It NEVER signs a publish (key
+    // separation): authorship is supplied per-publish via { signWith } (an author
+    // identity), and a peer holds no default author.
+    this._identity = nodeIdentity;
     this._transport = transport;
     this._persist  = persist;
     this._started = false;
@@ -1150,7 +1156,7 @@ export class AxonaPeer extends DHT {
       engine: engine ?? { onEvent: () => () => {} },
       node:   finalNode,
       axonaManager,
-      identity,
+      nodeIdentity: identity,
       transport,
     });
     peer.pendingSubscriptions = Array.isArray(state.subscriptions)
@@ -1330,65 +1336,73 @@ export class AxonaPeer extends DHT {
    * @param {boolean} [opts.sign=true]
    * @returns {Promise<string>} msgId — sha256 of the canonical envelope.
    */
-  async pub(topic, message, opts = {}) {
-    const { sign = true } = opts;
-    if (typeof topic !== 'string' || topic.length === 0) {
+  /**
+   * Resolve a topic descriptor { region?, owner?, name, write? } → the canonical
+   * resolved descriptor + topic id (hex + BigInt). The single entrypoint every
+   * pub/sub/pull/kill/unpub/host/unhost uses, so they all address identically and
+   * a root can recompute the same id from the signed descriptor. @internal
+   */
+  async _resolveTopicOrThrow(topic, op) {
+    if (!topic || typeof topic !== 'object' || typeof topic.name !== 'string' || topic.name.length === 0) {
       throw new PublishError(ErrorCodes.PUBLISH_INVALID_TOPIC,
-        `peer.pub: topic must be a non-empty string, got ${typeof topic}`,
+        `peer.${op}: topic must be an object { name, region?, owner?, write? }`,
         { context: { topic } });
     }
-    const am          = this._requireAxonaManager('pub');
-    // opts.publisher selects the topic-id derivation mode:
-    //   undefined (default)  → publisher-keyed, this peer's nodeId
-    //   null                 → public mode (anyone-can-publish, simple hash)
-    //   '66-char hex'        → publisher-keyed under a specified id
-    //                          (rare for pub — typically used for tests
-    //                          or for relaying as a known principal)
-    //
-    // publisherId stays hex at this layer — it's the user-facing form
-    // and is what flows into the envelope's `publisher` field.  Kernel
-    // internals (AxonaManager) use BigInt; we derive both.
-    const publisherId = 'publisher' in opts ? opts.publisher : this._nodeIdHex();
-    const publisherBig = publisherId === null ? null : fromHex(publisherId);
-    const topicIdBig  = await deriveTopicIdBig(publisherBig, topic);
+    let r;
+    try {
+      r = await resolveTopic(topic);
+    } catch (cause) {
+      const code = /region is required/.test(cause.message)
+        ? ErrorCodes.TOPIC_REGION_REQUIRED : ErrorCodes.PUBLISH_INVALID_TOPIC;
+      throw new PublishError(code, `peer.${op}: ${cause.message}`, { cause, context: { topic } });
+    }
+    r.topicIdBig = BigInt('0x' + r.topicId);
+    return r;
+  }
 
-    // Signing identity for THIS publish — the PUBLISH identity. KEY SEPARATION:
-    // publishes are signed by a publish keypair, NEVER implicitly by the transport
-    // `identity`. Precedence is per-call opts.signWith → peer default
-    // this._publishIdentity. There is intentionally NO fallback to the transport
-    // identity: reusing one keypair for both the connection and authorship is a
-    // key-reuse violation. signerPubkey on the envelope is this key's pubkey, so
-    // authorship (verification, per-publisher seq, kill/unpub ownership) follows it.
-    // Run MANY publish identities through one peer by varying { signWith } per call.
-    // (Signing with the transport key remains possible but only EXPLICITLY — pass it
-    // as { signWith }; that's an intentional, discouraged choice, never the default.)
-    const signId = sign ? (opts.signWith ?? this._publishIdentity) : null;
-    if (sign && !signId) {
+  async pub(topic, message, opts = {}) {
+    const desc = await this._resolveTopicOrThrow(topic, 'pub');
+    const am   = this._requireAxonaManager('pub');
+
+    // Signer (design v0.3 §5/§6): opts.signWith is an AUTHOR identity, or the
+    // ANONYMOUS sentinel for a deliberately unsigned publish. There is NO default
+    // author and NO fallback to the node key — omitting a signer is an error, never
+    // silent anonymity. Run many personas through one peer by varying { signWith }.
+    const anon   = opts.signWith === ANONYMOUS;
+    const signId = anon ? null : (opts.signWith ?? null);
+    if (!anon && !signId) {
       throw new PublishError(ErrorCodes.PUBLISH_NO_PUBLISH_IDENTITY,
-        'peer.pub: a publish identity is required to sign a publish. Pass { publishIdentity } to ' +
-        'AxonaPeer (or a per-call { signWith }). The transport identity must not sign publishes ' +
-        '(key separation); to do so intentionally, pass it explicitly as { signWith }. For an ' +
-        'unsigned/anonymous publish use { sign: false }.',
-        { context: { topic } });
+        'peer.pub: name a signer — pass { signWith: <authorIdentity> }, or { signWith: ANONYMOUS } to ' +
+        'publish unsigned. There is no default author, and the node key never signs publishes (key separation).',
+        { context: { topic: desc.name } });
     }
-    if (sign && (!signId.privateKey || typeof signId.pubkeyHex !== 'string')) {
+    if (signId && (!signId.privateKey || typeof signId.pubkeyHex !== 'string')) {
       throw new PublishError(ErrorCodes.PUBLISH_SIGN_FAILED,
-        'peer.pub: the signing identity ({ signWith } / { publishIdentity }) must expose privateKey + pubkeyHex',
-        { context: { topic } });
+        'peer.pub: { signWith } must be an author identity exposing privateKey + pubkeyHex',
+        { context: { topic: desc.name } });
+    }
+    // Owner-only topic: only the owner key may publish. Fail fast here (the root
+    // enforces the same at ingress, so this just turns a silent drop into an error).
+    if (desc.write === 'owner' && signId && signId.pubkeyHex.toLowerCase() !== desc.owner) {
+      throw new PublishError(ErrorCodes.WRITE_POLICY_VIOLATION,
+        `peer.pub: owner-only topic '${desc.name}' — only the owner key may publish ` +
+        `(signer ${signId.pubkeyHex.slice(0, 12)}… ≠ owner ${desc.owner.slice(0, 12)}…)`,
+        { context: { topic: desc.name } });
     }
 
     let envelope;
     try {
       envelope = await buildEnvelope({
-        topic, message,
-        seq: this._nextPubSeq(),
+        topic:    { region: desc.region, owner: desc.owner, name: desc.name, write: desc.write },
+        message,
+        seq:      this._nextPubSeq(),
         identity: signId,
-        sign,
+        sign:     !anon,
       });
     } catch (cause) {
       throw new PublishError(ErrorCodes.PUBLISH_SIGN_FAILED,
         `peer.pub: building envelope failed (${cause.message})`,
-        { cause, context: { topic, sign } });
+        { cause, context: { topic: desc.name } });
     }
 
     let json;
@@ -1396,31 +1410,19 @@ export class AxonaPeer extends DHT {
     catch (cause) {
       throw new PublishError(ErrorCodes.PUBLISH_INVALID_MESSAGE,
         `peer.pub: message is not JSON-serializable (${cause.message})`,
-        { cause, context: { topic } });
+        { cause, context: { topic: desc.name } });
     }
-    // Fail LOUD on oversize (O-5). A larger enveloped message is not guaranteed
-    // RECEIVABLE — WebRTC SCTP maxMessageSize is negotiated per connection and
-    // floored by the weakest hop + the receiving browser (measured: some stacks
-    // silently drop ≥64 KB). Above the interop-safe 16 KiB the publisher gets a
-    // clear error here instead of a message that vanishes mid-mesh. Large
-    // payloads must be chunked — see @axona/protocol/std/chunk.
     if (json.length > this._maxPublishBytes) {
       throw new PublishError(ErrorCodes.PUBLISH_PAYLOAD_TOO_LARGE,
         `peer.pub: enveloped message ${json.length}B exceeds the reliable-delivery limit ${this._maxPublishBytes}B ` +
-        `(WebRTC-interoperable floor; a larger message may not be receivable by every peer/browser). ` +
-        `Chunk large payloads with @axona/protocol/std/chunk (publishChunkedBytes).`,
-        { context: { topic, size: json.length, max: this._maxPublishBytes } });
+        `(WebRTC-interoperable floor). Chunk large payloads with @axona/protocol/std/chunk (publishChunkedBytes).`,
+        { context: { topic: desc.name, size: json.length, max: this._maxPublishBytes } });
     }
 
-    // AxonaManager generates its own publishId for network routing/
-    // cache keying.  We pass postHash = envelope.msgId so the relay's
-    // replay cache becomes searchable by content-hash for peer.pull()
-    // (A3).  publisher is recorded for the metrics counters.
-    am.pubsubPublish(topicIdBig, json, {
-      publisher: publisherId,
-      postHash:  envelope.msgId,
-      publishId: opts.publishId,   // optional app-supplied dedup token (e.g. std/publisher); kernel mints one if absent
-    });
+    // postHash = envelope.msgId makes the replay cache searchable by content hash
+    // for peer.pull (A3). v0.3: no publisher anchor, no publishId — dedup is the
+    // content-addressed msgId; placement is the topic id's region byte.
+    am.pubsubPublish(desc.topicIdBig, json, { postHash: envelope.msgId });
     return envelope.msgId;
   }
 
@@ -1449,44 +1451,31 @@ export class AxonaPeer extends DHT {
    * @returns {Promise<{ ok: boolean }>}  ok:true once the kill is dispatched
    */
   async kill(topic, msgId, opts = {}) {
-    if (typeof topic !== 'string' || topic.length === 0) {
-      throw new KillError(ErrorCodes.KILL_INVALID_TOPIC,
-        `peer.kill: topic must be a non-empty string, got ${typeof topic}`,
-        { context: { topic } });
-    }
     if (typeof msgId !== 'string' || !/^[0-9a-f]{64}$/.test(msgId)) {
       throw new KillError(ErrorCodes.KILL_INVALID_MSGID,
         `peer.kill: msgId must be a 64-char hex string (the value peer.pub returned)`,
         { context: { topic, msgId } });
     }
-    if (!this._identity) {
+    // A kill is authorized by AUTHORSHIP: the root accepts it only if its signer
+    // matches the signer of the cached message. So a kill is signed by the SAME
+    // author key that published the message — pass it as { signWith } (v0.3 §5).
+    const author = opts.signWith;
+    if (!author || !author.privateKey || typeof author.pubkeyHex !== 'string') {
       throw new KillError(ErrorCodes.KILL_SIGN_FAILED,
-        'peer.kill: identity required — a kill must be signed by the message creator',
+        'peer.kill: a kill must be signed by the author key that published the message — pass { signWith }',
         { context: { topic } });
     }
-    const am           = this._requireAxonaManager('kill');
-    const publisherId  = 'publisher' in opts ? opts.publisher : this._nodeIdHex();
-    const publisherBig = publisherId === null ? null : fromHex(publisherId);
-    const topicIdBig   = await deriveTopicIdBig(publisherBig, topic);
-    const topicIdHex   = publisherBig === null
-      ? await deriveTopicId(null, topic)
-      : await deriveTopicId(publisherId, topic);
-
+    const desc = await this._resolveTopicOrThrow(topic, 'kill');
+    const am   = this._requireAxonaManager('kill');
     let kill;
     try {
-      kill = await buildKill({
-        topicId: topicIdHex,
-        msgId,
-        seq:      this._nextPubSeq(),
-        identity: this._identity,
-      });
+      kill = await buildKill({ topicId: desc.topicId, msgId, seq: this._nextPubSeq(), identity: author });
     } catch (cause) {
       throw new KillError(ErrorCodes.KILL_SIGN_FAILED,
         `peer.kill: signing the kill failed (${cause.message})`,
         { cause, context: { topic, msgId } });
     }
-
-    am.pubsubKill(topicIdBig, kill);
+    am.pubsubKill(desc.topicIdBig, kill);
     return { ok: true };
   }
 
@@ -1512,44 +1501,30 @@ export class AxonaPeer extends DHT {
    * @returns {Promise<{ ok: true }>}
    */
   async touch(topic, msgId, opts = {}) {
-    if (typeof topic !== 'string' || topic.length === 0) {
-      throw new TouchError(ErrorCodes.TOUCH_INVALID_TOPIC,
-        `peer.touch: topic must be a non-empty string, got ${typeof topic}`,
-        { context: { topic } });
-    }
     if (typeof msgId !== 'string' || !/^[0-9a-f]{64}$/.test(msgId)) {
       throw new TouchError(ErrorCodes.TOUCH_INVALID_MSGID,
         `peer.touch: msgId must be a 64-char hex string (the value peer.pub returned)`,
         { context: { topic, msgId } });
     }
-    if (!this._identity) {
+    // Signed for freshness; authority is by topic — anyone may touch an OPEN topic,
+    // only the owner an OWNED one (verified at the root). Pass the author as { signWith }.
+    const author = opts.signWith;
+    if (!author || !author.privateKey || typeof author.pubkeyHex !== 'string') {
       throw new TouchError(ErrorCodes.TOUCH_SIGN_FAILED,
-        'peer.touch: identity required — a touch must be signed by the message creator',
+        'peer.touch: a touch must be signed — pass { signWith } (an author key; on an owned topic it must be the owner)',
         { context: { topic } });
     }
-    const am           = this._requireAxonaManager('touch');
-    const publisherId  = 'publisher' in opts ? opts.publisher : this._nodeIdHex();
-    const publisherBig = publisherId === null ? null : fromHex(publisherId);
-    const topicIdBig   = await deriveTopicIdBig(publisherBig, topic);
-    const topicIdHex   = publisherBig === null
-      ? await deriveTopicId(null, topic)
-      : await deriveTopicId(publisherId, topic);
-
+    const desc = await this._resolveTopicOrThrow(topic, 'touch');
+    const am   = this._requireAxonaManager('touch');
     let touch;
     try {
-      touch = await buildTouch({
-        topicId: topicIdHex,
-        msgId,
-        seq:      this._nextPubSeq(),
-        identity: this._identity,
-      });
+      touch = await buildTouch({ topicId: desc.topicId, msgId, seq: this._nextPubSeq(), identity: author });
     } catch (cause) {
       throw new TouchError(ErrorCodes.TOUCH_SIGN_FAILED,
         `peer.touch: signing the touch failed (${cause.message})`,
         { cause, context: { topic, msgId } });
     }
-
-    am.pubsubTouch(topicIdBig, touch);
+    am.pubsubTouch(desc.topicIdBig, touch);
     return { ok: true };
   }
 
@@ -1578,44 +1553,41 @@ export class AxonaPeer extends DHT {
    * @returns {Promise<{ ok: boolean }>}
    */
   async unpub(topic, opts = {}) {
-    if (typeof topic !== 'string' || topic.length === 0) {
-      throw new UnpubError(ErrorCodes.UNPUB_INVALID_TOPIC,
-        `peer.unpub: topic must be a non-empty string, got ${typeof topic}`,
-        { context: { topic } });
-    }
-    const publisherId = 'publisher' in opts ? opts.publisher : this._nodeIdHex();
-    if (publisherId === null) {
+    const desc = await this._resolveTopicOrThrow(topic, 'unpub');
+    // Only an OWNED topic can be unpublished, and only by its owner key.
+    if (!desc.owner || desc.write !== 'owner') {
       throw new UnpubError(ErrorCodes.UNPUB_PUBLIC_TOPIC,
-        'peer.unpub: public (ownerless) topics have no owner and cannot be unpublished',
-        { context: { topic } });
+        'peer.unpub: only an owned topic can be unpublished ({ owner, write: \'owner\' }); open topics have no owner',
+        { context: { topic: desc.name } });
     }
-    if (!this._identity) {
+    const author = opts.signWith;
+    if (!author || !author.privateKey || typeof author.pubkeyHex !== 'string') {
       throw new UnpubError(ErrorCodes.UNPUB_SIGN_FAILED,
-        'peer.unpub: identity required — an unpub must be signed by the topic owner',
-        { context: { topic } });
+        'peer.unpub: an unpub must be signed by the topic owner — pass { signWith } (the owner author key)',
+        { context: { topic: desc.name } });
     }
-    const am           = this._requireAxonaManager('unpub');
-    const publisherBig = fromHex(publisherId);
-    const topicIdBig   = await deriveTopicIdBig(publisherBig, topic);
-    const topicIdHex   = await deriveTopicId(publisherId, topic);
-
+    if (author.pubkeyHex.toLowerCase() !== desc.owner) {
+      throw new UnpubError(ErrorCodes.UNPUB_SIGN_FAILED,
+        'peer.unpub: signer is not the topic owner',
+        { context: { topic: desc.name } });
+    }
+    const am = this._requireAxonaManager('unpub');
     let unpub;
     try {
       unpub = await buildUnpub({
-        topicId:     topicIdHex,
-        topicName:   topic,
-        ownerNodeId: publisherId,
+        topicId:     desc.topicId,
+        topicName:   desc.name,
+        ownerNodeId: desc.owner,         // v0.3: the owner is the Author ID (public key)
         destroy:     opts.destroy === true,
         seq:         this._nextPubSeq(),
-        identity:    this._identity,
+        identity:    author,
       });
     } catch (cause) {
       throw new UnpubError(ErrorCodes.UNPUB_SIGN_FAILED,
         `peer.unpub: signing the unpub failed (${cause.message})`,
-        { cause, context: { topic } });
+        { cause, context: { topic: desc.name } });
     }
-
-    am.pubsubUnpub(topicIdBig, unpub);
+    am.pubsubUnpub(desc.topicIdBig, unpub);
     return { ok: true };
   }
 
@@ -1634,29 +1606,16 @@ export class AxonaPeer extends DHT {
    * @returns {Promise<Subscription>}
    */
   async sub(topic, handler, opts = {}) {
-    if (typeof topic !== 'string' || topic.length === 0) {
-      throw new SubscribeError(ErrorCodes.SUBSCRIBE_INVALID_TOPIC,
-        `peer.sub: topic must be a non-empty string, got ${typeof topic}`,
-        { context: { topic } });
-    }
     if (typeof handler !== 'function') {
       throw new SubscribeError(ErrorCodes.SUBSCRIBE_HANDLER_MISSING,
-        'peer.sub: handler must be a function',
-        { context: { topic } });
+        'peer.sub: handler must be a function', { context: { topic } });
     }
-
-    const am          = this._requireAxonaManager('sub');
-    // opts.publisher selects the topic-id derivation mode (same
-    // semantics as peer.pub):
-    //   undefined (default)  → publisher-keyed, this peer's nodeId
-    //                          (subscribe to your own published feed)
-    //   null                 → public mode (subscribe to a well-known
-    //                          public topic by name)
-    //   '66-char hex'        → publisher-keyed under that publisher
-    //                          (subscribe to someone else's feed)
-    const publisherId = 'publisher' in opts ? opts.publisher : this._nodeIdHex();
-    const publisherBig = publisherId === null ? null : fromHex(publisherId);
-    const topicIdBig  = await deriveTopicIdBig(publisherBig, topic);
+    // Structured topic { region?, owner?, name, write? } — same addressing as pub.
+    // To read someone's feed/profile pass their owner Author ID; key-derived
+    // placement (region omitted + owner) makes it discoverable from the Author ID.
+    const desc       = await this._resolveTopicOrThrow(topic, 'sub');
+    const am         = this._requireAxonaManager('sub');
+    const topicIdBig = desc.topicIdBig;
 
     // Apply `since` mode by seeding AxonaManager's per-topic lastSeenTs
     // BEFORE the subscribe call.  AxonaManager passes lastSeenTs in the
@@ -1669,7 +1628,7 @@ export class AxonaPeer extends DHT {
     // routed correctly.  Subscription's internal `_topicId` is BigInt
     // (kernel form); the public `sub.topicId` getter returns hex.
     const sub = new Subscription({
-      peer: this, topicId: topicIdBig, topicName: topic, handler, opts,
+      peer: this, topicId: topicIdBig, topicName: desc.name, handler, opts,
     });
     if (!this._subscriptions.has(topicIdBig)) this._subscriptions.set(topicIdBig, new Set());
     this._subscriptions.get(topicIdBig).add(sub);
@@ -1705,15 +1664,9 @@ export class AxonaPeer extends DHT {
    * @returns {Promise<{ ok: boolean, removed: number }>}
    */
   async unsub(topic, opts = {}) {
-    if (typeof topic !== 'string' || topic.length === 0) {
-      throw new SubscribeError(ErrorCodes.SUBSCRIBE_INVALID_TOPIC,
-        `peer.unsub: topic must be a non-empty string, got ${typeof topic}`,
-        { context: { topic } });
-    }
     // Derive the topicId exactly as sub() does so we target the same feed.
-    const publisherId  = 'publisher' in opts ? opts.publisher : this._nodeIdHex();
-    const publisherBig = publisherId === null ? null : fromHex(publisherId);
-    const topicIdBig   = await deriveTopicIdBig(publisherBig, topic);
+    const desc       = await this._resolveTopicOrThrow(topic, 'unsub');
+    const topicIdBig = desc.topicIdBig;
 
     const set = this._subscriptions.get(topicIdBig);
     if (!set || set.size === 0) return { ok: true, removed: 0 };
@@ -1756,18 +1709,11 @@ export class AxonaPeer extends DHT {
       this._markPersistDirty('hosting');
       return { ok: true, scope: 'keyspace' };
     }
-    if (typeof topic !== 'string' || topic.length === 0) {
-      throw new SubscribeError(ErrorCodes.SUBSCRIBE_INVALID_TOPIC,
-        `peer.host: topic must be a non-empty string (or omitted for keyspace), got ${typeof topic}`,
-        { context: { topic } });
-    }
-    const publisherId  = 'publisher' in opts ? opts.publisher : this._nodeIdHex();
-    const publisherBig = publisherId === null ? null : fromHex(publisherId);
-    const topicIdBig   = await deriveTopicIdBig(publisherBig, topic);
-    this._applySince(am, topicIdBig, opts.since);
-    am.pubsubHost(topicIdBig);
+    const desc = await this._resolveTopicOrThrow(topic, 'host');
+    this._applySince(am, desc.topicIdBig, opts.since);
+    am.pubsubHost(desc.topicIdBig);
     this._markPersistDirty('hosting');
-    return { ok: true, scope: 'topic', topicId: toHex(topicIdBig) };
+    return { ok: true, scope: 'topic', topicId: desc.topicId };
   }
 
   /**
@@ -1787,15 +1733,8 @@ export class AxonaPeer extends DHT {
       this._markPersistDirty('hosting');
       return { ok: true, scope: 'keyspace' };
     }
-    if (typeof topic !== 'string' || topic.length === 0) {
-      throw new SubscribeError(ErrorCodes.SUBSCRIBE_INVALID_TOPIC,
-        `peer.unhost: topic must be a non-empty string (or omitted), got ${typeof topic}`,
-        { context: { topic } });
-    }
-    const publisherId  = 'publisher' in opts ? opts.publisher : this._nodeIdHex();
-    const publisherBig = publisherId === null ? null : fromHex(publisherId);
-    const topicIdBig   = await deriveTopicIdBig(publisherBig, topic);
-    am.pubsubUnhost(topicIdBig);
+    const desc = await this._resolveTopicOrThrow(topic, 'unhost');
+    am.pubsubUnhost(desc.topicIdBig);
     this._markPersistDirty('hosting');
     return { ok: true, scope: 'topic' };
   }
@@ -1838,7 +1777,7 @@ export class AxonaPeer extends DHT {
    * @param {number} [opts.timeoutMs=1000]
    * @returns {Promise<object | null>} envelope or null
    */
-  async pull(msgId, { topic, publisher, timeoutMs = 1000 } = {}) {
+  async pull(msgId, { topic, timeoutMs = 1000 } = {}) {
     // Phase A #6: msgId is OPTIONAL — pass null (or omit) to fetch the topic's
     // most-recent message; pass a 64-char hex msgId for a specific one.
     const wantsLatest = msgId === null || msgId === undefined;
@@ -1847,27 +1786,14 @@ export class AxonaPeer extends DHT {
         `peer.pull: msgId must be a 64-char hex string, or null/omitted for the latest message`,
         { context: { msgId } });
     }
-    if (typeof topic !== 'string' || topic.length === 0) {
-      throw new PullError(ErrorCodes.PULL_INVALID_MSGID,
-        'peer.pull: { topic } is required',
-        { context: { msgId } });
-    }
-    // publisher may be:
-    //   · null (public topic — sha256(topicName), no publisher prefix)
-    //   · 66-char hex node ID (publisher-keyed)
-    if (publisher !== null && !isHexId(publisher)) {
-      throw new PullError(ErrorCodes.PULL_INVALID_MSGID,
-        'peer.pull: { publisher } must be a 66-char hex node ID or null',
-        { context: { msgId, publisher } });
-    }
     const am = this._requireAxonaManager('pull');
     if (typeof am.requestPull !== 'function') {
       throw new PullError(ErrorCodes.PULL_AXONS_UNREACHABLE,
         'peer.pull: AxonaManager does not support requestPull',
         { context: {} });
     }
-    const publisherBig = publisher === null ? null : fromHex(publisher);
-    const topicIdBig   = await deriveTopicIdBig(publisherBig, topic);
+    const desc       = await this._resolveTopicOrThrow(topic, 'pull');
+    const topicIdBig = desc.topicIdBig;
     const result = await am.requestPull(topicIdBig, wantsLatest ? null : msgId, { timeoutMs });
     if (!result) return null;
 
@@ -1908,26 +1834,13 @@ export class AxonaPeer extends DHT {
    *   count reported by any single responding relay — exact for an unsplit
    *   topic (single root), a lower bound once the tree has split into sub-axons.
    */
-  async metrics(topic, { publisher, timeoutMs = 500 } = {}) {
-    if (typeof topic !== 'string' || topic.length === 0) {
-      throw new MetricsError(ErrorCodes.METRICS_AXONS_UNREACHABLE,
-        'peer.metrics: topic must be a non-empty string',
-        { context: { topic } });
-    }
-    // publisher may be:
-    //   · null (public topic — sha256(topicName), no publisher prefix)
-    //   · 66-char hex node ID (publisher-keyed)
-    if (publisher !== null && !isHexId(publisher)) {
-      throw new MetricsError(ErrorCodes.METRICS_AXONS_UNREACHABLE,
-        'peer.metrics: { publisher } must be a 66-char hex node ID or null',
-        { context: { topic, publisher } });
-    }
+  async metrics(topic, { timeoutMs = 500 } = {}) {
+    const desc = await this._resolveTopicOrThrow(topic, 'metrics');
     const am = this._requireAxonaManager('metrics');
     if (typeof am.requestMetrics !== 'function') {
       return { publishes: 0, subscribers: 0, deliveries: 0, pulls: 0, reshares: 0, relayCount: 0 };
     }
-    const publisherBig = publisher === null ? null : fromHex(publisher);
-    const topicIdBig   = await deriveTopicIdBig(publisherBig, topic);
+    const topicIdBig = desc.topicIdBig;
     const responses = await am.requestMetrics(topicIdBig, null, { timeoutMs });
 
     let deliveries = 0, pulls = 0, reshares = 0, publishes = 0;
@@ -2512,10 +2425,14 @@ export class AxonaPeer extends DHT {
       }
       // Defence: enforce envelope shape so apps always see consistent
       // fields even if a malformed peer sends garbage.
+      // v0.3: the envelope's topic is the signed descriptor object
+      // { region, owner, name, write } — not a bare string. Require the
+      // descriptor's name to be a string so apps see a consistent shape.
       if (!envelope || typeof envelope !== 'object' ||
           typeof envelope.msgId !== 'string' ||
           typeof envelope.ts !== 'number' ||
-          typeof envelope.topic !== 'string' ||
+          typeof envelope.topic !== 'object' || envelope.topic === null ||
+          typeof envelope.topic.name !== 'string' ||
           !('message' in envelope)) {
         throw new Error('malformed envelope');
       }

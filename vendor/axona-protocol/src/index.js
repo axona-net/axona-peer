@@ -78,18 +78,24 @@ export {
 } from './persistence/interface.js';
 
 // ── Identity ─────────────────────────────────────────────────────────
-// Ed25519 keypair + 264-bit nodeId + S2-prefix region anchor.
-// deriveIdentity({ lat, lng }) generates a fresh identity;
-// dumpIdentity/loadIdentity persist and restore. computeNodeId is
-// the public helper for verifying a claimed nodeId against the
-// stored pubkey + region.
+// Two factories (design v0.3):
+//   createNodeIdentity({ lat, lng }) → the CONNECTION key + 264-bit nodeId
+//     (S2-prefix region anchor); ephemeral.
+//   createAuthorIdentity({ persistAs? }) → the AUTHORSHIP key (Author ID);
+//     keypair only, NO location/nodeId; persistence is an option.
+// dumpIdentity/loadIdentity persist/restore a node identity (advanced).
+// computeNodeId verifies a claimed nodeId against pubkey + region.
 export {
-  deriveIdentity,
+  createNodeIdentity,
+  createAuthorIdentity,
   dumpIdentity,
   loadIdentity,
   computeNodeId,
   computeNodeIdBigInt,
 } from './identity/index.js';
+
+// Sentinel for an explicitly anonymous (unsigned) publish: pub(t, m, { signWith: ANONYMOUS }).
+export { ANONYMOUS } from './dht/AxonaPeer.js';
 
 // ── Proof-of-work scaffolding (E-1 / Stage 2 — inert at difficulty 0) ──
 export {
@@ -114,13 +120,10 @@ export { Subscription } from './dht/Subscription.js';
 
 // ── Pub/sub primitives ─────────────────────────────────────────────
 export { AxonaManager } from './pubsub/AxonaManager.js';
-export { AxonPubSub }  from './pubsub/AxonPubSub.js';
 export {
-  makePost,
+  resolveTopic,
   deriveTopicId,
-  verifyPostHash,
-  verifyTopicOwnership,
-  verifySignature,
+  deriveTopicIdBig,
   canonical,
   sha256Hex,
 } from './pubsub/post.js';
@@ -241,6 +244,9 @@ export {
   regionCode,
   resolveRegion,
   regionNameForLatLng,
+  regionCenter,
+  POPULATED_REGIONS,
+  keyDerivedRegion,
 } from './utils/region-names.js';
 
 // axona/4 authenticated-identity handshake.  Re-exported so consumers

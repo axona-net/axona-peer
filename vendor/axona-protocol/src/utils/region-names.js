@@ -19,7 +19,7 @@
  *     then returns the canonical (lowest) code for that name.
  */
 
-import { geoCellId, isValidCellId, S2_CELL_COUNT } from './s2.js';
+import { geoCellId, geoCellCenter, isValidCellId, S2_CELL_COUNT } from './s2.js';
 
 /** Single region name for every code, indexed by code [0,192). */
 export const REGION_NAMES = Object.freeze([
@@ -282,6 +282,50 @@ export function resolveRegion(token) {
  */
 export function regionNameForLatLng(lat, lng) {
   return REGION_NAMES[geoCellId(lat, lng, 8)];
+}
+
+/**
+ * The (lat,lng) center of a region, by name or code. Used as the default
+ * placement for topics and to mint a node identity in a chosen region.
+ * @param {string|number} nameOrCode  e.g. 'useast', '0x89', 137
+ * @returns {{lat:number,lng:number}|null}
+ */
+export function regionCenter(nameOrCode) {
+  const code = resolveRegion(nameOrCode);
+  return code === null ? null : geoCellCenter(code);
+}
+
+// Open-ocean cells follow the "<oce3>_<hex>" convention (pac_68, atl_0a, …);
+// everything else is a populated/land (or inhabited-island) region. A topic
+// must live where nodes actually are, so placement is restricted to these.
+const OCEAN_NAME_RE = /^(pac|atl|ind|sou|arc)_[0-9a-f]{2}$/;
+
+/**
+ * Populated regions — `{ code, name }` for every non-open-ocean cell. The set a
+ * topic may be placed in (no global region; no empty ocean).
+ * NOTE (review before prod): this is the ocean-name heuristic; it still includes
+ * sparsely-populated polar/Antarctic land cells. Tighten the exclusion list if a
+ * key-derived profile landing there proves undiscoverable.
+ */
+export const POPULATED_REGIONS = Object.freeze(
+  REGION_NAMES.map((name, code) => ({ code, name }))
+    .filter((r) => !OCEAN_NAME_RE.test(r.name)),
+);
+const POPULATED_CODES = Object.freeze(POPULATED_REGIONS.map((r) => r.code));
+
+/**
+ * Map an Author ID to a deterministic, real, populated region (design D6). Lets
+ * an owner-anchored topic (profile, avatar, inbox) be discovered from the Author
+ * ID alone — and because the region is a hash of the key, it reveals nothing
+ * about the author's actual location.
+ * @param {string} authorId  64-char hex public key (the Author ID)
+ * @returns {Promise<number>} a populated region code
+ */
+export async function keyDerivedRegion(authorId) {
+  const bytes  = new TextEncoder().encode(String(authorId));
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes));
+  const n = ((digest[0] << 24) | (digest[1] << 16) | (digest[2] << 8) | digest[3]) >>> 0;
+  return POPULATED_CODES[n % POPULATED_CODES.length];
 }
 
 if (REGION_NAMES.length !== S2_CELL_COUNT) {

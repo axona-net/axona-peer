@@ -8,9 +8,9 @@
 // transport), this one walks the v1.0.0-rc.0 surface end-to-end:
 //
 //   1. Kernel imports resolve from vendor/axona-protocol/
-//   2. deriveIdentity({ lat, lng }) gives a 264-bit hex identity
+//   2. createNodeIdentity({ lat, lng }) gives a 264-bit hex identity
 //   3. SimNetwork + simTransport bind two peers in-process
-//   4. AxonaPeer constructor accepts (identity, transport) — no
+//   4. AxonaPeer constructor accepts (nodeIdentity, transport) — no
 //      legacy engine/node god's-eye object required
 //   5. peer.join() (standalone) brings the transport up
 //   6. Signed envelopes build + verify in this env
@@ -40,7 +40,7 @@
 import {
   SimNetwork, simTransport,
   AxonaPeer,
-  deriveIdentity,
+  createNodeIdentity,
   buildEnvelope, verifyEnvelope,
 } from '../vendor/axona-protocol/src/index.js';
 
@@ -56,8 +56,8 @@ const TOKYO  = { lat: 35.6762, lng: 139.6503 };
 // ── 1. Kernel construction in axona-peer's env ─────────────────────
 async function testConstruction() {
   console.log('\n── kernel construction in axona-peer/ env ──');
-  const aliceId = await deriveIdentity(LONDON);
-  const bobId   = await deriveIdentity(TOKYO);
+  const aliceId = await createNodeIdentity(LONDON);
+  const bobId   = await createNodeIdentity(TOKYO);
 
   check('alice id is 66-char hex',
     typeof aliceId.id === 'string' && aliceId.id.length === 66);
@@ -73,8 +73,11 @@ async function testConstruction() {
 // ── 2. Signed envelope round-trip in this env ──────────────────────
 async function testEnvelope({ aliceId }) {
   console.log('\n── signed envelope build + verify ──');
+  // Envelope v3: `topic` is the structured DESCRIPTOR { region, owner,
+  // name, write } — the signature binds the exact topic + write policy,
+  // and verifyEnvelope rejects a bare-string topic (missing_topic).
   const env = await buildEnvelope({
-    topic:    'weather/london',
+    topic:    { region: 0x89, owner: null, name: 'weather', write: 'open' },
     message:  { temp: 12, sky: 'cloudy' },
     identity: aliceId,
   });
@@ -100,12 +103,12 @@ async function testTransportMessaging({ aliceId, bobId }) {
   const alice = new AxonaPeer({
     engine: { onEvent: () => () => {} },
     node:   { id: aliceId.id, alive: true, synaptome: new Map() },
-    identity: aliceId, transport: aliceT,
+    nodeIdentity: aliceId, transport: aliceT,
   });
   const bob = new AxonaPeer({
     engine: { onEvent: () => () => {} },
     node:   { id: bobId.id, alive: true, synaptome: new Map() },
-    identity: bobId, transport: bobT,
+    nodeIdentity: bobId, transport: bobT,
   });
 
   await alice.join();

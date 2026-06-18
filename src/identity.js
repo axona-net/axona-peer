@@ -27,18 +27,26 @@
 //
 // API:
 //   getCurrentIdentity()      → null | Identity   (synchronous read of localStorage)
-//   deriveIdentity(opts)      → Promise<Identity> (creates + persists)
+//   deriveIdentity(opts)      → Promise<Identity> (creates + persists; wraps kernel createNodeIdentity)
 //   rotateIdentity(opts)      → Promise<Identity> (forces fresh bits)
 //   forgetIdentity()          → void              (clears localStorage)
+//   getAuthorIdentity()       → Promise<AuthorIdentity> (durable publish-signing key; wraps kernel createAuthorIdentity)
 //
 // Where Identity = { id: bigint, geoBits: number, region: {...} }
 // =====================================================================
 
 import { geoCellId }              from '../vendor/axona-protocol/src/utils/s2.js';
-import { deriveIdentity as kernelDeriveIdentity }
-                                  from '../vendor/axona-protocol/src/identity/index.js';
+// v0.3: the connection/node identity factory is `createNodeIdentity`
+// (was `deriveIdentity`).  The durable AUTHORSHIP key is a separate
+// factory, `createAuthorIdentity` — keypair only, no nodeId/region.
+import {
+  createNodeIdentity   as kernelCreateNodeIdentity,
+  createAuthorIdentity as kernelCreateAuthorIdentity,
+}                                 from '../vendor/axona-protocol/src/identity/index.js';
 
 const STORAGE_KEY = 'axona.identity.v1';
+// localStorage key under which the durable author (publish) key persists.
+const AUTHOR_STORAGE_KEY = 'axona.author.v1';
 const GEO_BITS    = 8;
 
 // Identity store.  We use sessionStorage (per-tab) by default instead
@@ -221,7 +229,7 @@ export async function deriveIdentity(opts = {}) {
   // dumpIdentity), so make the signing key non-extractable — XSS or a
   // malicious dependency can sign while the session lives but can never
   // export/exfiltrate the key.
-  const kernel = await kernelDeriveIdentity({
+  const kernel = await kernelCreateNodeIdentity({
     lat: region.lat, lng: region.lng, extractable: false,
   });
 
@@ -280,6 +288,20 @@ export function forgetIdentity() {
     if (!store) continue;
     try { store.removeItem(STORAGE_KEY); } catch { /* quota or disabled */ }
   }
+}
+
+/**
+ * v0.3: the durable AUTHORSHIP key (Author ID) used to SIGN publishes.
+ * This is a separate keypair from the node/connection identity: it has
+ * no location and no nodeId — authorship is not a place.  It persists
+ * to localStorage under AUTHOR_STORAGE_KEY (load-or-create), so a
+ * returning visitor keeps a recognizable Author ID across sessions and
+ * can retract their own messages (kill / unpub).
+ *
+ * Returns { authorId (=pubkeyHex), pubkey, pubkeyHex, privateKey, sign, verify }.
+ */
+export async function getAuthorIdentity() {
+  return kernelCreateAuthorIdentity({ persistAs: AUTHOR_STORAGE_KEY });
 }
 
 // ── Internal ────────────────────────────────────────────────────────

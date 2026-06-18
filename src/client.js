@@ -25,36 +25,55 @@ import { renderQR }    from './qr.js';
 // NeuronNode + AxonaDomain own routing and pub/sub.  This replaces the
 // hand-rolled mesh / node / wire codec the prior build wired together
 // in this file.
-import { AxonaPeer, AxonaDomain, NeuronNode } from '../vendor/axona-protocol/src/index.js';
+import { AxonaPeer, AxonaDomain, NeuronNode, ANONYMOUS } from '../vendor/axona-protocol/src/index.js';
 import { webTransport } from '../vendor/axona-protocol/src/transport/web/index.js';
 import {
   REGIONS,
   getCurrentIdentity,
   deriveIdentity,
+  getAuthorIdentity,
 } from './identity.js';
-// v1.1: region-keyed topics use a synthetic publisher whose top 8
-// bits match the chosen region's S2 cell, so deriveTopicId emits a
-// topic ID with that S2 prefix and us-east peers (S2=0x89 under the
-// standard-S2 partition, kernel v2.0+) become naturally XOR-closest
-// to us-east topics.
-import { geoCellId }   from '../vendor/axona-protocol/src/utils/s2.js';
+// v0.3: topics are STRUCTURED descriptors, not strings.  An open topic
+// is `{ region, name }`, where `region` is a kernel region NAME (e.g.
+// 'useast') or numeric S2 code.  We map the app's REGIONS entries
+// (ids like 'us-east', lat/lng) to kernel region names via
+// `regionNameForLatLng(lat, lng)` so the structured topic's region
+// carries the same S2 cell the old synthetic-publisher scheme used —
+// us-east peers stay XOR-closest to us-east topics.
+import { regionNameForLatLng } from '../vendor/axona-protocol/src/index.js';
 // Bridge directory: discover alternate bridges + fail over to a saved one
 // when the configured primary is unreachable (see bridgeBook.js).
 import { BRIDGE_DIRECTORY_TOPIC } from '../vendor/axona-protocol/src/bridgeDirectory.js';
 import * as bridgeBook from './bridgeBook.js';
-// I3: pub/sub now uses the kernel's unified API via peer.pub /
-// peer.sub.  Topics are public-mode strings (anyone-can-publish,
-// anyone-can-subscribe) shaped as `${regionId}/${eventName}` so the
-// (region, event) addressing UX is preserved without forcing a
-// publisher-keyed model.  The application chooses the hashing mode
-// per call; `{ publisher: null }` selects the simple-name hash.
+
+// v0.3: open topics are structured descriptors and REQUIRE a region —
+// there's no global region byte anymore.  The bridge-directory topic is
+// a single well-known, globally-discoverable topic, so every client must
+// agree on ONE fixed region for it.  We pin it to 'useast' (0x89).
+//
+// Cross-repo invariant: axona-bridge/src/bridge_directory.js publishes to
+// the IDENTICAL descriptor `{ region: 'useast', name: BRIDGE_DIRECTORY_TOPIC }`
+// (both repos migrated together in the v3.0.0 flag-day), so the published
+// and subscribed topic ids match.  If either side's region or name changes,
+// directory discovery silently stops interoperating — keep them in lockstep.
+const BRIDGE_DIRECTORY_DESC = Object.freeze({
+  region: 'useast',
+  name:   BRIDGE_DIRECTORY_TOPIC,
+});
+// v0.3: pub/sub uses the kernel's structured-topic API via peer.pub /
+// peer.sub.  An open topic is the descriptor `{ region, name }`
+// (anyone-can-publish, anyone-can-subscribe); `region` is a kernel
+// region name carrying the S2 cell.  The (region, event) addressing
+// UX is preserved: the app's `eventName` becomes the topic `name` and
+// the app's `regionId` maps to a kernel region name (appRegionName()).
+// Publishes are signed with the durable author key (signWith:).
 
 // Peer build number.  Bump the middle digit on every code change so
 // you can confirm a redeployed page actually loaded (esp. on iOS,
 // where the bfcache can serve a stale module set for ages).  The
 // bridge version arrives separately in its `welcome` message; the
 // "version" row in the me panel shows both side by side.
-const PEER_VERSION = '3.35.0';
+const PEER_VERSION = '3.36.0';
 
 // webTransport() now owns the bridge WebSocket lifecycle (ping cadence,
 // stale window, reconnect backoff, uptime), so those constants moved
@@ -163,10 +182,10 @@ async function refreshBridgeDirectory(connectedUrl, timeToMeshMs) {
   const collected = [];
   let sub = null;
   try {
-    sub = await peer.sub(BRIDGE_DIRECTORY_TOPIC, (env) => {
+    sub = await peer.sub(BRIDGE_DIRECTORY_DESC, (env) => {
       if (!env || env.deleted || !env.signerPubkey) return;
       collected.push({ entry: env.message, signerKey: env.signerPubkey });
-    }, { publisher: null, since: 'all' });
+    }, { since: 'all' });
     await new Promise((r) => setTimeout(r, 5000));
   } catch (err) {
     appendLog('directory:refresh-failed', err.message ?? String(err), 'warn');
@@ -719,6 +738,7 @@ window.addEventListener('beforeunload', () => {
 let peer = null;        // AxonaPeer
 let transport = null;   // CompositeTransport from webTransport()
 let node = null;        // NeuronNode
+let authorIdentity = null;  // durable AUTHORSHIP key (signWith: for every publish)
 
 function populateRegionDropdown() {
   for (const r of REGIONS) {
@@ -774,11 +794,14 @@ async function waitForMeshReady() {
 async function bootAxonaNode(opts = {}) {
   const bootStartedAt = Date.now();
   const identity = await deriveIdentity(opts);
-  // Key separation (kernel v2.51): publishes are signed by a PUBLISH identity,
-  // never the transport `identity`. A distinct keypair, minted per session (this
-  // demo doesn't persist authorship; an app that wants durable authorship would
-  // dumpIdentity/loadIdentity it instead).
-  const publishIdentity = await deriveIdentity(opts);
+  // Key separation (design v0.3): publishes are signed by the durable
+  // AUTHORSHIP key, never the transport/node `identity`.  The author key
+  // is a keypair-only Author ID (no location, no nodeId) and persists to
+  // localStorage so a returning visitor keeps a recognizable identity and
+  // can retract (kill/unpub) their own messages.  It is passed per-publish
+  // as `{ signWith: authorIdentity }` — there is no default signer on the
+  // AxonaPeer anymore.
+  authorIdentity = await getAuthorIdentity();
   $axonaId.textContent     = fmtNodeId(identity.id);
   $axonaRegion.textContent = identity.region?.label
     ?? identity.region?.id
@@ -816,7 +839,7 @@ async function bootAxonaNode(opts = {}) {
   node.transport = transport;
 
   const domain = new AxonaDomain({ k: 20 });
-  peer = new AxonaPeer({ domain, node, identity, transport, publishIdentity });   // publishes signed by publishIdentity (not the transport key)
+  peer = new AxonaPeer({ domain, node, nodeIdentity: identity, transport });   // publishes are signed per-call via { signWith: authorIdentity }
 
   // ── Wire UI events BEFORE start so we don't miss the first welcome
   //    / state transition that lands during the handshake. ──────────
@@ -915,16 +938,16 @@ async function bootAxonaNode(opts = {}) {
      *  an axon supposedly has a subscriber in role.children but
      *  transport.notify silently drops because the binding doesn't exist. */
     boundPeers:  () => transport.boundPeers().map(hex),
-    /** Resolve a (regionId, eventName) to its 264-bit hex topic ID
-     *  (public-mode: '00' + sha256(`${regionId}/${eventName}`)). */
+    /** Resolve an (appRegionId, eventName) to its 264-bit hex topic ID
+     *  (v0.3 structured open topic: <region S2 prefix> + sha256(descriptor)). */
     topicKey: async (regionId, eventName) => {
       const { deriveTopicId } = await import(
         '../vendor/axona-protocol/src/pubsub/post.js'
       );
-      // v1.1: region-keyed — same synth publisher addSubscription /
-      // publishFromForm use, so DevTools shows the topic ID that's
-      // actually routed.
-      return deriveTopicId(regionSynthPublisher(regionId), `${regionId}/${eventName}`);
+      // v0.3: structured open topic descriptor — same one
+      // addSubscription / publishFromForm use, so DevTools shows the
+      // topic ID that's actually routed.
+      return deriveTopicId(openTopicDesc(regionId, eventName));
     },
     /** Run findKClosest for a topic.  Reveals WHICH K peers this node
      *  thinks are the topic's axon set — the most important diagnostic
@@ -1149,22 +1172,25 @@ function escapeHtml(s) {
 }
 
 /**
- * Build a 66-char synthetic publisher ID for `regionId` so the
- * topic ID derives with the region's 8-bit S2 prefix.  All peers
- * pick the same synth ID for the same region (geoCellId is
- * deterministic from lat/lng), so publisher + subscriber produce
- * identical topicIds and land on the same K-closest axon set.
+ * Map an app `regionId` (e.g. 'us-east' from REGIONS) to a KERNEL region
+ * NAME (e.g. 'useast') for a structured topic descriptor.  The kernel
+ * region name carries the same 8-bit S2 cell the old synthetic-publisher
+ * scheme used: it's `regionNameForLatLng(lat, lng)` of the app region's
+ * canonical coordinates, so publisher and subscriber compute the same
+ * topic id and land on the same K-closest axon set, and us-east peers
+ * stay XOR-closest to us-east topics (replaces regionSynthPublisher).
  *
- * Shape: `<2 hex chars: regional S2 prefix> + <64 zero hex chars>`.
- * Not a real peer's nodeId — it never signs anything; the envelope
- * is signed by the calling peer's actual identity.privateKey, and
- * `opts.publisher` here only controls deriveTopicId's prefix.
+ * Returns null for an unknown regionId.
  */
-function regionSynthPublisher(regionId) {
+function appRegionName(regionId) {
   const region = REGIONS.find(r => r.id === regionId);
   if (!region) return null;
-  const s2 = geoCellId(region.lat, region.lng, 8);
-  return s2.toString(16).padStart(2, '0') + '0'.repeat(64);
+  return regionNameForLatLng(region.lat, region.lng);
+}
+
+/** Structured OPEN-topic descriptor for an (appRegionId, eventName) pair. */
+function openTopicDesc(regionId, eventName) {
+  return { region: appRegionName(regionId), name: eventName };
 }
 
 async function addSubscription(regionId, eventName) {
@@ -1177,16 +1203,15 @@ async function addSubscription(regionId, eventName) {
   if (subscriptions.some(s => s.regionId === regionId && s.eventName === eventName)) {
     return;
   }
-  const topic = `${regionId}/${eventName}`;
+  const topic = openTopicDesc(regionId, eventName);
   const sub = { regionId, eventName, topic, handle: null, messages: [] };
   subscriptions.push(sub);
 
-  // v1.1: region-keyed topic.  We pass a synthetic publisher ID
-  // whose top 8 bits = the region's S2 cell, so the derived
-  // topic ID has the region's S2 prefix and us-east peers (S2
-  // prefix matches) become the natural axon set.  Previously
-  // {publisher: null} produced a `00`-prefix global-bucket topic,
-  // which broke F1's geographic locality entirely.
+  // v0.3: structured open topic { region, name }.  `region` is a kernel
+  // region name carrying the chosen region's S2 cell, so the derived
+  // topic id has that region's prefix and same-region peers become the
+  // natural axon set — same geographic locality the old synthetic-
+  // publisher scheme gave, now expressed in the descriptor.
   //
   // since: 'all' replays everything in the axon's pubsub cache for
   // this topic before live-tailing.  Matches the demo UX expectation
@@ -1194,7 +1219,6 @@ async function addSubscription(regionId, eventName) {
   // message — without this the new subscriber starts at a live tail
   // and never sees publishes that happened before its sub envelope
   // reached the K-closest axon.
-  const publisher = regionSynthPublisher(regionId);
   sub.handle = await peer.sub(topic, (envelope) => {
     sub.messages.push({
       publisher: envelope.signerPubkey ?? null,
@@ -1206,7 +1230,7 @@ async function addSubscription(regionId, eventName) {
       sub.messages.shift();
     }
     renderSubscriptions();
-  }, { publisher, since: 'all' });
+  }, { since: 'all' });
 
   // Arm the kernel's AxonaManager periodic refresh timer.  This is
   // exactly what the kernel's minimal-pubsub-browser demo does after
@@ -1294,10 +1318,8 @@ async function recomputeKeyLabel(form, $keyEl) {
     const { deriveTopicId } = await import(
       '../vendor/axona-protocol/src/pubsub/post.js'
     );
-    const topicId = await deriveTopicId(
-      regionSynthPublisher(form.regionId),
-      `${form.regionId}/${form.eventName}`,
-    );
+    // v0.3: deriveTopicId takes a structured descriptor.
+    const topicId = await deriveTopicId(openTopicDesc(form.regionId, form.eventName));
     $keyEl.textContent = `topic id: ${topicId}`;
   } catch { $keyEl.textContent = '—'; }
 }
@@ -1322,17 +1344,14 @@ async function publishFromForm(form, $messageEl) {
     appendLog('pubsub:publish-skip', 'unknown region', 'error');
     return;
   }
-  const topic = `${form.regionId}/${eventName}`;
+  const topic = openTopicDesc(form.regionId, eventName);
   try {
-    // v1.1: region-keyed publish — `opts.publisher` is a synthetic
-    // ID whose top 8 bits carry the region's S2 prefix, matching
-    // what addSubscription does so the derived topic ID lands in
-    // the region's address space (us-east peers ↔ us-east topics).
-    // Signed by default (sign:true is the kernel default); the
-    // envelope's signerPubkey is the real publisher's pubkey —
-    // the synthetic ID only steers deriveTopicId's S2 prefix.
-    const publisher = regionSynthPublisher(form.regionId);
-    const msgId = await peer.pub(topic, message, { publisher });
+    // v0.3: structured open topic { region, name } + a REQUIRED signer.
+    // `region` carries the chosen region's S2 cell so the derived topic
+    // id lands in that region's address space (us-east peers ↔ us-east
+    // topics), matching addSubscription.  The envelope's signerPubkey is
+    // the durable author key's Author ID, passed as { signWith }.
+    const msgId = await peer.pub(topic, message, { signWith: authorIdentity });
     console.log('[axona] published', { topic, msgId });
     appendLog('pubsub:published', `${form.regionId}/${eventName} → ${msgId}`);
     $messageEl.value = '';

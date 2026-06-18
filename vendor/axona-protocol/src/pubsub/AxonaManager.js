@@ -44,7 +44,7 @@ import { powVerify } from '../pow/pow.js';
 import { verifyKill } from './kill.js';
 import { verifyTouch } from './touch.js';
 import { verifyUnpub } from './unpub.js';
-import { deriveTopicId, sha256Hex } from './post.js';
+import { resolveTopic, deriveTopicId, sha256Hex } from './post.js';
 
 // ── Defaults (simulator-tuned; production would use much longer values) ────
 
@@ -971,6 +971,36 @@ export class AxonaManager {
   }
 
   /**
+   * v0.3 topic-policy gate (run at a root, AFTER `_publishSignatureOk`). Two checks
+   * keyed off the SIGNED topic descriptor `env.topic = { region, owner, name, write }`:
+   *   1. Binding — recompute the topic id from the descriptor and require it equals
+   *      the topic this message was routed to. Stops a message signed for topic A
+   *      from being injected onto topic B (the descriptor is under the signature).
+   *   2. Write policy — for `write: 'owner'`, the `signerPubkey` MUST equal the
+   *      descriptor's `owner` (only the owner key may publish to an owned topic).
+   * Envelopes missing a v3 descriptor are dropped at a root (flag-day boundary).
+   * @param {string} json     serialized envelope
+   * @param {bigint} topicId  the routed topic id
+   * @returns {Promise<boolean>}
+   */
+  async _topicPolicyOk(json, topicId) {
+    if (typeof json !== 'string') return true;          // non-string payload → nothing to bind
+    let env;
+    try { env = JSON.parse(json); } catch { return true; }
+    if (!env || typeof env !== 'object' || !('message' in env)) return true; // not an envelope
+    const d = env.topic;
+    if (!d || typeof d !== 'object' || typeof d.name !== 'string') return false; // pre-v3 / malformed → drop at root
+    let resolved;
+    try { resolved = await resolveTopic(d); } catch { return false; }
+    if (BigInt('0x' + resolved.topicId) !== topicId) return false;           // descriptor ≠ routed topic
+    if (resolved.write === 'owner') {
+      const signer = typeof env.signerPubkey === 'string' ? env.signerPubkey.toLowerCase() : null;
+      if (!signer || signer !== resolved.owner) return false;                // owner-only: signer must be owner
+    }
+    return true;
+  }
+
+  /**
    * Reconcile the UNSIGNED wire `postHash` against the content-derived msgId of
    * the (already signature-verified) envelope.  postHash is the key the replay
    * cache, pull(), and kill()/tombstones all index on — but it travels as a
@@ -1267,6 +1297,7 @@ export class AxonaManager {
     if (this._isTombstoned(postHash)) return false;
     if ((role.replayCache || []).some((e) => e.postHash === postHash)) return false;   // already hold (by content)
     if (!(await this._publishSignatureOk(json))) return false;          // forged signed envelope → drop
+    if (!(await this._topicPolicyOk(json, topicId))) return false;      // descriptor/write-policy violation → drop
     if (!(await this._postHashConsistent(json, postHash))) return false; // poisoned content address → drop
     if (typeof publisher === 'string') { try { publisher = _wire(publisher); } catch { publisher = null; } }
     this._addToReplayCache(role, { json, publishId, publishTs, postHash, publisher });
@@ -1448,19 +1479,20 @@ export class AxonaManager {
     // 3. dedup (shares the kill seen-set; signatures are unique).
     if (this._seenKills.has(unpub.signature)) return 'consumed';
     this._seenKills.set(unpub.signature, this._now());
-    // 4. owner authorization — fully self-authenticating.
-    let pubSuffix = null;
-    try {
-      const pkBytes = new Uint8Array((unpub.signerPubkey.match(/../g) || []).map(h => parseInt(h, 16)));
-      pubSuffix = await sha256Hex(pkBytes);
-    } catch { /* malformed pubkey */ }
-    const ownerNodeId = typeof unpub.ownerNodeId === 'string' ? unpub.ownerNodeId : '';
-    if (!pubSuffix || pubSuffix !== ownerNodeId.slice(2).toLowerCase()) {
+    // 4. owner authorization (v0.3) — self-authenticating. ownerNodeId is the
+    // owner's Author ID; the signer must BE that owner, and the descriptor
+    // (region, owner, name, write:'owner') must derive THIS topic. The region
+    // byte is recovered from the routed topic id, so it need not travel in the unpub.
+    const ownerId = typeof unpub.ownerNodeId === 'string' ? unpub.ownerNodeId.toLowerCase() : '';
+    const signer  = typeof unpub.signerPubkey === 'string' ? unpub.signerPubkey.toLowerCase() : '';
+    if (!ownerId || signer !== ownerId) {
       this._emitLog?.('debug', 'unpub-pubkey-not-owner', {});
-      return 'consumed';                               // pubkey doesn't own the claimed nodeId
+      return 'consumed';                               // signer is not the claimed owner
     }
+    const region = parseInt(toHex(topicId).slice(0, 2), 16);   // region byte ← routed topic id
     let derivedTopicId = null;
-    try { derivedTopicId = await deriveTopicId(ownerNodeId, unpub.topicName); } catch { /* bad inputs */ }
+    try { derivedTopicId = (await resolveTopic({ region, owner: ownerId, name: unpub.topicName, write: 'owner' })).topicId; }
+    catch { /* bad inputs */ }
     if (!derivedTopicId || derivedTopicId.toLowerCase() !== toHex(topicId).toLowerCase()) {
       this._emitLog?.('debug', 'unpub-topic-not-owned', {});
       return 'consumed';                               // owner didn't create this topic
@@ -1732,6 +1764,11 @@ export class AxonaManager {
       this._emitLog?.('debug', 'publish-bad-signature-dropped', { topicId: toHex(topicId) });
       return 'consumed';
     }
+    // v0.3: topic-descriptor binding + write-policy (owner-only) enforcement.
+    if (!(await this._topicPolicyOk(json, topicId))) {
+      this._emitLog?.('debug', 'publish-policy-dropped', { topicId: toHex(topicId) });
+      return 'consumed';
+    }
     // C-2: freshness + per-publisher monotonic seq on the live path. A
     // replayed/stale signed envelope is dropped here before it is cached
     // or fanned out (publishId already marked seen above, so a resend of
@@ -1894,12 +1931,13 @@ export class AxonaManager {
   async _openTopicQuota(role, json, topicId) {
     try {
       const env = JSON.parse(json);
-      if (env && typeof env.topic === 'string') {
-        const publicId = await deriveTopicId(null, env.topic);
-        if (publicId === toHex(topicId)) {
-          const max = role.maxMessages || this.replayCacheSize;
-          return Math.max(1, Math.ceil(max / 4));
-        }
+      const d = env && env.topic;
+      // Open (v0.3): the signed descriptor's write policy is 'open' (anyone may
+      // publish). _topicPolicyOk has already bound the descriptor to THIS topic id
+      // at ingress, so the write field can be trusted here.
+      if (d && typeof d === 'object' && (d.write === 'open' || !d.owner)) {
+        const max = role.maxMessages || this.replayCacheSize;
+        return Math.max(1, Math.ceil(max / 4));
       }
     } catch { /* non-envelope */ }
     return null;
@@ -2302,6 +2340,11 @@ export class AxonaManager {
     // fan-out — so spoofed-signature spam is dropped at the edge.
     if (!(await this._publishSignatureOk(json))) {
       this._emitLog?.('debug', 'publish-bad-signature-dropped', { topicId: toHex(topicId) });
+      return;
+    }
+    // v0.3: topic-descriptor binding + write-policy (owner-only) enforcement.
+    if (!(await this._topicPolicyOk(json, topicId))) {
+      this._emitLog?.('debug', 'publish-policy-dropped', { topicId: toHex(topicId) });
       return;
     }
     // C-2: freshness + per-publisher monotonic seq (live path; see

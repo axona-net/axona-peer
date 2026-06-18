@@ -20,6 +20,7 @@ const {
   deriveIdentity,
   rotateIdentity,
   forgetIdentity,
+  getAuthorIdentity,
 } = await import('./identity.js');
 
 let passed = 0, failed = 0;
@@ -114,6 +115,29 @@ async function testFallback() {
     ident.region.source === 'default');
 }
 
+async function testAuthorIdentity() {
+  console.log('\n── Author identity (v0.3 durable publish key) ──');
+  // localStorage.removeItem for the author key so we start fresh.
+  localStorage.removeItem('axona.author.v1');
+
+  const a1 = await getAuthorIdentity();
+  check('authorId is 64-hex (raw pubkey)',
+    typeof a1.authorId === 'string' && /^[0-9a-f]{64}$/.test(a1.authorId));
+  check('authorId === pubkeyHex',          a1.authorId === a1.pubkeyHex);
+  check('author has NO nodeId',            a1.id === undefined);
+  check('author has NO region',            a1.region === undefined);
+
+  // author signs + verifies its own signature
+  const msg = new TextEncoder().encode('hello v0.3 from axona-peer');
+  const sig = await a1.sign(msg);
+  check('author sign↔verify round-trips',  await a1.verify(msg, sig));
+
+  // persistAs (localStorage) → returning visitor keeps the same Author ID
+  const a2 = await getAuthorIdentity();
+  check('getAuthorIdentity reloads the same durable Author ID',
+    a1.authorId === a2.authorId);
+}
+
 async function main() {
   console.log('Identity module smoke');
   await testFreshIdentity();
@@ -121,6 +145,7 @@ async function main() {
   await testRotation();
   await testForget();
   await testFallback();
+  await testAuthorIdentity();
   console.log(`\nResult: ${passed} passed, ${failed} failed`);
   process.exit(failed === 0 ? 0 : 1);
 }

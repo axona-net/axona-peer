@@ -185,7 +185,10 @@ export async function verifyEnvelope(envelope) {
   if (typeof envelope.ts !== 'number') {
     return { ok: false, reason: 'missing_ts', signed: false };
   }
-  if (typeof envelope.topic !== 'string') {
+  // Envelope v3: `topic` is the topic DESCRIPTOR { region, owner, name, write }
+  // (signed, so the signature binds the exact topic + write policy — a root
+  // recomputes the topic id from it and enforces owner-only writes).
+  if (!envelope.topic || typeof envelope.topic !== 'object' || typeof envelope.topic.name !== 'string') {
     return { ok: false, reason: 'missing_topic', signed: false };
   }
   if (!('message' in envelope)) {

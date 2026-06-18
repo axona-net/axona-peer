@@ -41,6 +41,8 @@
 //   fallback — see signPost / verifySignature for the contract.
 // =====================================================================
 
+import { resolveRegion, keyDerivedRegion } from '../utils/region-names.js';
+
 /**
  * Stable, total, JSON-valid canonical encoding (finding C-1).
  *
@@ -157,27 +159,48 @@ export async function sha256Hex(input) {
  * @param {string}      topicName        Application-chosen topic name.
  * @returns {Promise<string>}            66-char lowercase hex topic ID.
  */
-export async function deriveTopicId(publisherNodeId, topicName) {
-  if (typeof topicName !== 'string' || topicName.length === 0) {
-    throw new TypeError('deriveTopicId: topicName must be a non-empty string');
+export async function resolveTopic({ region = null, owner = null, name, write = 'open' } = {}) {
+  if (typeof name !== 'string' || name.length === 0) {
+    throw new TypeError('resolveTopic: name must be a non-empty string');
   }
-  // Public mode: 0x00 prefix + sha256(topicName).
-  if (publisherNodeId === null || publisherNodeId === undefined || publisherNodeId === '') {
-    const hash256 = await sha256Hex(topicName);
-    return '00' + hash256;
+  if (write !== 'open' && write !== 'owner') {
+    throw new RangeError(`resolveTopic: write must be 'open' or 'owner', got '${write}'`);
   }
-  // Publisher-keyed mode (default).
-  if (typeof publisherNodeId !== 'string' || publisherNodeId.length !== 66) {
+  const ownerLc = owner == null ? null : String(owner).toLowerCase();
+  if (ownerLc != null && !/^[0-9a-f]{64}$/.test(ownerLc)) {
+    throw new RangeError('resolveTopic: owner must be a 64-hex Author ID or null');
+  }
+  if (write === 'owner' && ownerLc == null) {
+    throw new RangeError("resolveTopic: write:'owner' requires an owner (Author ID)");
+  }
+
+  // Region byte (top byte of the topic id) — ALWAYS a real region; never global.
+  //   region given            → that region (publisher-chosen placement)
+  //   region omitted + owner   → key-derived from the owner (discoverable, D6)
+  //   region omitted, no owner → error (open topics must name a region)
+  let code;
+  if (region !== null && region !== undefined) {
+    code = resolveRegion(region);
+    if (code === null) throw new RangeError(`resolveTopic: unknown region '${region}'`);
+  } else if (ownerLc != null) {
+    code = await keyDerivedRegion(ownerLc);
+  } else {
     throw new RangeError(
-      `deriveTopicId: publisherNodeId must be a 66-char hex string or null, got length ${publisherNodeId?.length}`,
-    );
+      'resolveTopic: region is required (no global region); an open topic must name a real region');
   }
-  if (!/^[0-9a-fA-F]+$/.test(publisherNodeId)) {
-    throw new RangeError('deriveTopicId: publisherNodeId contains non-hex characters');
-  }
-  const s2Prefix = publisherNodeId.slice(0, 2).toLowerCase();
-  const hash256  = await sha256Hex(publisherNodeId + ':' + topicName);
-  return s2Prefix + hash256;
+
+  const prefix  = code.toString(16).padStart(2, '0');
+  // owner + write are folded into the hash so a root can recompute the id from the
+  // SIGNED descriptor and enforce write authorization statelessly. region is the
+  // resolved code so the descriptor is self-contained (recomputable without
+  // re-running key-derivation).
+  const hash256 = await sha256Hex(canonical({ owner: ownerLc, name, write }));
+  return { region: code, owner: ownerLc, name, write, topicId: prefix + hash256 };
+}
+
+/** Convenience: just the 66-hex topic id for a topic descriptor. */
+export async function deriveTopicId(descriptor) {
+  return (await resolveTopic(descriptor)).topicId;
 }
 
 /**
@@ -196,180 +219,7 @@ export async function deriveTopicId(publisherNodeId, topicName) {
  * @param {string}      topicName     Application-chosen topic name.
  * @returns {Promise<bigint>}         264-bit BigInt topic ID.
  */
-export async function deriveTopicIdBig(publisherBig, topicName) {
-  if (publisherBig === null || publisherBig === undefined) {
-    const hex = await deriveTopicId(null, topicName);
-    return BigInt('0x' + hex);
-  }
-  if (typeof publisherBig !== 'bigint') {
-    throw new TypeError(
-      `deriveTopicIdBig: publisher must be bigint or null, got ${typeof publisherBig}`,
-    );
-  }
-  const publisherHex = publisherBig.toString(16).padStart(66, '0');
-  const hex = await deriveTopicId(publisherHex, topicName);
+export async function deriveTopicIdBig(descriptor) {
+  const hex = await deriveTopicId(descriptor);
   return BigInt('0x' + hex);
-}
-
-/**
- * @typedef {Object} PostRef
- * @property {string} topic_id
- * @property {string} post_hash
- */
-
-/**
- * @typedef {Object} SignedPost
- * @property {string}    post_hash
- * @property {string}    publisher
- * @property {string}    topic_id
- * @property {string}    topic_name
- * @property {number}    timestamp     Unix ms
- * @property {any}       content       Application-defined payload
- * @property {PostRef[]} references    Empty for original posts;
- *                                     non-empty for reshares
- * @property {string}    signature     "ed25519:<hex>" when signed,
- *                                     "stub:<publisher>" when not
- */
-
-/**
- * Construct a `SignedPost`.  Async.
- *
- * The signing step is optional — if `args.signer` is omitted, the
- * post carries a `stub:<publisher>` placeholder signature (the same
- * v0 behavior).  Callers that DO want real signatures pass in a
- * `signer` function that returns a Promise<Uint8Array> over the
- * `canonical(draft)` bytes; we hex-encode and prefix with `ed25519:`.
- *
- * @param {Object}   args
- * @param {string}   args.publisher
- * @param {string}   args.topicName
- * @param {any}      args.content
- * @param {PostRef[]} [args.references]
- * @param {number}   [args.timestamp]
- * @param {(canonicalBytes: Uint8Array) => Promise<Uint8Array>} [args.signer]
- *                   Optional Ed25519 signer.  Receives the canonical-
- *                   encoded draft bytes; returns the 64-byte signature.
- *                   Without a signer, the post is unsigned (stub:).
- * @returns {Promise<SignedPost>}
- */
-export async function makePost({
-  publisher, topicName, content, references = [], timestamp, signer,
-}) {
-  const topic_id = await deriveTopicId(publisher, topicName);
-  const ts = timestamp ?? Date.now();
-  const draft = {
-    publisher,
-    topic_id,
-    topic_name: topicName,
-    timestamp:  ts,
-    content,
-    references,
-  };
-  const canonicalStr   = canonical(draft);
-  const canonicalBytes = _enc.encode(canonicalStr);
-  const post_hash      = await sha256Hex(canonicalBytes);
-
-  let signature = 'stub:' + publisher;
-  if (typeof signer === 'function') {
-    const sigBytes = await signer(canonicalBytes);
-    let hex = '';
-    for (let i = 0; i < sigBytes.length; i++) hex += sigBytes[i].toString(16).padStart(2, '0');
-    signature = 'ed25519:' + hex;
-  }
-
-  return {
-    post_hash,
-    ...draft,
-    signature,
-  };
-}
-
-/**
- * Recompute a post's hash and verify it matches the stored field.
- * Async.
- *
- * Failed verification means the relay layer mangled (or forged) the
- * post — every conforming receiver drops it silently, no error
- * surfaced to the user.  This is the §3.5 spec rule applied at the
- * receiving edge.
- *
- * @param {SignedPost} post
- * @returns {Promise<boolean>}
- */
-export async function verifyPostHash(post) {
-  if (!post || typeof post !== 'object') return false;
-  const recomputed = await sha256Hex(canonical({
-    publisher:  post.publisher,
-    topic_id:   post.topic_id,
-    topic_name: post.topic_name,
-    timestamp:  post.timestamp,
-    content:    post.content,
-    references: post.references,
-  }));
-  return recomputed === post.post_hash;
-}
-
-/**
- * Verify topic_id was derived from this publisher + topic_name.
- * The cheap half of authenticity, needs only the hash.
- * Async.
- *
- * @param {SignedPost} post
- * @returns {Promise<boolean>}
- */
-export async function verifyTopicOwnership(post) {
-  const expected = await deriveTopicId(post.publisher, post.topic_name);
-  return post.topic_id === expected;
-}
-
-/**
- * Verify an Ed25519 signature on a SignedPost.  Answers exactly one
- * question: "is this post's signature cryptographically valid?"
- *
- * An unsigned post (legacy `stub:` prefix) carries NO proof of origin,
- * so it returns `false` — never `true`.  (Returning `true` here was a
- * forgery hole: a `stub:<any-publisher>` placeholder would pass as
- * authentic.  Security finding M4.)  Callers that legitimately accept
- * unsigned posts in a trusted/sim context must check
- * `post.signature.startsWith('stub:')` themselves and decide — this
- * function does not conflate "unsigned" with "valid".
- *
- * For real signatures (`ed25519:<hex>`), call the provided `verifier`
- * with (publisherKeyBytes, canonicalBytes, signatureBytes) — return
- * true/false.
- *
- * The verifier function is the caller's responsibility because Ed25519
- * support differs between Web Crypto (Chrome 110+, Safari 17+,
- * Firefox 130+) and pure-JS (@noble/ed25519).  Decoupling lets each
- * runtime pick its implementation.
- *
- * @param {SignedPost} post
- * @param {(publisherKey: any, canonicalBytes: Uint8Array, sig: Uint8Array) => Promise<boolean>} verifier
- * @param {any} publisherKey   Caller-supplied; format depends on
- *                             the verifier (CryptoKey, hex string,
- *                             Uint8Array).
- * @returns {Promise<boolean>}
- */
-export async function verifySignature(post, verifier, publisherKey) {
-  if (!post?.signature || typeof post.signature !== 'string') return false;
-  if (post.signature.startsWith('stub:')) return false;  // unsigned ⇒ not authenticated (M4)
-  if (!post.signature.startsWith('ed25519:')) return false;
-  if (typeof verifier !== 'function') return false;
-
-  const hex = post.signature.slice('ed25519:'.length);
-  if (hex.length !== 128) return false;  // 64 bytes = 128 hex chars
-  const sig = new Uint8Array(64);
-  for (let i = 0; i < 64; i++) sig[i] = parseInt(hex.substr(i * 2, 2), 16);
-
-  const canonicalBytes = _enc.encode(canonical({
-    publisher:  post.publisher,
-    topic_id:   post.topic_id,
-    topic_name: post.topic_name,
-    timestamp:  post.timestamp,
-    content:    post.content,
-    references: post.references,
-  }));
-
-  try { return await verifier(publisherKey, canonicalBytes, sig); }
-  catch { return false; }
 }

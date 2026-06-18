@@ -44,17 +44,22 @@ import { UpgradeRequiredError } from '../errors.js';
 /** The wire-format version this build of the kernel speaks. Major is the
  *  hard-compat axis (see wireCompatible): a major bump partitions the
  *  peer↔bridge handshake. Bumped 1.0 → 2.0 for the 2026-06 wire flag-day
- *  (paired with the AUTH_PROTO axona/4 → axona/5 bump, which is the
- *  load-bearing peer-to-peer partition). The web client now sends this in its
- *  client-hello so the bridge gate can reject a mismatched major early. */
-export const WIRE_VERSION = '2.0';
+ *  (paired with the AUTH_PROTO axona/4 → axona/5 bump). Bumped 2.0 → 3.0 for
+ *  the v0.3 identity/authorship flag-day: the signed envelope now carries a
+ *  topic DESCRIPTOR object `{ region, owner, name, write }` instead of a bare
+ *  string, so a 2.x and a 3.x peer reject each other's envelopes — the
+ *  partition is hermetic at the wire layer. The web client sends this in its
+ *  client-hello so the bridge gate (REQUIRED_WIRE_MAJOR) rejects a mismatched
+ *  major early, cleanly, instead of a silent post-admit envelope failure. */
+export const WIRE_VERSION = '3.0';
 
-/** The kernel's own peer-version string.  Apps wrapping the kernel
- *  pass their own version through; this is just the default.  Kept on the 2.x
- *  line (NOT bumped to 3.x) so the bridge's major-version namespace gate
- *  (kernel-2.x vs peer-app-3.x in flagDayFloor) still classifies it correctly;
- *  the partition rides on WIRE_VERSION + AUTH_PROTO, not this semver. */
-export const KERNEL_VERSION = '2.51.0';
+/** The kernel's own peer-version string. Apps wrapping the kernel pass their
+ *  own version through; this is just the default. As of the v0.3 flag-day the
+ *  kernel is on the 3.x line and the bridge's old major-version *namespace*
+ *  heuristic (kernel-2.x vs peer-app-3.x) no longer discriminates — the
+ *  partition now rides on WIRE_VERSION major + AUTH_PROTO, which is the
+ *  load-bearing, hermetic gate. */
+export const KERNEL_VERSION = '3.0.0';
 
 /** WebSocket close code for version mismatches (custom, in the
  *  application-specific 4000-4999 range). */

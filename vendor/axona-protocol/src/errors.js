@@ -170,7 +170,9 @@ export const ErrorCodes = Object.freeze({
   // Publish
   PUBLISH_INVALID_TOPIC:     'PUBLISH_INVALID_TOPIC',
   PUBLISH_SIGN_FAILED:       'PUBLISH_SIGN_FAILED',
-  PUBLISH_NO_PUBLISH_IDENTITY:'PUBLISH_NO_PUBLISH_IDENTITY',   // signed publish with no publish identity (transport key must not sign)
+  PUBLISH_NO_PUBLISH_IDENTITY:'PUBLISH_NO_PUBLISH_IDENTITY',   // signed publish with no signer named (transport key must not sign)
+  TOPIC_REGION_REQUIRED:     'TOPIC_REGION_REQUIRED',          // open topic with no region (no global region exists)
+  WRITE_POLICY_VIOLATION:    'WRITE_POLICY_VIOLATION',         // publish to an owner-only topic by a non-owner key
   PUBLISH_REPLICATION_FAILED:'PUBLISH_REPLICATION_FAILED',
   PUBLISH_PAYLOAD_TOO_LARGE: 'PUBLISH_PAYLOAD_TOO_LARGE',
   PUBLISH_INVALID_MESSAGE:   'PUBLISH_INVALID_MESSAGE',

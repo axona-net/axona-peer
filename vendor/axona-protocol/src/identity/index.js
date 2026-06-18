@@ -74,10 +74,10 @@ const ALGORITHM = { name: 'Ed25519' };
  *        should pass `false` so XSS can't exfiltrate the signing key (H4).
  * @returns {Promise<Identity>}
  */
-export async function deriveIdentity({ lat, lng, extractable = true }) {
+export async function createNodeIdentity({ lat, lng, extractable = true }) {
   if (typeof lat !== 'number' || typeof lng !== 'number') {
     throw new IdentityError(ErrorCodes.IDENTITY_INVALID_FORMAT,
-      'deriveIdentity: region must be { lat: number, lng: number }');
+      'createNodeIdentity: region must be { lat: number, lng: number }');
   }
 
   let pair;
@@ -85,7 +85,7 @@ export async function deriveIdentity({ lat, lng, extractable = true }) {
     pair = await generateKeyPair({ extractable });
   } catch (cause) {
     throw new IdentityError(ErrorCodes.IDENTITY_KEYGEN_FAILED,
-      `deriveIdentity: Web Crypto Ed25519 generateKey failed (${cause.message})`,
+      `createNodeIdentity: Web Crypto Ed25519 generateKey failed (${cause.message})`,
       { cause });
   }
 
@@ -103,6 +103,112 @@ export async function deriveIdentity({ lat, lng, extractable = true }) {
   // the auth hello; raising difficulty later needs no identity-format change.
   identity.pow = await powMint({ pubkeyHex: identity.pubkeyHex, role: 'transport' });
   return identity;
+}
+
+/**
+ * Create an AUTHOR identity — the keypair that signs publishes (its public key
+ * is the Author ID, i.e. `signerPubkey`). Unlike a node identity it has **no
+ * location and no nodeId**: authorship is not a place (design D3). Only the
+ * keypair matters.
+ *
+ * Durability is the only real choice (design D5): mint a fresh one (ephemeral,
+ * unlinkable) or persist it (a recognizable author across sessions, able to
+ * retract). Persistence is an *option here*, not a separate function:
+ *   createAuthorIdentity()                         → ephemeral
+ *   createAuthorIdentity({ persistAs: 'me' })       → durable (browser localStorage)
+ *   createAuthorIdentity({ persistAs: 'me', store }) → durable (custom {get,set})
+ *
+ * @param {object}   [opts]
+ * @param {string}   [opts.persistAs]    storage key; load-or-create + save.
+ * @param {{get,set}}[opts.store]        custom store (else browser localStorage).
+ * @param {boolean}  [opts.extractable]  forced true when persistAs is set.
+ * @returns {Promise<AuthorIdentity>} { authorId, pubkey, pubkeyHex, privateKey, sign, verify }
+ */
+export async function createAuthorIdentity({ persistAs = null, store = null, extractable = true } = {}) {
+  const st = persistAs ? (store || defaultAuthorStore()) : null;
+  if (persistAs && st) {
+    try {
+      const saved = await st.get(persistAs);
+      if (saved) return await loadAuthorIdentity(typeof saved === 'string' ? JSON.parse(saved) : saved);
+    } catch { /* corrupt / absent → mint fresh below */ }
+  }
+  // A persisted key must be exportable; an ephemeral one defaults non-persistable-safe.
+  const id = await mintAuthorIdentity({ extractable: persistAs ? true : extractable });
+  if (persistAs && st) {
+    try { await st.set(persistAs, JSON.stringify(await dumpAuthorIdentity(id))); } catch { /* best-effort */ }
+  }
+  return id;
+}
+
+async function mintAuthorIdentity({ extractable }) {
+  let pair;
+  try {
+    pair = await generateKeyPair({ extractable });
+  } catch (cause) {
+    throw new IdentityError(ErrorCodes.IDENTITY_KEYGEN_FAILED,
+      `createAuthorIdentity: Ed25519 generateKey failed (${cause.message})`, { cause });
+  }
+  const pubkey = await exportPublicKey(pair.publicKey);
+  return buildAuthorIdentity({ pubkey, privateKey: pair.privateKey, createdAt: Date.now() });
+}
+
+/** Author identities have a keypair only — no nodeId, no region. */
+function buildAuthorIdentity({ pubkey, privateKey, createdAt }) {
+  const pubkeyHex = bytesToHex(pubkey);
+  return {
+    kind:      'author',
+    authorId:  pubkeyHex,            // the public Author ID (== signerPubkey on the wire)
+    pubkey,
+    pubkeyHex,
+    privateKey,
+    createdAt,
+    pow:       '',                   // publish-role PoW nonce (minted by the publish path; '' = inert)
+    sign:   (message)            => sign(privateKey, message),
+    verify: (message, signature) => verify(pubkey, message, signature),
+  };
+}
+
+/** Author persistence envelope — keypair only (no id/region). */
+async function dumpAuthorIdentity(identity) {
+  let pkcs8;
+  try {
+    pkcs8 = await exportPrivateKeyPkcs8(identity.privateKey);
+  } catch (cause) {
+    throw new IdentityError(ErrorCodes.IDENTITY_LOAD_FAILED,
+      `createAuthorIdentity: privateKey export failed (${cause.message})`, { cause });
+  }
+  return { kind: 'author', pubkey: identity.pubkeyHex, privkey: bytesToBase64(new Uint8Array(pkcs8)), createdAt: identity.createdAt };
+}
+
+async function loadAuthorIdentity(env) {
+  if (!env || typeof env.pubkey !== 'string' || env.pubkey.length !== 64 || typeof env.privkey !== 'string') {
+    throw new IdentityError(ErrorCodes.IDENTITY_INVALID_FORMAT, 'loadAuthorIdentity: bad envelope');
+  }
+  const pubkeyBytes = hexToBytes(env.pubkey);
+  let privateKey;
+  try {
+    privateKey = await importPrivateKey(bytesToBase64.decode(env.privkey));
+  } catch (cause) {
+    throw new IdentityError(ErrorCodes.IDENTITY_LOAD_FAILED,
+      `loadAuthorIdentity: privateKey import failed (${cause.message})`, { cause });
+  }
+  // Same private↔public correspondence probe as loadIdentity (M5).
+  const probe = new TextEncoder().encode('axona-identity-keypair-probe');
+  if (!(await verify(pubkeyBytes, probe, await sign(privateKey, probe)))) {
+    throw new IdentityError(ErrorCodes.IDENTITY_INVALID_FORMAT,
+      'loadAuthorIdentity: private key does not correspond to the stored public key');
+  }
+  return buildAuthorIdentity({ pubkey: pubkeyBytes, privateKey, createdAt: typeof env.createdAt === 'number' ? env.createdAt : Date.now() });
+}
+
+/** Browser localStorage as a {get,set} store, or null when unavailable. */
+function defaultAuthorStore() {
+  try {
+    if (typeof localStorage !== 'undefined') {
+      return { get: (k) => localStorage.getItem(k), set: (k, v) => localStorage.setItem(k, v) };
+    }
+  } catch { /* sandboxed / denied */ }
+  return null;
 }
 
 /**
@@ -230,7 +336,7 @@ function buildIdentity({ id, pubkey, privateKey, region, createdAt }) {
     privateKey,
     region,
     createdAt,
-    pow: '',                          // Stage 2: transport PoW nonce (deriveIdentity/loadIdentity overwrite; '' = inert)
+    pow: '',                          // Stage 2: transport PoW nonce (createNodeIdentity/loadIdentity overwrite; '' = inert)
     sign: (message) => sign(privateKey, message),
     // Verify against this identity's own public key — used for
     // round-trip sanity checks. To verify a different signer's
