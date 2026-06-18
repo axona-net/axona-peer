@@ -246,7 +246,6 @@ export {
   regionNameForLatLng,
   regionCenter,
   POPULATED_REGIONS,
-  keyDerivedRegion,
 } from './utils/region-names.js';
 
 // axona/4 authenticated-identity handshake.  Re-exported so consumers

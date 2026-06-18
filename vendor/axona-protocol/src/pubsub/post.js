@@ -41,7 +41,7 @@
 //   fallback — see signPost / verifySignature for the contract.
 // =====================================================================
 
-import { resolveRegion, keyDerivedRegion } from '../utils/region-names.js';
+import { resolveRegion } from '../utils/region-names.js';
 
 /**
  * Stable, total, JSON-valid canonical encoding (finding C-1).
@@ -159,7 +159,7 @@ export async function sha256Hex(input) {
  * @param {string}      topicName        Application-chosen topic name.
  * @returns {Promise<string>}            66-char lowercase hex topic ID.
  */
-export async function resolveTopic({ region = null, owner = null, name, write = 'open' } = {}) {
+export async function resolveTopic({ region = null, owner = null, name, write = 'open' } = {}, selfRegion = null) {
   if (typeof name !== 'string' || name.length === 0) {
     throw new TypeError('resolveTopic: name must be a non-empty string');
   }
@@ -174,19 +174,25 @@ export async function resolveTopic({ region = null, owner = null, name, write = 
     throw new RangeError("resolveTopic: write:'owner' requires an owner (Author ID)");
   }
 
-  // Region byte (top byte of the topic id) — ALWAYS a real region; never global.
-  //   region given            → that region (publisher-chosen placement)
-  //   region omitted + owner   → key-derived from the owner (discoverable, D6)
-  //   region omitted, no owner → error (open topics must name a region)
+  // Region byte (top byte of the topic id) — ALWAYS a real, routable region;
+  // never global, never derived from the author key (the author has no region,
+  // and a hashed region would dump every author's topics into one arbitrary
+  // cell, creating a hotspot in whatever populated region sits closest).
+  //   region given   → that region (explicit, app-chosen placement)
+  //   region omitted  → the publisher's own node region (`selfRegion`, the top
+  //                     byte of its node/transport ID) supplied by the caller
+  //   neither         → error (the caller must name a region or pass selfRegion)
   let code;
   if (region !== null && region !== undefined) {
     code = resolveRegion(region);
     if (code === null) throw new RangeError(`resolveTopic: unknown region '${region}'`);
-  } else if (ownerLc != null) {
-    code = await keyDerivedRegion(ownerLc);
+  } else if (selfRegion !== null && selfRegion !== undefined) {
+    code = resolveRegion(selfRegion);
+    if (code === null) throw new RangeError(`resolveTopic: invalid selfRegion '${selfRegion}'`);
   } else {
     throw new RangeError(
-      'resolveTopic: region is required (no global region); an open topic must name a real region');
+      'resolveTopic: region is required (no global region; not derived from the author) — ' +
+      'name a region or publish from a peer that supplies its node region');
   }
 
   const prefix  = code.toString(16).padStart(2, '0');
@@ -198,9 +204,10 @@ export async function resolveTopic({ region = null, owner = null, name, write = 
   return { region: code, owner: ownerLc, name, write, topicId: prefix + hash256 };
 }
 
-/** Convenience: just the 66-hex topic id for a topic descriptor. */
-export async function deriveTopicId(descriptor) {
-  return (await resolveTopic(descriptor)).topicId;
+/** Convenience: just the 66-hex topic id for a topic descriptor. `selfRegion`
+ *  (optional) is the region-omitted fallback — the publisher's node region. */
+export async function deriveTopicId(descriptor, selfRegion = null) {
+  return (await resolveTopic(descriptor, selfRegion)).topicId;
 }
 
 /**
@@ -219,7 +226,7 @@ export async function deriveTopicId(descriptor) {
  * @param {string}      topicName     Application-chosen topic name.
  * @returns {Promise<bigint>}         264-bit BigInt topic ID.
  */
-export async function deriveTopicIdBig(descriptor) {
-  const hex = await deriveTopicId(descriptor);
+export async function deriveTopicIdBig(descriptor, selfRegion = null) {
+  const hex = await deriveTopicId(descriptor, selfRegion);
   return BigInt('0x' + hex);
 }

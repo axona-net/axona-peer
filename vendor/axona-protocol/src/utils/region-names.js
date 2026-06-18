@@ -301,32 +301,16 @@ export function regionCenter(nameOrCode) {
 const OCEAN_NAME_RE = /^(pac|atl|ind|sou|arc)_[0-9a-f]{2}$/;
 
 /**
- * Populated regions — `{ code, name }` for every non-open-ocean cell. The set a
- * topic may be placed in (no global region; no empty ocean).
- * NOTE (review before prod): this is the ocean-name heuristic; it still includes
- * sparsely-populated polar/Antarctic land cells. Tighten the exclusion list if a
- * key-derived profile landing there proves undiscoverable.
+ * Populated regions — `{ code, name }` for every non-open-ocean cell. A
+ * convenience list of real, inhabited cells (e.g. for a region picker in a UI).
+ * A topic's region must be a real cell; when an app omits the region, the kernel
+ * defaults it to the publisher's own node region (the top byte of its node ID),
+ * never to a value derived from the author key.
  */
 export const POPULATED_REGIONS = Object.freeze(
   REGION_NAMES.map((name, code) => ({ code, name }))
     .filter((r) => !OCEAN_NAME_RE.test(r.name)),
 );
-const POPULATED_CODES = Object.freeze(POPULATED_REGIONS.map((r) => r.code));
-
-/**
- * Map an Author ID to a deterministic, real, populated region (design D6). Lets
- * an owner-anchored topic (profile, avatar, inbox) be discovered from the Author
- * ID alone — and because the region is a hash of the key, it reveals nothing
- * about the author's actual location.
- * @param {string} authorId  64-char hex public key (the Author ID)
- * @returns {Promise<number>} a populated region code
- */
-export async function keyDerivedRegion(authorId) {
-  const bytes  = new TextEncoder().encode(String(authorId));
-  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes));
-  const n = ((digest[0] << 24) | (digest[1] << 16) | (digest[2] << 8) | digest[3]) >>> 0;
-  return POPULATED_CODES[n % POPULATED_CODES.length];
-}
 
 if (REGION_NAMES.length !== S2_CELL_COUNT) {
   throw new Error(

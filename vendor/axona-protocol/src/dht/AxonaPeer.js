@@ -40,7 +40,7 @@
 import { DHT }            from '../contracts/DHT.js';
 import { Synapse }        from './Synapse.js';
 import { Subscription }   from './Subscription.js';
-import { clz264, toHex, fromHex, isHexId, BAD_ID_CODE } from '../utils/hexid.js';
+import { clz264, toHex, fromHex, isHexId, extractS2Prefix, BAD_ID_CODE } from '../utils/hexid.js';
 import { resolveTopic, deriveTopicId, deriveTopicIdBig } from '../pubsub/post.js';
 
 /**
@@ -1348,9 +1348,14 @@ export class AxonaPeer extends DHT {
         `peer.${op}: topic must be an object { name, region?, owner?, write? }`,
         { context: { topic } });
     }
+    // When the app omits the region, default it to THIS peer's own node region
+    // (the top byte of its node/transport ID) — a real, routable cell. Never
+    // derived from the author. selfRegion is ignored when topic.region is given.
+    const selfRegion = (this._node && typeof this._node.id === 'bigint')
+      ? extractS2Prefix(this._node.id) : null;
     let r;
     try {
-      r = await resolveTopic(topic);
+      r = await resolveTopic(topic, selfRegion);
     } catch (cause) {
       const code = /region is required/.test(cause.message)
         ? ErrorCodes.TOPIC_REGION_REQUIRED : ErrorCodes.PUBLISH_INVALID_TOPIC;
