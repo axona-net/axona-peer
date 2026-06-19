@@ -1793,9 +1793,19 @@ export class AxonaManager {
       return 'consumed';
     }
 
+    // Upsert by content (msgId): a re-publish of identical content from the
+    // same author has the SAME msgId. Replace the prior copy so the cache holds
+    // one entry per msgId — the newest, which (as a fresh entry) gets a fresh
+    // hold + 48h ceiling. Then skip re-delivery: current subscribers already
+    // received this msgId; late subscribers get it once via replay-on-subscribe.
+    // (Different authors of identical text have different msgIds — not collapsed.)
+    const isRepublish = !!postHash && (role.replayCache || []).some(e => e.postHash === postHash);
+    if (isRepublish) role.replayCache = role.replayCache.filter(e => e.postHash !== postHash);
+
     const quotaPerPublisher = await this._openTopicQuota(role, json, topicId);
     this._addToReplayCache(role, { json, publishId, publishTs, postHash, publisher }, { quotaPerPublisher });
     this._recordReceived(topicId, publishId, publishTs);
+    if (isRepublish) return 'consumed';   // refreshed in place; no re-fan-out
 
     const topicIdHex  = toHex(topicId);
     const publisherHex = publisher === null || publisher === undefined ? publisher : toHex(publisher);
@@ -2393,9 +2403,16 @@ export class AxonaManager {
       this.axonRoles.set(topicId, role);
     }
 
+    // Upsert by content (msgId) — same as _onPublish: a re-publish of identical
+    // content replaces the prior copy (one entry per msgId, fresh hold/ceiling)
+    // and skips re-delivery. Different authors of identical text differ in msgId.
+    const isRepublish = !!postHash && (role.replayCache || []).some(e => e.postHash === postHash);
+    if (isRepublish) role.replayCache = role.replayCache.filter(e => e.postHash !== postHash);
+
     const quotaPerPublisher = await this._openTopicQuota(role, json, topicId);
     this._addToReplayCache(role, { json, publishId, publishTs, postHash, publisher }, { quotaPerPublisher });
     this._recordReceived(topicId, publishId, publishTs);
+    if (isRepublish) return;   // refreshed in place; no re-fan-out
 
     const topicIdHex   = toHex(topicId);
     const publisherHex = publisher === null || publisher === undefined ? publisher : toHex(publisher);
