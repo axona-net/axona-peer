@@ -159,19 +159,31 @@ export async function sha256Hex(input) {
  * @param {string}      topicName        Application-chosen topic name.
  * @returns {Promise<string>}            66-char lowercase hex topic ID.
  */
-export async function resolveTopic({ region = null, owner = null, name, write = 'open' } = {}, selfRegion = null) {
+export async function resolveTopic({ region = null, owner = null, name, write } = {}, selfRegion = null) {
   if (typeof name !== 'string' || name.length === 0) {
     throw new TypeError('resolveTopic: name must be a non-empty string');
-  }
-  if (write !== 'open' && write !== 'owner') {
-    throw new RangeError(`resolveTopic: write must be 'open' or 'owner', got '${write}'`);
   }
   const ownerLc = owner == null ? null : String(owner).toLowerCase();
   if (ownerLc != null && !/^[0-9a-f]{64}$/.test(ownerLc)) {
     throw new RangeError('resolveTopic: owner must be a 64-hex Author ID or null');
   }
-  if (write === 'owner' && ownerLc == null) {
-    throw new RangeError("resolveTopic: write:'owner' requires an owner (Author ID)");
+  // Write policy is keyed on whether an owner is named:
+  //   no owner   → the topic is necessarily 'open' (there's no owner to restrict
+  //                to); any passed `write` is ignored.
+  //   has owner  → defaults to 'owner' (naming an owner means owner-only — the safe
+  //                default, no footgun); pass write:'open' explicitly for an
+  //                owner-namespaced open topic (an inbox/wall anyone may post to).
+  // `write` is folded into the hash, so { owner, name } and { owner, name,
+  // write:'owner' } resolve to the SAME id, and { owner, name, write:'open' } to a
+  // different (open) one.
+  let w;
+  if (ownerLc == null) {
+    w = 'open';
+  } else {
+    w = (write == null) ? 'owner' : write;
+    if (w !== 'open' && w !== 'owner') {
+      throw new RangeError(`resolveTopic: write must be 'open' or 'owner', got '${write}'`);
+    }
   }
 
   // Region byte (top byte of the topic id) — ALWAYS a real, routable region;
@@ -200,8 +212,8 @@ export async function resolveTopic({ region = null, owner = null, name, write = 
   // SIGNED descriptor and enforce write authorization statelessly. region is the
   // resolved code so the descriptor is self-contained (recomputable without
   // re-running key-derivation).
-  const hash256 = await sha256Hex(canonical({ owner: ownerLc, name, write }));
-  return { region: code, owner: ownerLc, name, write, topicId: prefix + hash256 };
+  const hash256 = await sha256Hex(canonical({ owner: ownerLc, name, write: w }));
+  return { region: code, owner: ownerLc, name, write: w, topicId: prefix + hash256 };
 }
 
 /** Convenience: just the 66-hex topic id for a topic descriptor. `selfRegion`

@@ -1343,6 +1343,17 @@ export class AxonaPeer extends DHT {
    * a root can recompute the same id from the signed descriptor. @internal
    */
   async _resolveTopicOrThrow(topic, op) {
+    if (typeof topic === 'string' && isHexId(topic)) {
+      // A bare topic ID is a READ handle, not a write credential. Publishing (and
+      // owner ops like kill/unpub) need the descriptor { region?, owner?, name,
+      // write? } so the storing node can recompute the id and verify the write
+      // policy (signer === owner). A hash can't reveal its owner, so the id alone
+      // can't prove authorization — see Topic-IDs doc.
+      throw new PublishError(ErrorCodes.PUBLISH_INVALID_TOPIC,
+        `peer.${op}: a bare topic ID is a read-only handle (use it with sub/pull/metrics); ` +
+        `publishing needs the descriptor { region?, owner?, name, write? } to verify the write policy`,
+        { context: { topic } });
+    }
     if (!topic || typeof topic !== 'object' || typeof topic.name !== 'string' || topic.name.length === 0) {
       throw new PublishError(ErrorCodes.PUBLISH_INVALID_TOPIC,
         `peer.${op}: topic must be an object { name, region?, owner?, write? }`,
@@ -1363,6 +1374,35 @@ export class AxonaPeer extends DHT {
     }
     r.topicIdBig = BigInt('0x' + r.topicId);
     return r;
+  }
+
+  /**
+   * Resolve a topic for a READ operation (sub / pull / metrics), accepting
+   * EITHER a structured descriptor `{ region?, owner?, name, write? }` OR a bare
+   * 66-hex topic ID — the shareable read handle produced by `deriveTopicId`.
+   *
+   * The topic ID is sufficient to read because subscription/pull only need the
+   * routing key; the descriptor fields aren't required to receive (subscribers
+   * verify signers themselves). Publishing is different — it requires the
+   * descriptor (see `_resolveTopicOrThrow`), because the storing node must
+   * recompute the id from the descriptor to enforce the write policy.
+   */
+  async _resolveReadTopic(topic, op) {
+    if (typeof topic === 'string') {
+      const id = topic.trim().toLowerCase();
+      if (!isHexId(id)) {
+        throw new PublishError(ErrorCodes.PUBLISH_INVALID_TOPIC,
+          `peer.${op}: a string topic must be a ${id.length}-char hex topic ID — ` +
+          `pass the full 66-hex id, or a descriptor object { region?, owner?, name, write? }`,
+          { context: { topic } });
+      }
+      return {
+        region: parseInt(id.slice(0, 2), 16),
+        owner: null, name: null, write: null,
+        topicId: id, topicIdBig: BigInt('0x' + id), byId: true,
+      };
+    }
+    return this._resolveTopicOrThrow(topic, op);
   }
 
   async pub(topic, message, opts = {}) {
@@ -1615,10 +1655,12 @@ export class AxonaPeer extends DHT {
       throw new SubscribeError(ErrorCodes.SUBSCRIBE_HANDLER_MISSING,
         'peer.sub: handler must be a function', { context: { topic } });
     }
-    // Structured topic { region?, owner?, name, write? } — same addressing as pub.
-    // To read someone's feed/profile pass their owner Author ID; key-derived
-    // placement (region omitted + owner) makes it discoverable from the Author ID.
-    const desc       = await this._resolveTopicOrThrow(topic, 'sub');
+    // Accepts a structured topic { region?, owner?, name, write? } OR a bare
+    // 66-hex topic ID (the shareable read handle from deriveTopicId). To read
+    // someone's owned feed by descriptor, pass their owner Author ID + the
+    // feed's region + name + write:'owner' (the full descriptor that produced
+    // the id) — or just the id they shared with you.
+    const desc       = await this._resolveReadTopic(topic, 'sub');
     const am         = this._requireAxonaManager('sub');
     const topicIdBig = desc.topicIdBig;
 
@@ -1633,7 +1675,7 @@ export class AxonaPeer extends DHT {
     // routed correctly.  Subscription's internal `_topicId` is BigInt
     // (kernel form); the public `sub.topicId` getter returns hex.
     const sub = new Subscription({
-      peer: this, topicId: topicIdBig, topicName: desc.name, handler, opts,
+      peer: this, topicId: topicIdBig, topicName: desc.name ?? ('#' + desc.topicId.slice(0, 10)), handler, opts,
     });
     if (!this._subscriptions.has(topicIdBig)) this._subscriptions.set(topicIdBig, new Set());
     this._subscriptions.get(topicIdBig).add(sub);
@@ -1797,7 +1839,7 @@ export class AxonaPeer extends DHT {
         'peer.pull: AxonaManager does not support requestPull',
         { context: {} });
     }
-    const desc       = await this._resolveTopicOrThrow(topic, 'pull');
+    const desc       = await this._resolveReadTopic(topic, 'pull');
     const topicIdBig = desc.topicIdBig;
     const result = await am.requestPull(topicIdBig, wantsLatest ? null : msgId, { timeoutMs });
     if (!result) return null;
@@ -1840,7 +1882,7 @@ export class AxonaPeer extends DHT {
    *   topic (single root), a lower bound once the tree has split into sub-axons.
    */
   async metrics(topic, { timeoutMs = 500 } = {}) {
-    const desc = await this._resolveTopicOrThrow(topic, 'metrics');
+    const desc = await this._resolveReadTopic(topic, 'metrics');
     const am = this._requireAxonaManager('metrics');
     if (typeof am.requestMetrics !== 'function') {
       return { publishes: 0, subscribers: 0, deliveries: 0, pulls: 0, reshares: 0, relayCount: 0 };
