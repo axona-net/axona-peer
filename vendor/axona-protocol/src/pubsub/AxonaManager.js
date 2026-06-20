@@ -1307,7 +1307,7 @@ export class AxonaManager {
     const topicIdHex = toHex(topicId);
     const publisherHex = publisher == null ? publisher : toHex(publisher);
     for (const [childId] of role.children) {
-      if (childId === this.nodeId) { this._deliverToApp(topicId, json, publishId, publishTs); continue; }
+      if (childId === this.nodeId) { this._deliverToApp(topicId, json, publishId, publishTs, postHash); continue; }
       this.dht.sendDirect(childId, 'pubsub:deliver', { topicId: topicIdHex, json, publishId, publishTs, postHash, publisher: publisherHex });
     }
     return true;
@@ -1794,18 +1794,19 @@ export class AxonaManager {
     }
 
     // Upsert by content (msgId): a re-publish of identical content from the
-    // same author has the SAME msgId. Replace the prior copy so the cache holds
-    // one entry per msgId — the newest, which (as a fresh entry) gets a fresh
-    // hold + 48h ceiling. Then skip re-delivery: current subscribers already
-    // received this msgId; late subscribers get it once via replay-on-subscribe.
+    // same author has the SAME msgId. Replace the prior copy so this role's
+    // cache holds one entry per msgId — the newest, which (as a fresh entry)
+    // gets a fresh hold + 48h ceiling. The re-publish then fans out normally so
+    // EVERY replica upserts and refreshes its own hold (the point of a re-
+    // publish is a fleet-wide hold refresh, not a single-root one). Exactly-once
+    // app delivery is enforced downstream in _deliverToApp, keyed on msgId, so
+    // re-fanning identical content never double-delivers to a subscriber.
     // (Different authors of identical text have different msgIds — not collapsed.)
-    const isRepublish = !!postHash && (role.replayCache || []).some(e => e.postHash === postHash);
-    if (isRepublish) role.replayCache = role.replayCache.filter(e => e.postHash !== postHash);
+    if (postHash) role.replayCache = (role.replayCache || []).filter(e => e.postHash !== postHash);
 
     const quotaPerPublisher = await this._openTopicQuota(role, json, topicId);
     this._addToReplayCache(role, { json, publishId, publishTs, postHash, publisher }, { quotaPerPublisher });
     this._recordReceived(topicId, publishId, publishTs);
-    if (isRepublish) return 'consumed';   // refreshed in place; no re-fan-out
 
     const topicIdHex  = toHex(topicId);
     const publisherHex = publisher === null || publisher === undefined ? publisher : toHex(publisher);
@@ -1813,7 +1814,7 @@ export class AxonaManager {
     const deadChildren = [];
     for (const [childId] of role.children) {
       if (childId === this.nodeId) {
-        this._deliverToApp(topicId, json, publishId, publishTs);
+        this._deliverToApp(topicId, json, publishId, publishTs, postHash);
         if (postHash) this._bumpDelivery(topicId, postHash);
         continue;
       }
@@ -2002,13 +2003,19 @@ export class AxonaManager {
    * a publishId reaches the app at most once regardless of how many roles /
    * resubscribes route it here.  Bounded LRU, same shape as _seenPublishes.
    */
-  _deliverToApp(topicId, json, publishId, publishTs) {
+  _deliverToApp(topicId, json, publishId, publishTs, postHash) {
     if (!this._deliveryCallback) return;
-    if (publishId) {
-      // TOPIC-SCOPED dedup key: lets pubsubResetTopicConsumption() forget
-      // exactly one topic's deliveries (on unsub / since:'all' resubscribe) so
-      // a fresh subscribe re-delivers, without disturbing other topics.
-      const dkey = `${topicId}:${publishId}`;
+    // Exactly-once key.  Prefer the CONTENT id (postHash = msgId) so a message
+    // reaches the app at most once regardless of HOW it arrived: a re-publish
+    // of identical content (same msgId, new random publishId) and the same
+    // content fanned out by several K-closest roots both collapse to a single
+    // delivery.  Fall back to publishId only for content-less frames (e.g. the
+    // kill/delete notification, which carries no postHash).  Both keep the
+    // `${topicId}:` prefix so pubsubResetTopicConsumption() can forget exactly
+    // one topic's deliveries on unsub / since:'all' resubscribe.
+    const dedupId = postHash || publishId;
+    if (dedupId) {
+      const dkey = `${topicId}:${dedupId}`;
       if (this._appDelivered.has(dkey)) return;     // already delivered locally
       this._appDelivered.set(dkey, this._now());
       this._capStore(this._appDelivered, this._appDeliveredCap);
@@ -2050,7 +2057,7 @@ export class AxonaManager {
       }
     }
 
-    this._deliverToApp(topicId, json, publishId, publishTs);
+    this._deliverToApp(topicId, json, publishId, publishTs, postHash);
   }
 
   async _onPromoteAxon(payload, meta) {
@@ -2226,7 +2233,7 @@ export class AxonaManager {
     if (subscriberId === this.nodeId) {
       for (const m of cache) {
         if (m.postHash && this._isTombstoned(m.postHash)) continue;   // never replay a killed message
-        this._deliverToApp(topicId, m.json, m.publishId, m.publishTs);
+        this._deliverToApp(topicId, m.json, m.publishId, m.publishTs, m.postHash);
       }
       return;
     }
@@ -2316,7 +2323,7 @@ export class AxonaManager {
         // re-served to future subscribers even after a successful kill.
         if (role) this._addToReplayCache(role, { json, publishId, publishTs, postHash, publisher });
       }
-      this._deliverToApp(topicId, json, publishId, publishTs);
+      this._deliverToApp(topicId, json, publishId, publishTs, postHash);
     }
   }
 
@@ -2404,15 +2411,15 @@ export class AxonaManager {
     }
 
     // Upsert by content (msgId) — same as _onPublish: a re-publish of identical
-    // content replaces the prior copy (one entry per msgId, fresh hold/ceiling)
-    // and skips re-delivery. Different authors of identical text differ in msgId.
-    const isRepublish = !!postHash && (role.replayCache || []).some(e => e.postHash === postHash);
-    if (isRepublish) role.replayCache = role.replayCache.filter(e => e.postHash !== postHash);
+    // content replaces this role's prior copy (one entry per msgId, fresh hold/
+    // ceiling) and then fans out normally so every replica refreshes its hold;
+    // exactly-once app delivery is enforced in _deliverToApp by msgId. Different
+    // authors of identical text differ in msgId, so they aren't collapsed.
+    if (postHash) role.replayCache = (role.replayCache || []).filter(e => e.postHash !== postHash);
 
     const quotaPerPublisher = await this._openTopicQuota(role, json, topicId);
     this._addToReplayCache(role, { json, publishId, publishTs, postHash, publisher }, { quotaPerPublisher });
     this._recordReceived(topicId, publishId, publishTs);
-    if (isRepublish) return;   // refreshed in place; no re-fan-out
 
     const topicIdHex   = toHex(topicId);
     const publisherHex = publisher === null || publisher === undefined ? publisher : toHex(publisher);
@@ -2420,7 +2427,7 @@ export class AxonaManager {
     const deadChildren = [];
     for (const [childId] of role.children) {
       if (childId === this.nodeId) {
-        this._deliverToApp(topicId, json, publishId, publishTs);
+        this._deliverToApp(topicId, json, publishId, publishTs, postHash);
         if (postHash) this._bumpDelivery(topicId, postHash);
         continue;
       }
