@@ -1793,17 +1793,12 @@ export class AxonaManager {
       return 'consumed';
     }
 
-    // Upsert by content (msgId): a re-publish of identical content from the
-    // same author has the SAME msgId. Replace the prior copy so this role's
-    // cache holds one entry per msgId — the newest, which (as a fresh entry)
-    // gets a fresh hold + 48h ceiling. The re-publish then fans out normally so
-    // EVERY replica upserts and refreshes its own hold (the point of a re-
-    // publish is a fleet-wide hold refresh, not a single-root one). Exactly-once
+    // Re-publish of identical content (same msgId) upserts in the cache (see
+    // _addToReplayCache: one entry per msgId, fresh hold + 48h ceiling) and then
+    // fans out normally so EVERY replica refreshes its own hold — the point of a
+    // re-publish is a fleet-wide hold refresh, not a single-root one. Exactly-once
     // app delivery is enforced downstream in _deliverToApp, keyed on msgId, so
     // re-fanning identical content never double-delivers to a subscriber.
-    // (Different authors of identical text have different msgIds — not collapsed.)
-    if (postHash) role.replayCache = (role.replayCache || []).filter(e => e.postHash !== postHash);
-
     const quotaPerPublisher = await this._openTopicQuota(role, json, topicId);
     this._addToReplayCache(role, { json, publishId, publishTs, postHash, publisher }, { quotaPerPublisher });
     this._recordReceived(topicId, publishId, publishTs);
@@ -1852,6 +1847,17 @@ export class AxonaManager {
    */
   _addToReplayCache(role, entry, opts = {}) {
     if (!role.replayCache) role.replayCache = [];
+    // Upsert by content id (postHash = msgId): one entry per msgId, always. A
+    // re-publish of identical content (same author + message) replaces the
+    // prior copy here — so EVERY ingress path (routed publish, direct publish-k,
+    // sub-axon deliver, replay re-cache) converges to a single entry with a
+    // fresh hold + 48h ceiling, no matter how many roots/paths carry the copy.
+    // (Anti-entropy already drops a known postHash before calling, so this is a
+    // no-op there. Different authors of identical text differ in postHash.)
+    if (entry.postHash) {
+      const dup = role.replayCache.findIndex(e => e.postHash === entry.postHash);
+      if (dup !== -1) role.replayCache.splice(dup, 1);
+    }
     // Enrich with the ordering key (parse once from the signed envelope).
     if (entry.seq === undefined) {
       let env = null;
@@ -2410,13 +2416,9 @@ export class AxonaManager {
       this.axonRoles.set(topicId, role);
     }
 
-    // Upsert by content (msgId) — same as _onPublish: a re-publish of identical
-    // content replaces this role's prior copy (one entry per msgId, fresh hold/
-    // ceiling) and then fans out normally so every replica refreshes its hold;
-    // exactly-once app delivery is enforced in _deliverToApp by msgId. Different
-    // authors of identical text differ in msgId, so they aren't collapsed.
-    if (postHash) role.replayCache = (role.replayCache || []).filter(e => e.postHash !== postHash);
-
+    // Re-publish of identical content upserts (one entry per msgId, fresh hold;
+    // see _addToReplayCache) then fans out normally so every replica refreshes
+    // its hold; exactly-once app delivery is enforced in _deliverToApp by msgId.
     const quotaPerPublisher = await this._openTopicQuota(role, json, topicId);
     this._addToReplayCache(role, { json, publishId, publishTs, postHash, publisher }, { quotaPerPublisher });
     this._recordReceived(topicId, publishId, publishTs);
