@@ -1847,6 +1847,20 @@ export class AxonaManager {
    */
   _addToReplayCache(role, entry, opts = {}) {
     if (!role.replayCache) role.replayCache = [];
+    // Enrich with the ordering key (parse once from the signed envelope).  Also
+    // backfill the content id from the envelope's msgId: some ingress paths
+    // (e.g. a sub-axon deliver frame) can reach here without an explicit
+    // postHash, and the upsert below MUST have the content key or it would
+    // append a duplicate of a message already held — exactly the bug that left
+    // keyspace-hosting roots with two copies of one msgId after a re-publish.
+    if (entry.seq === undefined) {
+      let env = null;
+      try { env = JSON.parse(entry.json); } catch { /* non-envelope */ }
+      entry.seq          = (env && typeof env.seq === 'number') ? env.seq : 0;
+      entry.ts           = (env && typeof env.ts  === 'number') ? env.ts  : (entry.publishTs || 0);
+      entry.signerPubkey = (env && typeof env.signerPubkey === 'string') ? env.signerPubkey : null;
+      if (!entry.postHash && env && typeof env.msgId === 'string') entry.postHash = env.msgId;
+    }
     // Upsert by content id (postHash = msgId): one entry per msgId, always. A
     // re-publish of identical content (same author + message) replaces the
     // prior copy here — so EVERY ingress path (routed publish, direct publish-k,
@@ -1857,14 +1871,6 @@ export class AxonaManager {
     if (entry.postHash) {
       const dup = role.replayCache.findIndex(e => e.postHash === entry.postHash);
       if (dup !== -1) role.replayCache.splice(dup, 1);
-    }
-    // Enrich with the ordering key (parse once from the signed envelope).
-    if (entry.seq === undefined) {
-      let env = null;
-      try { env = JSON.parse(entry.json); } catch { /* non-envelope */ }
-      entry.seq          = (env && typeof env.seq === 'number') ? env.seq : 0;
-      entry.ts           = (env && typeof env.ts  === 'number') ? env.ts  : (entry.publishTs || 0);
-      entry.signerPubkey = (env && typeof env.signerPubkey === 'string') ? env.signerPubkey : null;
     }
     // Hold time (Phase A #5): absolute expiry off the message ts, CLAMPED to
     // receive-time.  Real (signed) traffic is within the C-2 freshness window
