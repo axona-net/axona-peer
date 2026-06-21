@@ -127,6 +127,15 @@ export {
   canonical,
   sha256Hex,
 } from './pubsub/post.js';
+// Derived metric-topic convention (clients + roots must agree byte-for-byte, so
+// it lives in core beside deriveTopicId, not in the optional std/ helper layer).
+export {
+  metricTopic,
+  isMetricTopic,
+  isMetricTopicName,
+  dataTopicIdOf,
+  METRIC_NAMESPACE,
+} from './pubsub/metrics.js';
 
 // ── Bridge directory (discovery + failover ranking) ────────────────
 export {

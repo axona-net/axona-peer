@@ -194,6 +194,17 @@ function _wireSafe(hex) {
   try { return _wire(hex); } catch { return null; }
 }
 
+/**
+ * Is `json` a kill/delete marker (`{ deleted: true, msgId, topic }`) rather than
+ * a signed message envelope? Cheap substring pre-check before the parse; a real
+ * envelope never carries a top-level `deleted` field, so even a message whose
+ * payload contains the word "deleted" classifies correctly as not-a-delete.
+ */
+function _isDeleteFrame(json) {
+  if (typeof json !== 'string' || !json.includes('"deleted"')) return false;
+  try { return JSON.parse(json)?.deleted === true; } catch { return false; }
+}
+
 // ── AxonaManager ────────────────────────────────────────────────────────────
 
 export class AxonaManager {
@@ -2046,6 +2057,39 @@ export class AxonaManager {
     if (this._alreadySeenPublish(publishId)) return;
 
     this._recordReceived(topicId, publishId, publishTs);
+
+    // Delete/tombstone marker — a root's kill, fanned down to subscribers via
+    // pubsub:deliver. It is NOT a message: caching the {deleted:true} blob would
+    // pollute the replay queue (and, via the postHash upsert, masquerade as the
+    // content). Purge the killed content from our own cache + tombstone it, re-fan
+    // the marker to our children, then deliver it to the app keyed on the kill
+    // DELIVERY id (publishId = "kill:<msgId>") — NOT on postHash, which equals the
+    // original msgId and would be deduped against the message's own delivery,
+    // silently dropping the tombstone (the "kill removes the message but never
+    // calls the handler with deleted:true" bug). Do NOT _recordHave(postHash): the
+    // msgId is now tombstoned, not held.
+    if (_isDeleteFrame(json)) {
+      const role = this.axonRoles.get(topicId);
+      if (role) {
+        if (postHash) {
+          role.replayCache = (role.replayCache || []).filter(e => e.postHash !== postHash);
+          this._addTombstone(postHash);
+        }
+        if (!role.isRoot) {                       // sub-axon: propagate the delete downstream
+          const topicIdHex = toHex(topicId);
+          const fromId = _wire(meta.fromId);
+          for (const [childId] of role.children) {
+            if (childId === fromId || childId === this.nodeId) continue;
+            await this.dht.sendDirect(childId, 'pubsub:deliver', {
+              topicId: topicIdHex, json, publishId, publishTs, postHash,
+            });
+          }
+        }
+      }
+      this._deliverToApp(topicId, json, publishId, publishTs, null);
+      return;
+    }
+
     this._recordHave(topicId, postHash);
 
     const role = this.axonRoles.get(topicId);
@@ -2745,28 +2789,30 @@ export class AxonaManager {
     // also drops a relayed `metricsBroadcast` (it arrives from a root, so
     // fromId ≠ requesterId).
     if (fromId !== null && requesterBig !== fromId) return null;
-    // Ownership gate. A topic is "owned" only when it is anchored at a real
-    // identity — a publisher nodeId whose low 256 bits are the SHA-256 of a
-    // pubkey. Two anchor shapes are therefore UNOWNED, and their metrics are
-    // readable by anyone:
-    //   · public topics      — null publisher (top byte 0x00, no anchor);
-    //   · synthetic regional  — `prefix || 0^256` (e.g. region-keyed topics).
-    //     No key can hash to all-zero, so no node can ever own or unpub them.
-    // Owned topics stay owner-only (self-authenticating: only the node whose
-    // id IS the publisher anchor may read their metrics).
+    // Ownership gate — metrics() is now an OWNER-ONLY reader (kernel v3.5.0).
+    // A topic is "owned" only when it is anchored at a real identity: a
+    // publisher nodeId whose low 256 bits are the SHA-256 of a pubkey. Two
+    // anchor shapes are UNOWNED — public topics (null publisher) and synthetic
+    // regional topics (`prefix || 0^256`); no key hashes to all-zero, so no
+    // node can own them.
+    //
+    // Open/public/regional topics now expose their live state through the
+    // PUBLISHED metric topic (metricTopic(T) — a relay republishes signed
+    // snapshots there on a cadence), so the scatter-gather REFUSES them
+    // outright. The effect is that a non-owner can no longer trigger a fan-out
+    // metrics read of ANY topic: open topics are served by subscription, and
+    // owned topics answer only their owner (the anchor must equal the proven
+    // requester). An empty cache means the owner is indeterminate (no cached
+    // post to establish the anchor) — fail closed, refuse.
     const samplePost = role.replayCache?.[0];
     const anchor = samplePost?.publisher ?? null;          // BigInt | null
     const owned  = anchor !== null && (anchor & ((1n << 256n) - 1n)) !== 0n;
-    if (owned && anchor !== requesterBig) {
+    if (!owned || anchor !== requesterBig) {
       return null;
     }
-    // C-3 (fail-CLOSED): the subscriber count is the owner-sensitive field. With
-    // an empty replay cache the owner is INDETERMINATE (no cached post to
-    // establish the anchor), so the topic could be owned — withhold the count
-    // (`null`) rather than leak it. Non-sensitive counts are still returned, and
-    // sibling roots that hold the queue answer the real subscriber count via the
-    // metricsReq-k aggregation.
-    const ownershipKnown = (role.replayCache?.length ?? 0) > 0;
+    // Past the gate the topic is owned AND the requester is its owner, so the
+    // replay cache is non-empty and the subscriber count is safe to return to
+    // its owner.
     const byTopic = this._counters.get(topicIdBig) || new Map();
     const wantedHashes = (postHashes && postHashes.length > 0)
       ? postHashes
@@ -2781,9 +2827,57 @@ export class AxonaManager {
       responderId:   toHex(this.nodeId),
       entries,
       current_count: this._liveCacheCount(role),
-      subscribers:   ownershipKnown ? (role.children?.size ?? 0) : null,
+      subscribers:   role.children?.size ?? 0,
       timestamp:     this._now(),
     };
+  }
+
+  /**
+   * Enumerate the topics this node currently ROOTS (its axon roles), each with
+   * its signed topic descriptor (recovered from a cached envelope) and a
+   * locally-computed metric snapshot. Pure + synchronous — no network, no
+   * scatter-gather; it only reads local replay-cache state.
+   *
+   * This is the read side of the derived-metric-topic convention
+   * (src/pubsub/metrics.js): an infrastructure root walks this list on a timer,
+   * skips metric topics (recursion guard) and non-open topics (privacy — owned
+   * subscriber counts stay owner-only, matching the _buildMetricsResp gate), and
+   * republishes each open topic's snapshot to metricTopic(topicId). The kernel
+   * supplies the MECHANISM (what do I root, what are the counts); the caller
+   * supplies the POLICY (cadence, which topics, the signing author).
+   *
+   * `descriptor` is null when no live envelope is cached (an empty role, or a
+   * non-envelope payload) — a caller cannot apply the name-based recursion guard
+   * to such a role and should skip it (it has nothing to report anyway).
+   *
+   * @returns {Array<{ topicId:string, descriptor:object|null,
+   *                    current_count:number, subscribers:number, bytes:number }>}
+   */
+  rootedTopics(now = this._now()) {
+    const out = [];
+    for (const [topicId, role] of this.axonRoles) {
+      const cache = role?.replayCache || [];
+      let descriptor = null, live = 0, bytes = 0;
+      for (const e of cache) {
+        if (this._isExpired(e, now)) continue;
+        live++;
+        bytes += (typeof e.json === 'string' ? e.json.length : 0);
+        if (descriptor === null && typeof e.json === 'string') {
+          try {
+            const env = JSON.parse(e.json);
+            if (env && typeof env.topic === 'object' && env.topic) descriptor = env.topic;
+          } catch { /* non-envelope cache entry */ }
+        }
+      }
+      out.push({
+        topicId:       typeof topicId === 'bigint' ? toHex(topicId) : String(topicId),
+        descriptor,
+        current_count: live,
+        subscribers:   role?.children?.size ?? 0,
+        bytes,
+      });
+    }
+    return out;
   }
 
   _maybeRespondMetrics(payload, role, topicIdBig, meta) {

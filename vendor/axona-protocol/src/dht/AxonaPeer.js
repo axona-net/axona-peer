@@ -1923,6 +1923,24 @@ export class AxonaPeer extends DHT {
     };
   }
 
+  /**
+   * Enumerate the topics this peer currently ROOTS, each with its signed topic
+   * descriptor and a locally-computed metric snapshot — synchronous, no network
+   * (unlike metrics(), which scatter-gathers the K roots). The read side of the
+   * derived-metric-topic convention (`metricTopic()`): an infrastructure root
+   * walks this on a timer, skips metric topics + non-open topics, and
+   * republishes each open topic's snapshot to metricTopic(topicId).
+   *
+   * @returns {Array<{ topicId:string, descriptor:object|null,
+   *                   current_count:number, subscribers:number, bytes:number }>}
+   *          Empty if no AxonaManager is wired (e.g. a routing-only peer).
+   */
+  rootedTopics() {
+    const am = this._axonaManager;
+    if (!am || typeof am.rootedTopics !== 'function') return [];
+    return am.rootedTopics();
+  }
+
   // ─── Direct messaging (v1.0 API) ──────────────────────────────────
   //
   // Three primitives that ride directly on the underlying Transport
