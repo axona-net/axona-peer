@@ -643,7 +643,12 @@ export class AxonaManager {
   }
 
   pubsubResetTopicConsumption(topicId) {
-    this._lastSeenTsByTopic.delete(topicId);
+    // "Consumed nothing" → seed the since-floor to 0 so a following subscribe
+    // replays the FULL history (since:'all'). MUST NOT delete the entry: a
+    // missing _lastSeenTsByTopic makes pubsubSubscribe fall back to since=now()
+    // (live tail), which silently defeats since:'all' (the live backlog/gap
+    // recover-0% bug — the root then filters out everything before now).
+    this._lastSeenTsByTopic.set(topicId, 0);
     this._upstream.delete(topicId);
     const prefix = topicId.toString(16) + ':';
     for (const k of this._appDelivered.keys()) if (k.startsWith(prefix)) this._appDelivered.delete(k);
