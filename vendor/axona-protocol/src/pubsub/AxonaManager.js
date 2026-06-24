@@ -68,6 +68,17 @@ const APP_DEDUP_MAX   = 8192;            // exactly-once app-delivery LRU
 const REPLAY_CHUNK_BYTES = 96 * 1024;    // byte budget per replay deliver batch
 const FUTURE_TOLERANCE_MS = 5 * 60 * 1000;   // §5 bad-clock rule: drop replayed stamps this far ahead
 
+// ── Root beacon (soft-state root advertisement; Pubsub-Root-Beacon-v0.1) ────
+// A root periodically announces "root for T was last at X" to its K XOR-closest
+// neighbors (the topic's convergence basin), recursive 2 layers. Receivers cache
+// it (verify-don't-trust) and consult it before greedy/lookup, fixing the
+// last-mile divergence (publisher/subscriber resolving different roots).
+const BEACON_MS       = 20_000;          // emission cadence (faster than RENEW_MS so churn heals quickly)
+const BEACON_TTL_MS   = 50_000;          // inbound pointer validity (~2.5×BEACON_MS)
+const BEACON_FANOUT   = 6;               // K closest neighbors per layer (fan-out ≤ K+K²)
+const BEACON_LAYERS   = 2;               // recursive forward depth
+const BEACON_SEEN_MS  = 60_000;          // flood-dedup retention
+
 // ── Wire message types (all ROUTED) ─────────────────────────────────────
 const T = {
   SUB:      'pubsub:sub',       // subscribe — routed toward topic id (or a via waypoint)
@@ -82,6 +93,7 @@ const T = {
   TOUCH:    'pubsub:touch',     // extend TTL (thin; TODO Phase 4)
   PULL:     'pubsub:pull',      // on-demand fetch request — routed toward topic id
   PULLRESP: 'pubsub:pullresp',  // pull response — routed back toward the requester id
+  ROOTBEACON: 'pubsub:rootbeacon', // soft-state root advertisement to the topic's neighborhood
 };
 
 // ── id helpers (264-bit ids ⇄ 66-char hex) ──────────────────────────────
@@ -148,6 +160,10 @@ export class AxonaManager {
     // Internal.
     this._upstream        = new Map();  // topicIdBig -> [hex]  the relay we renew toward
     this._rootHint        = new Map();  // topicIdBig -> { via:hex|null, at }  cached iterative-lookup root
+    this._rootBeacons     = new Map();  // topicIdBig -> { root:hex, at, exp }  inbound root advert (soft state)
+    this._beaconSeen      = new Map();  // beaconId -> exp  (flood dedup)
+    this._lastBeaconAt    = 0;
+    this._beaconSeq       = 0;
     this._appDelivered    = new Map();  // "topicHex:msgId" -> true (exactly-once LRU)
     this._deliveryCallback = null;
     this._hostKeyspace    = false;
@@ -172,7 +188,11 @@ export class AxonaManager {
     on(T.TOUCH,    this._onTouch);
     on(T.PULL,     this._onPull);
     on(T.PULLRESP, this._onPullResp);
+    on(T.ROOTBEACON, this._onRootBeacon);
   }
+
+  // ── XOR-distance helper (264-bit ids as bigints) ────────────────────────
+  _cmpXor(a, b, target) { const da = a ^ target, db = b ^ target; return da < db ? -1 : da > db ? 1 : 0; }
 
   // ── routing core ────────────────────────────────────────────────────
   // Route toward via[0] if present, else toward the topic id. The topic id is
@@ -349,6 +369,24 @@ export class AxonaManager {
     if (d === 'reroute') { this._reroute(T.PUB, payload); return 'consumed'; }
 
     const topicBig = idBig(payload.topicId);
+    // Root-beacon last-mile correction. At this point I'm the acting target for
+    // the publish (bare-topic terminus, or via-pinned to me). If a fresh beacon
+    // names a different root genuinely CLOSER to the topic than me, forward to it
+    // and demote any spurious root I'd wrongly claimed at this near-miss node so
+    // I stop intercepting. The strictly-closer test is a second verify-don't-trust
+    // gate (never defer to a farther node). Fires regardless of the incoming via:
+    // a node that wrongly became root also emits poisoning "root=me" beacons, so a
+    // peer can arrive here via-pinned to me — the correction must still re-home it.
+    {
+      const b = this._rootBeacons.get(topicBig);
+      const meHex = lc(idHex(this.nodeId));
+      if (b && this._now() < b.exp && b.root !== meHex && (idBig(b.root) ^ topicBig) < (this.nodeId ^ topicBig)) {
+        const spurious = this.axonRoles.get(topicBig);
+        if (spurious && spurious.isRoot) spurious.isRoot = false;       // demote: a closer root exists
+        this._send(T.PUB, { topicId: payload.topicId, via: [b.root], json: payload.json });
+        return 'consumed';
+      }
+    }
     let role = this.axonRoles.get(topicBig) || this._becomeRoot(topicBig);
     this._maybePromoteRoot(role, payload, meta);
     // Only the root (the topic terminus) stamps. A non-root relay can only reach
@@ -570,6 +608,11 @@ export class AxonaManager {
   // rather than waiting for the next renewal. Steady state (pinned via the deliver
   // `from`) never consults this; renewals use the cheap via-pin.
   _rootHint_(topicBig) {
+    // Highest priority: a fresh root beacon — the root announced its location
+    // directly, so no per-node lookup (which can diverge on a gappy mesh) is
+    // needed. This is the primary convergence aid (Pubsub-Root-Beacon-v0.1).
+    const beacon = this._rootBeacons.get(topicBig);
+    if (beacon && this._now() < beacon.exp) return beacon.root;
     if (typeof this.dht.lookup !== 'function') return null;
     const cached = this._rootHint.get(topicBig);
     const fresh = cached && (this._now() - cached.at) < this.renewMs;
@@ -595,6 +638,81 @@ export class AxonaManager {
       }
     }
     return cached ? cached.via : null;
+  }
+
+  // ── Root beacon (Pubsub-Root-Beacon-v0.1) ───────────────────────────────
+  // Emit: for every topic I root, announce {root: me} to my K XOR-closest
+  // neighbors (the topics' convergence basin, since the root ≈ the topic ids),
+  // aggregated into one beacon, recursive BEACON_LAYERS deep. No-op without a
+  // neighbors() adapter (sim/fabric that don't model topology simply skip it).
+  _emitRootBeacons() {
+    if (typeof this.dht.neighbors !== 'function') return;
+    const rooted = [];
+    for (const [t, r] of this.axonRoles) if (r.isRoot) rooted.push(t);
+    if (!rooted.length) return;
+    const neigh = (this.dht.neighbors() || []).map(idBig).filter(n => n !== this.nodeId);
+    if (!neigh.length) return;
+    const basin = neigh.slice().sort((a, b) => this._cmpXor(a, b, this.nodeId)).slice(0, BEACON_FANOUT);
+    const payload = {
+      root: lc(idHex(this.nodeId)),
+      topics: rooted.map(idHex),
+      beaconId: `${idHex(this.nodeId).slice(0, 10)}-${this._now()}-${this._beaconSeq++}`,
+      layer: BEACON_LAYERS,
+    };
+    this._beaconSeen.set(payload.beaconId, this._now() + BEACON_SEEN_MS);   // never re-forward my own
+    for (const nb of basin) this._route(nb, T.ROOTBEACON, payload);
+  }
+
+  // Receive: cache the pointer (verify-don't-trust), then re-forward once within
+  // the basin. The beacon is a HINT — accepted only if `root` is at least as
+  // close to the topic as my own best-known node, so a liar cannot divert a
+  // publish to a node FARTHER from the topic than honest routing would pick.
+  _onRootBeacon(payload, meta) {
+    if (!payload || typeof payload.root !== 'string' || !Array.isArray(payload.topics)) return;
+    if (!payload.beaconId || this._beaconSeen.has(payload.beaconId)) return;
+    this._beaconSeen.set(payload.beaconId, this._now() + BEACON_SEEN_MS);
+    let rootBig; try { if (!isHexId(lc(payload.root))) return; rootBig = idBig(payload.root); } catch { return; }
+    const now = this._now();
+    for (const tHex of payload.topics.slice(0, 256)) {
+      let tBig; try { if (!isHexId(lc(tHex))) continue; tBig = idBig(tHex); } catch { continue; }
+      const mine = this._bestKnownClosest(tBig);                           // local-only
+      if (mine != null && (rootBig ^ tBig) > (mine ^ tBig)) continue;       // verify-don't-trust
+      this._rootBeacons.set(tBig, { root: lc(payload.root), at: now, exp: now + BEACON_TTL_MS });
+      // If I'd wrongly become this topic's root but the beacon proves a strictly
+      // closer root exists, demote NOW and renew toward it — so I stop claiming
+      // the topic and stop emitting poisoning "root=me" beacons.
+      if ((rootBig ^ tBig) < (this.nodeId ^ tBig)) {
+        const role = this.axonRoles.get(tBig);
+        if (role && role.isRoot && rootBig !== this.nodeId) {
+          role.isRoot = false;
+          this._upstream.set(tBig, [lc(payload.root)]);
+        }
+      }
+    }
+    if (payload.layer > 1 && typeof this.dht.neighbors === 'function') {
+      let from = null; try { if (meta && meta.fromId != null) from = idBig(meta.fromId); } catch { /* */ }
+      const neigh = (this.dht.neighbors() || []).map(idBig).filter(n => n !== this.nodeId && n !== from);
+      const fwd = { ...payload, layer: payload.layer - 1 };
+      for (const nb of neigh.sort((a, b) => this._cmpXor(a, b, this.nodeId)).slice(0, BEACON_FANOUT)) {
+        this._route(nb, T.ROOTBEACON, fwd);
+      }
+    }
+  }
+
+  // Nearest node to `tBig` among what I know LOCALLY: my neighbors, myself, and
+  // any cached beacon root. Never triggers a network lookup (keeps the verify
+  // step cheap and non-amplifying).
+  _bestKnownClosest(tBig) {
+    let best = this.nodeId, bestD = this.nodeId ^ tBig;
+    if (typeof this.dht.neighbors === 'function') {
+      for (const n of (this.dht.neighbors() || [])) {
+        let nb; try { nb = idBig(n); } catch { continue; }
+        const d = nb ^ tBig; if (d < bestD) { bestD = d; best = nb; }
+      }
+    }
+    const b = this._rootBeacons.get(tBig);
+    if (b) { try { const rb = idBig(b.root); const d = rb ^ tBig; if (d < bestD) { bestD = d; best = rb; } } catch { /* */ } }
+    return best;
   }
 
   // Subscribe — always sent SYNCHRONOUSLY and immediately (fast path, never blocked
@@ -694,6 +812,9 @@ export class AxonaManager {
     this._upstream.clear();
     this._rootHint.clear();
     this._lookupInflight?.clear();
+    this._rootBeacons.clear();
+    this._beaconSeen.clear();
+    this._lastBeaconAt = 0;
     this._appDelivered.clear();
     for (const p of this._pending.values()) clearTimeout(p.timer);
     this._pending.clear();
@@ -796,6 +917,13 @@ export class AxonaManager {
         this._upstream.delete(t);
       }
     }
+
+    // 3. Root beacons — advertise where each topic I root lives, to my XOR-closest
+    //    neighbors (last-mile convergence aid). Throttled to BEACON_MS; expire the
+    //    inbound pointer + flood-dedup caches by their TTLs.
+    if (now - this._lastBeaconAt >= BEACON_MS) { this._lastBeaconAt = now; this._emitRootBeacons(); }
+    for (const [t, b] of this._rootBeacons) if (b.exp <= now) this._rootBeacons.delete(t);
+    for (const [id, exp] of this._beaconSeen) if (exp <= now) this._beaconSeen.delete(id);
   }
 
   _log(level, event, ctx) {

@@ -2408,6 +2408,21 @@ export class AxonaPeer extends DHT {
 
     const dht = {
       getSelfId:    () => peer.getNodeId(),
+      // Locally-known mesh neighbors (authenticated bound peers; synaptome as
+      // fallback for transports without a bound list). Used by the root-beacon
+      // to reach the topic's neighborhood. Local-only — never probes the network.
+      neighbors: () => {
+        const out = new Set();
+        try {
+          if (node.transport && typeof node.transport.boundPeers === 'function') {
+            for (const p of node.transport.boundPeers()) if (typeof p === 'bigint') out.add(p);
+          }
+        } catch { /* best-effort */ }
+        if (out.size === 0) {
+          for (const syn of node.synaptome?.values?.() ?? []) if (typeof syn.peerId === 'bigint') out.add(syn.peerId);
+        }
+        return [...out];
+      },
       findKClosest: async (targetIdBig, K = 5) => {
         // AxonaManager now passes BigInt targetId; the adapter is
         // BigInt-throughout.  No hex conversion needed.
