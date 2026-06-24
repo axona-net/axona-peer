@@ -234,7 +234,7 @@ export class AxonaManager {
   // itself forever.
   _maybePromoteRoot(role, payload, meta) {
     const viaEmpty = !(Array.isArray(payload.via) && payload.via.length);
-    if (viaEmpty && meta.isTerminal && !role.isRoot) { role.isRoot = true; this._upstream.delete(role.topicId); }
+    if (viaEmpty && meta.isTerminal && !role.isRoot) { role.isRoot = true; this._upstream.delete(role.topicId); this._announceRoot(role.topicId); }
   }
 
   // ── SUBSCRIBE ────────────────────────────────────────────────────────
@@ -583,7 +583,22 @@ export class AxonaManager {
     const role = makeRole(topicBig, true);
     this.axonRoles.set(topicBig, role);
     this._log('info', 'root-formed', { topic: idHex(topicBig).slice(0, 12) });
+    this._announceRoot(topicBig);
     return role;
+  }
+
+  // Emit a root beacon IMMEDIATELY on becoming root, so a brand-new topic's
+  // location is advertised at once instead of waiting up to BEACON_MS for the
+  // throttled tick (closes the cold-publish timing gap: discovery 0% cases where
+  // the publisher fires before the root's first periodic beacon). Lightly
+  // rate-limited per topic so a flapping promotion can't storm the basin.
+  _announceRoot(topicBig) {
+    if (typeof this.dht.neighbors !== 'function') return;
+    const now = this._now();
+    if (!this._lastAnnounce) this._lastAnnounce = new Map();
+    if (now - (this._lastAnnounce.get(topicBig) || 0) < BEACON_MS / 2) return;
+    this._lastAnnounce.set(topicBig, now);
+    this._emitRootBeacons();
   }
 
   // The `since` to renew with: max of our cache high-water (relay), last app
@@ -814,6 +829,7 @@ export class AxonaManager {
     this._lookupInflight?.clear();
     this._rootBeacons.clear();
     this._beaconSeen.clear();
+    this._lastAnnounce?.clear();
     this._lastBeaconAt = 0;
     this._appDelivered.clear();
     for (const p of this._pending.values()) clearTimeout(p.timer);
