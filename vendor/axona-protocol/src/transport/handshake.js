@@ -59,7 +59,7 @@ export const WIRE_VERSION = '3.0';
  *  heuristic (kernel-2.x vs peer-app-3.x) no longer discriminates — the
  *  partition now rides on WIRE_VERSION major + AUTH_PROTO, which is the
  *  load-bearing, hermetic gate. */
-export const KERNEL_VERSION = '3.14.0';
+export const KERNEL_VERSION = '3.15.0';
 
 /** WebSocket close code for version mismatches (custom, in the
  *  application-specific 4000-4999 range). */

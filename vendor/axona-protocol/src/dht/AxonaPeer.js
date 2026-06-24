@@ -2477,6 +2477,16 @@ export class AxonaPeer extends DHT {
       },
       onRoutedMessage: (type, h) => peer.onRoutedMessage(type, h),
       onDirectMessage: (type, h) => peer.onDirectMessage(type, h),
+      // Robust ITERATIVE lookup (α-parallel, escapes the greedy local minima that
+      // strand subscribers on a sparse mesh). The routing-only manager uses this
+      // to find a topic's TRUE root for publish + initial/unpinned subscribe, so
+      // publisher and subscribers converge on the same root. Returns the single
+      // closest live node id (BigInt) or null.
+      lookup: async (targetIdBig) => {
+        if (typeof targetIdBig !== 'bigint') return null;
+        try { const arr = await peer.findKClosest(targetIdBig, 1); return (Array.isArray(arr) && arr.length) ? arr[0] : null; }
+        catch { return null; }
+      },
     };
 
     // Receiver end of the routed fallback.  Mirrors browser_engine.
