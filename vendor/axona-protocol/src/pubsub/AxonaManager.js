@@ -558,35 +558,54 @@ export class AxonaManager {
     return Math.max(relay, Number.isFinite(seen) ? seen : 0, Number.isFinite(sub) ? sub : 0);
   }
 
-  // Find the topic's true root via the robust ITERATIVE lookup (escapes the
-  // greedy-routing local minima that strand subscribers on a sparse mesh), and
-  // cache it for renewMs so steady-state stays cheap. Returns a hex node id, or
-  // null (no lookup adapter, or lookup failed) → caller falls back to greedy
-  // routing toward the bare topic id.
-  async _findRoot(topicBig) {
+  // Non-blocking root hint. The iterative lookup (peer.findKClosest) escapes the
+  // greedy-routing local minima that strand subscribers on a sparse mesh, BUT over
+  // a real WebRTC mesh it can take many seconds (α-parallel rounds against peers
+  // that may be slow to answer). We must NEVER block subscribe/publish on it — a
+  // blocking lookup that doesn't finish inside the join window means the SUB/PUB is
+  // never sent (observed live: scale 0%). So: return the cached true-root hint
+  // immediately (or null), and refresh it in the BACKGROUND. When a fresh hint
+  // lands and we're an unpinned subscriber not yet adopted (a greedy local-minimum
+  // strand), re-subscribe toward it at once — healing within one lookup latency
+  // rather than waiting for the next renewal. Steady state (pinned via the deliver
+  // `from`) never consults this; renewals use the cheap via-pin.
+  _rootHint_(topicBig) {
     if (typeof this.dht.lookup !== 'function') return null;
     const cached = this._rootHint.get(topicBig);
-    if (cached && (this._now() - cached.at) < this.renewMs) return cached.via;
-    let hex = null;
-    try { const id = await this.dht.lookup(topicBig); if (id != null) hex = lc(idHex(idBig(id))); }
-    catch { /* lookup failed → greedy fallback */ }
-    this._rootHint.set(topicBig, { via: hex, at: this._now() });
-    return hex;
+    const fresh = cached && (this._now() - cached.at) < this.renewMs;
+    if (!fresh) {
+      if (!this._lookupInflight) this._lookupInflight = new Set();
+      if (!this._lookupInflight.has(topicBig)) {
+        this._lookupInflight.add(topicBig);
+        Promise.resolve()
+          .then(() => this.dht.lookup(topicBig))
+          .then(id => {
+            const hex = id != null ? lc(idHex(idBig(id))) : null;
+            this._rootHint.set(topicBig, { via: hex, at: this._now() });
+            // Heal: subscribed, not yet pinned (no deliver `from` adopted us), and
+            // the true root is someone else → re-home toward it now.
+            if (hex && this.mySubscriptions.has(topicBig) &&
+                !(this._upstream.get(topicBig) || []).length &&
+                hex !== lc(idHex(this.nodeId))) {
+              this._emitSubscribe(topicBig, [hex]);
+            }
+          })
+          .catch(() => { /* lookup failed → greedy stays in effect */ })
+          .finally(() => this._lookupInflight.delete(topicBig));
+      }
+    }
+    return cached ? cached.via : null;
   }
 
-  // Lookup-assisted when UNPINNED (initial join, or healing a strand): find the
-  // true root and route the subscribe toward it. Once pinned to a relay (via the
-  // deliver `from`), renewals use the cheap via-pin and never lookup again.
-  // Sync entry. Pinned (steady state) or no lookup adapter → send synchronously
-  // (unchanged greedy behavior, keeps tests/mock adapters deterministic). Only
-  // when UNPINNED *and* lookup is available do we go async to find the true root.
+  // Subscribe — always sent SYNCHRONOUSLY and immediately (fast path, never blocked
+  // on the network). Pinned (steady state) → via the relay. Unpinned → the warm
+  // root hint if we have one, else greedy ([]) toward the bare topic id; the
+  // background lookup in _rootHint_ heals a greedy strand shortly after.
   _sendSubscribe(topicBig) {
     const pinned = this._upstream.get(topicBig) || [];
-    if (pinned.length || typeof this.dht.lookup !== 'function') {
-      this._emitSubscribe(topicBig, pinned.slice(0, MAX_VIA));
-      return;
-    }
-    this._findRoot(topicBig).then(root => this._emitSubscribe(topicBig, root ? [root] : [])).catch(() => {});
+    let via = pinned;
+    if (!via.length) { const hint = this._rootHint_(topicBig); via = hint ? [hint] : []; }
+    this._emitSubscribe(topicBig, via.slice(0, MAX_VIA));
   }
   _emitSubscribe(topicBig, via) {
     const role = this.axonRoles.get(topicBig);
@@ -598,18 +617,14 @@ export class AxonaManager {
   }
 
   // ── public API (contract surface) ────────────────────────────────────
-  // Route the UN-stamped publish toward the topic's TRUE root (iterative lookup,
-  // cached) so publisher + subscribers converge on the same root; root stamps it.
+  // Route the UN-stamped publish toward the topic's root; root stamps it. Sent
+  // SYNCHRONOUSLY and immediately: via the warm true-root hint if we have one (so
+  // publisher + subscribers converge on the same root), else greedy ([]) toward the
+  // bare topic id. _rootHint_ refreshes the hint in the background — never blocking
+  // the publish on a slow live-mesh lookup.
   pubsubPublish(topicId, json, meta = {}) {
-    if (typeof this.dht.lookup === 'function') {
-      // lookup-assisted: find the TRUE root so publisher + subscribers converge
-      // on the same root (async).
-      this._findRoot(topicId)
-        .then(root => this._send(T.PUB, { topicId: idHex(topicId), via: root ? [root] : [], json }))
-        .catch(() => {});
-    } else {
-      this._send(T.PUB, { topicId: idHex(topicId), via: [], json });   // sync greedy (no lookup adapter)
-    }
+    const hint = this._rootHint_(topicId);
+    this._send(T.PUB, { topicId: idHex(topicId), via: hint ? [hint] : [], json });
     return meta.postHash || '';
   }
 
@@ -673,6 +688,7 @@ export class AxonaManager {
     this._lastSeenTsByTopic.clear();
     this._upstream.clear();
     this._rootHint.clear();
+    this._lookupInflight?.clear();
     this._appDelivered.clear();
     for (const p of this._pending.values()) clearTimeout(p.timer);
     this._pending.clear();
