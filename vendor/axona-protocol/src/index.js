@@ -137,6 +137,18 @@ export {
   METRIC_NAMESPACE,
 } from './pubsub/metrics.js';
 
+// Author-class attestation — voluntary, signed human/agent provenance bound to
+// the author key (NOT the address). Carrier + verify live in core so every
+// consumer derives the profile topic and verifies the claim identically.
+export {
+  authorClassTopic,
+  buildAuthorClass,
+  verifyAuthorClass,
+  AUTHOR_CLASS_KIND,
+  AUTHOR_CLASS_NAME,
+  AUTHOR_CLASS_REGION,
+} from './pubsub/authorClass.js';
+
 // ── Bridge directory (discovery + failover ranking) ────────────────
 export {
   BRIDGE_DIRECTORY_TOPIC,

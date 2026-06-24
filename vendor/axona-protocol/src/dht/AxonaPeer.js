@@ -55,6 +55,7 @@ import { buildKill }      from '../pubsub/kill.js';
 import { buildTouch }     from '../pubsub/touch.js';
 import { buildUnpub }     from '../pubsub/unpub.js';
 import { AxonaManager, MAX_PUBLISH_BYTES, MAX_RELIABLE_PUBLISH_BYTES } from '../pubsub/AxonaManager.js';
+import { authorClassTopic, buildAuthorClass, verifyAuthorClass } from '../pubsub/authorClass.js';
 import { PublishError, SubscribeError, KillError, UnpubError, TouchError, PullError, MetricsError, ErrorCodes } from '../errors.js';
 
 // ── B-3 (eclipse prevention) tunables ───────────────────────────────
@@ -1858,6 +1859,55 @@ export class AxonaPeer extends DHT {
   }
 
   /**
+   * Declare THIS author's class (voluntary self-asserted provenance). Publishes a
+   * signed `axona:author-class:v1` attestation to the author's own owner-only
+   * profile topic — so only that author can set its own class, and any reader can
+   * resolve it from the Author ID alone. NOT a gate: nothing reads it before
+   * routing. A human-facing app wires its "I am human" toggle to this; infra nodes
+   * self-identify (a bridge declares 'bridge', a relay 'relay'); an automated
+   * app/feed declares 'service'.
+   * @param {'agent'|'human'|'service'|'bridge'|'relay'} cls
+   * @param {object} o
+   * @param {object} o.signWith            the author identity to declare for + sign with
+   * @param {string} [o.operator]          self-asserted operator (pubkey/handle); unverified
+   * @param {object} [o.operatorSignWith]  an operator identity → attaches a verified countersignature (v1.1)
+   * @param {string} [o.label]
+   * @returns {Promise<{ msgId:string, attestation:object }>}
+   */
+  async setAuthorClass(cls, { signWith, operator = null, operatorSignWith = null, label = null } = {}) {
+    if (!signWith || typeof signWith.pubkeyHex !== 'string') {
+      throw new PublishError(ErrorCodes.PUBLISH_NO_PUBLISH_IDENTITY,
+        'peer.setAuthorClass: signWith must be an author identity', { context: {} });
+    }
+    const attestation = await buildAuthorClass({ class: cls, operator, label, signWith, operatorSignWith });
+    const msgId = await this.pub(authorClassTopic(signWith.pubkeyHex), JSON.stringify(attestation), { signWith });
+    return { msgId, attestation };
+  }
+
+  /**
+   * Resolve an author's self-declared class from its Author ID alone. Pulls the
+   * author's owner-only profile topic and verifies the attestation. Returns
+   * `{ class:'agent'|'human'|'service'|'bridge'|'relay'|'unstated', operator, operatorVerified, label, ts }`;
+   * any missing/invalid/unparseable attestation resolves to `'unstated'` (never a
+   * default class). `operatorVerified` is true only for a valid v1.1 countersignature.
+   * @param {string} authorId 64-hex Author ID
+   */
+  async getAuthorClass(authorId, { timeoutMs = 1000 } = {}) {
+    if (typeof authorId !== 'string' || authorId.length !== 64) {
+      throw new PullError(ErrorCodes.PULL_INVALID_MSGID,
+        'peer.getAuthorClass: authorId must be a 64-char hex Author ID', { context: { authorId } });
+    }
+    const env = await this.pull(null, { topic: authorClassTopic(authorId), timeoutMs });
+    if (!env || env.message == null) return { class: 'unstated', operator: null, operatorVerified: false };
+    let att;
+    try { att = typeof env.message === 'string' ? JSON.parse(env.message) : env.message; }
+    catch { return { class: 'unstated', operator: null, operatorVerified: false, reason: 'unparseable' }; }
+    const v = await verifyAuthorClass(att, { expectedAuthor: authorId });
+    if (!v.ok) return { class: 'unstated', operator: null, operatorVerified: false, reason: v.reason };
+    return { class: v.class, operator: v.operator, operatorVerified: v.operatorVerified, label: v.label, ts: v.ts, author: v.author };
+  }
+
+  /**
    * Aggregate counters for a topic across the K-closest relay tree.
    *
    * Returns an object `{ publishes, subscribers, deliveries, pulls,
@@ -2461,7 +2511,20 @@ export class AxonaPeer extends DHT {
     // call peer.sub after the mesh has stabilised, so the
     // initial K-closest is already wide and refresh isn't needed
     // to recover from a stale boot-time target set.
-    return new AxonaManager({ dht });
+    //
+    // Wire `pickRelayPeer` so sub-axon recruitment uses BATCH ADOPTION
+    // (pick a relay XOR-closest to the new subscriber from the whole
+    // synaptome, hand off a batch) instead of the fallback that promotes
+    // an existing child one subscriber at a time.  Without it the axon
+    // tree degenerates into a deep near-linear chain as a topic grows
+    // (measured in dht-sim: depth ~21 at 600 subscribers vs ~4 with batch
+    // adoption) — a latency/fragility scaling problem.  `shouldRecruitSubAxon`
+    // keeps its default (recruit past `maxDirectSubs`).
+    return new AxonaManager({
+      dht,
+      pickRelayPeer: (role, subscriberId, forwarderId) =>
+        this._pickRelayPeer(role, subscriberId, forwarderId),
+    });
   }
 
   _installDeliveryHook(am) {
