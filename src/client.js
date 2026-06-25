@@ -27,6 +27,7 @@ import { renderQR }    from './qr.js';
 // in this file.
 import { AxonaPeer, AxonaDomain, NeuronNode, ANONYMOUS } from '../vendor/axona-protocol/src/index.js';
 import { webTransport } from '../vendor/axona-protocol/src/transport/web/index.js';
+import { makeMessage, readMessage } from '../vendor/axona-protocol/std/message.js';
 import {
   REGIONS,
   getCurrentIdentity,
@@ -1154,7 +1155,7 @@ function renderSubscriptions() {
         const time = new Date(m.ts).toLocaleTimeString();
         meta.textContent = `${time} · from ${fmtNodeId(m.publisher)}`;
         const body = document.createElement('span');
-        body.textContent = m.msg;
+        body.textContent = readMessage(m.msg);   // canonical std/message convention
         mli.appendChild(meta);
         mli.appendChild(body);
         ul.appendChild(mli);
@@ -1351,7 +1352,7 @@ async function publishFromForm(form, $messageEl) {
     // id lands in that region's address space (us-east peers ↔ us-east
     // topics), matching addSubscription.  The envelope's signerPubkey is
     // the durable author key's Author ID, passed as { signWith }.
-    const msgId = await peer.pub(topic, message, { signWith: authorIdentity });
+    const msgId = await peer.pub(topic, makeMessage(message), { signWith: authorIdentity });
     console.log('[axona] published', { topic, msgId });
     appendLog('pubsub:published', `${form.regionId}/${eventName} → ${msgId}`);
     $messageEl.value = '';

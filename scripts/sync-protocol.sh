@@ -58,6 +58,17 @@ for f in index.js errors.js bridgeDirectory.js; do
     echo "  ✓ ${f}"
   fi
 done
+
+# std/ — app-layer standard library (message convention, chunking). Lives beside
+# src/ in the kernel; vendor it so client.js can use std/message (the canonical
+# pub/sub body convention every Axona app shares).
+STD_SRC="$(dirname "${PROTOCOL_SRC}")/std"
+STD_DST="$(dirname "${VENDOR_DST}")/std"
+if [ -d "${STD_SRC}" ]; then
+  rm -rf "${STD_DST}"
+  cp -r "${STD_SRC}" "${STD_DST}"
+  echo "  ✓ std/ ($(ls "${STD_DST}" | tr '\n' ' '))"
+fi
 echo
 echo "Diff:"
 ( cd "${REPO_ROOT}" && git status --porcelain vendor/axona-protocol/ )
