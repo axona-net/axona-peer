@@ -63,7 +63,7 @@ const MAX_DIRECT      = 20;              // direct subscribers before a relay de
 const DELEGATE_BATCH  = 8;               // subscribers handed off when promoting a child
 const MAX_VIA         = 8;               // ordered-waypoint list length cap (wire sanity)
 const VIA_HOP_BUDGET  = 8;               // hops per via leg (enforced kernel-side, Phase 2+)
-const TTL_MS          = 48 * 60 * 60 * 1000;   // 48h message hold, keyed on the ROOT timestamp
+const TTL_MS          = 24 * 60 * 60 * 1000;   // 24h message hold, keyed on the ROOT timestamp
 const APP_DEDUP_MAX   = 8192;            // exactly-once app-delivery LRU
 const REPLAY_CHUNK_BYTES = 96 * 1024;    // byte budget per replay deliver batch
 const FUTURE_TOLERANCE_MS = 5 * 60 * 1000;   // §5 bad-clock rule: drop replayed stamps this far ahead
@@ -923,7 +923,7 @@ export class AxonaManager {
       // A ROOT holding non-expired cache MUST persist even with zero subscribers
       // — otherwise a message published before anyone subscribes (or after the
       // last subscriber leaves) is lost the moment refreshTick runs, breaking the
-      // 48h hold + late-join replay. The cache itself ages out via _expireCache
+      // TTL hold + late-join replay. The cache itself ages out via _expireCache
       // (TTL), so the role naturally tears down once its history fully expires. A
       // non-root child relay with no subscribers carries only redundant cache (the
       // root has it) so it may tear down immediately.
