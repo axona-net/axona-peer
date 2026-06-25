@@ -799,7 +799,7 @@ async function bootAxonaNode(opts = {}) {
   // AUTHORSHIP key, never the transport/node `identity`.  The author key
   // is a keypair-only Author ID (no location, no nodeId) and persists to
   // localStorage so a returning visitor keeps a recognizable identity and
-  // can retract (kill/unpub) their own messages.  It is passed per-publish
+  // can retract (kill) their own messages.  It is passed per-publish
   // as `{ signWith: authorIdentity }` — there is no default signer on the
   // AxonaPeer anymore.
   authorIdentity = await getAuthorIdentity();

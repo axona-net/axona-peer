@@ -296,7 +296,7 @@ export function forgetIdentity() {
  * no location and no nodeId — authorship is not a place.  It persists
  * to localStorage under AUTHOR_STORAGE_KEY (load-or-create), so a
  * returning visitor keeps a recognizable Author ID across sessions and
- * can retract their own messages (kill / unpub).
+ * can retract their own messages (kill).
  *
  * Returns { authorId (=pubkeyHex), pubkey, pubkeyHex, privateKey, sign, verify }.
  */

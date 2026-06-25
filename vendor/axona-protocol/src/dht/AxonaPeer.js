@@ -53,10 +53,10 @@ export const ANONYMOUS = Symbol.for('axona.publish.anonymous');
 import { buildEnvelope }  from '../pubsub/envelope.js';
 import { buildKill }      from '../pubsub/kill.js';
 import { buildTouch }     from '../pubsub/touch.js';
-import { buildUnpub }     from '../pubsub/unpub.js';
 import { AxonaManager, MAX_PUBLISH_BYTES, MAX_RELIABLE_PUBLISH_BYTES } from '../pubsub/AxonaManager.js';
+import { metricTopic } from '../pubsub/metrics.js';
 import { authorClassTopic, buildAuthorClass, verifyAuthorClass } from '../pubsub/authorClass.js';
-import { PublishError, SubscribeError, KillError, UnpubError, TouchError, PullError, MetricsError, ErrorCodes } from '../errors.js';
+import { PublishError, SubscribeError, KillError, TouchError, PullError, MetricsError, ErrorCodes } from '../errors.js';
 
 // ── B-3 (eclipse prevention) tunables ───────────────────────────────
 // Max concurrent verification probes triggered by gossip introductions —
@@ -1526,6 +1526,11 @@ export class AxonaPeer extends DHT {
   }
 
   /**
+   * @deprecated (v4.3.0) touch() is a NO-OP in the routing-only kernel (TTL extension
+   * was never implemented; `_onTouch` does nothing) and is removed from the docs. The
+   * method + wire type are retained as a harmless no-op for compatibility; do not use.
+   * Keep a message alive past the 24h hold by re-publishing it.
+   *
    * Touch a message (Phase A #7) — a keep-alive gated by TOPIC OWNERSHIP.
    * Always signed (for freshness); routed to the topic's K-closest roots,
    * each of which (if it holds the message) resets the message's hold-time
@@ -1574,68 +1579,12 @@ export class AxonaPeer extends DHT {
     return { ok: true };
   }
 
-  /**
-   * Remove a topic's message queue (Phase A #3) — owner-only.
-   *
-   * Only the topic OWNER (the identity whose nodeId seeds the topic id) can
-   * unpub.  The topic's root axons verify ownership self-authenticatingly:
-   * the signer's pubkey must bind to the owner nodeId, and that nodeId must
-   * derive the topicId.  Two modes:
-   *   - default            → drop the message queue (tombstone the msgIds so
-   *                          a lagging replica can't resurrect them); any
-   *                          topic config/ACL is kept so the owner can keep
-   *                          publishing.
-   *   - `{ destroy: true }`→ TOTAL removal: messages AND config/ACL AND the
-   *                          hosting role state. The topicId can be
-   *                          re-derived and the topic re-created later, but
-   *                          it comes back with defaults, not its old state.
-   *
-   * Ownerless (public) topics have no owner key and cannot be unpubbed.
-   *
-   * @param {string} topic
-   * @param {object} [opts]
-   * @param {boolean} [opts.destroy=false]
-   * @param {string|null} [opts.publisher]  owner selector; default = this peer
-   * @returns {Promise<{ ok: boolean }>}
-   */
-  async unpub(topic, opts = {}) {
-    const desc = await this._resolveTopicOrThrow(topic, 'unpub');
-    // Only an OWNED topic can be unpublished, and only by its owner key.
-    if (!desc.owner || desc.write !== 'owner') {
-      throw new UnpubError(ErrorCodes.UNPUB_PUBLIC_TOPIC,
-        'peer.unpub: only an owned topic can be unpublished ({ owner, write: \'owner\' }); open topics have no owner',
-        { context: { topic: desc.name } });
-    }
-    const author = opts.signWith;
-    if (!author || !author.privateKey || typeof author.pubkeyHex !== 'string') {
-      throw new UnpubError(ErrorCodes.UNPUB_SIGN_FAILED,
-        'peer.unpub: an unpub must be signed by the topic owner — pass { signWith } (the owner author key)',
-        { context: { topic: desc.name } });
-    }
-    if (author.pubkeyHex.toLowerCase() !== desc.owner) {
-      throw new UnpubError(ErrorCodes.UNPUB_SIGN_FAILED,
-        'peer.unpub: signer is not the topic owner',
-        { context: { topic: desc.name } });
-    }
-    const am = this._requireAxonaManager('unpub');
-    let unpub;
-    try {
-      unpub = await buildUnpub({
-        topicId:     desc.topicId,
-        topicName:   desc.name,
-        ownerNodeId: desc.owner,         // v0.3: the owner is the Author ID (public key)
-        destroy:     opts.destroy === true,
-        seq:         this._nextPubSeq(),
-        identity:    author,
-      });
-    } catch (cause) {
-      throw new UnpubError(ErrorCodes.UNPUB_SIGN_FAILED,
-        `peer.unpub: signing the unpub failed (${cause.message})`,
-        { cause, context: { topic: desc.name } });
-    }
-    am.pubsubUnpub(desc.topicIdBig, unpub);
-    return { ok: true };
-  }
+  // peer.unpub() — REMOVED in v4.3.0 (decision 2026-06-25: keep kill, drop unpub).
+  // It was a thin cache-clear, not a real owner topic-tombstone (no propagation, a
+  // surviving replica or a new publish resurrected the feed). Per-message retraction
+  // is peer.kill(); a whole feed is retired by killing its messages or letting the
+  // 24h TTL expire. If atomic owner feed-destroy is ever needed, build it properly as
+  // an owner-signed topic-tombstone — don't revive this.
 
   /**
    * Subscribe to `topic`.  Handler is invoked with the full envelope
@@ -1682,7 +1631,7 @@ export class AxonaPeer extends DHT {
     this._subscriptions.get(topicIdBig).add(sub);
     this._installDeliveryHook(am);
 
-    am.pubsubSubscribe(topicIdBig);
+    am.pubsubSubscribe(topicIdBig, { replayLatest: opts.since === 'latest' });
     this._markPersistDirty('subscriptions');
     return sub;
   }
@@ -1908,78 +1857,66 @@ export class AxonaPeer extends DHT {
   }
 
   /**
-   * Aggregate counters for a topic across the K-closest relay tree.
+   * One-shot read of a topic's latest metrics snapshot. Works for BOTH open and
+   * owned data topics (their metric topic is open + advisory either way).
    *
-   * Returns an object `{ publishes, subscribers, deliveries, pulls,
-   * reshares, relayCount }`.  Sums per-post counters across all relays
-   * that respond; `relayCount` is the number of distinct responding
-   * relays so callers can sanity-check coverage.
-   *
-   * Note: today's AxonaManager enforces a publisher-only ownership
-   * check on metrics requests — only the topic's publisher gets a
-   * non-empty result.  Removing that check (so any peer can audit)
-   * is queued as a kernel-side cleanup.
+   * Mechanism (kernel v4.3.0): metrics are no longer scatter-gathered — the topic's
+   * root PUBLISHES a signed snapshot to metricTopic(dataId) every ~20s (the relay
+   * fleet runs this publisher). This call briefly subscribes to that metric topic and
+   * returns the freshest snapshot via replay-on-subscribe. For a live dashboard,
+   * **prefer `sub(metricTopic(dataId), …)` directly** (one subscription, latest +
+   * rolling history) — this one-shot is a convenience.
    *
    * @param {string} topic
-   * @param {object} opts
-   * @param {string} opts.publisher  66-char hex node ID of the topic owner
-   * @param {number} [opts.timeoutMs=500]
-   * @returns {Promise<{ publishes: number, current_count: number, subscribers: number, deliveries: number, pulls: number, reshares: number, relayCount: number }>}
-   *   `current_count` is the number of published events currently retained
-   *   (live, non-expired, non-killed) in the topic's tree — the max reported
-   *   across responding root relays.  `subscribers` is the max direct-child
-   *   count reported by any single responding relay — exact for an unsplit
-   *   topic (single root), a lower bound once the tree has split into sub-axons.
+   * @param {object} [opts]
+   * @param {number} [opts.timeoutMs=1500]  how long to wait for a snapshot
+   * @returns {Promise<{ current_count:number, subscribers:number, bytes:number,
+   *   publishes:number, ts:number|null, signer:string|null, stale:boolean }>}
+   *   `current_count` = live (non-expired/non-killed) retained posts; `subscribers`
+   *   = the publishing root's direct-child count (a lower bound once the tree splits);
+   *   `stale:true` ⇒ no snapshot seen (no metrics publisher is rooting this topic).
+   *   Advisory: the metric topic is open, so check `signer` if you need provenance.
    */
-  async metrics(topic, { timeoutMs = 500 } = {}) {
-    const desc = await this._resolveReadTopic(topic, 'metrics');
-    const am = this._requireAxonaManager('metrics');
-    if (typeof am.requestMetrics !== 'function') {
-      return { publishes: 0, subscribers: 0, deliveries: 0, pulls: 0, reshares: 0, relayCount: 0 };
-    }
-    const topicIdBig = desc.topicIdBig;
-    const responses = await am.requestMetrics(topicIdBig, null, { timeoutMs });
-
-    let deliveries = 0, pulls = 0, reshares = 0, publishes = 0;
-    let subscribers = 0, current_count = 0;
-    const relayIds = new Set();
-    for (const resp of (responses ?? [])) {
-      if (resp?.responderId) relayIds.add(resp.responderId);
-      const entries = resp?.entries ?? [];
-      publishes = Math.max(publishes, entries.length);    // distinct post hashes seen
-      for (const c of entries) {
-        deliveries += c.delivery_count ?? 0;
-        pulls      += c.pull_count     ?? 0;
-        reshares   += c.reshare_count  ?? 0;
-      }
-      if (typeof resp?.subscribers === 'number') {
-        subscribers = Math.max(subscribers, resp.subscribers);
-      }
-      // current_count: live (non-expired, non-killed) messages a relay is
-      // holding for this topic right now.  Each root replica holds the same
-      // queue, so the max across responders is the tree's current count.
-      if (typeof resp?.current_count === 'number') {
-        current_count = Math.max(current_count, resp.current_count);
-      }
-    }
+  async metrics(topic, { timeoutMs = 1500 } = {}) {
+    const desc   = await this._resolveReadTopic(topic, 'metrics');
+    const mTopic = metricTopic(desc.topicId);     // open, derived; same for owned + open data topics
+    // Read the latest published snapshot: briefly sub the metric topic (since:'all'
+    // → the root replays its cached snapshots immediately) and keep the freshest.
+    let best = null;
+    let handle = null;
+    await new Promise((resolve) => {
+      const timer = setTimeout(resolve, timeoutMs);
+      this.sub(mTopic, (env) => {
+        let s = env?.message;
+        if (typeof s === 'string') { try { s = JSON.parse(s); } catch { return; } }
+        if (!s || typeof s !== 'object') return;
+        const ts = Number(s.ts ?? env?.publishTs ?? 0);
+        // Prefer the envelope's cryptographic signer over the self-asserted body field.
+        const signer = env?.signerPubkey ?? s.signer ?? null;
+        if (!best || ts >= best._ts) best = { ...s, signer, _ts: ts };
+        clearTimeout(timer); resolve();                 // first (replayed-latest) is enough
+      }, { since: 'all' }).then((h) => { handle = h; }).catch(() => { clearTimeout(timer); resolve(); });
+    });
+    try { if (handle && typeof handle.stop === 'function') await handle.stop(); } catch { /* */ }
     return {
-      publishes,
-      current_count,
-      subscribers,
-      deliveries,
-      pulls,
-      reshares,
-      relayCount: relayIds.size,
+      current_count: best?.current_count ?? 0,
+      subscribers:   best?.subscribers   ?? 0,
+      bytes:         best?.bytes          ?? 0,
+      publishes:     best?.publishes      ?? 0,   // present only if the publisher tracks it; else 0
+      ts:            best?.ts             ?? null,
+      signer:        best?.signer         ?? null,
+      stale:         best == null,                 // true ⇒ no snapshot seen (no metrics publisher for this topic)
     };
   }
 
   /**
    * Enumerate the topics this peer currently ROOTS, each with its signed topic
    * descriptor and a locally-computed metric snapshot — synchronous, no network
-   * (unlike metrics(), which scatter-gathers the K roots). The read side of the
+   * (metrics() reads the published snapshot instead). The producer side of the
    * derived-metric-topic convention (`metricTopic()`): an infrastructure root
-   * walks this on a timer, skips metric topics + non-open topics, and
-   * republishes each open topic's snapshot to metricTopic(topicId).
+   * walks this on a timer, skips only metric topics (recursion guard), and
+   * republishes each topic's snapshot to metricTopic(topicId) — owned AND open
+   * (v4.3.0: owned topics' metrics are public too, so anyone can subscribe).
    *
    * @returns {Array<{ topicId:string, descriptor:object|null,
    *                   current_count:number, subscribers:number, bytes:number }>}
@@ -2637,8 +2574,12 @@ export class AxonaPeer extends DHT {
       return;
     }
     if (since === 'latest') {
-      // Approximate: ask for the most recent ~1s of cache + future.
-      am._lastSeenTsByTopic.set(topicId, Date.now() - 1000);
+      // The newest retained message regardless of age + live tail. The floor is
+      // "future only" (now); the root replays the single newest cache entry via
+      // the replayLatest flag (set in sub()). The pre-v4.3.0 `now - 1000` was a
+      // 1-second cache window that MISSED any message last published more than
+      // ~1s before subscribe — the "subscribe latest, no callback" bug.
+      am._lastSeenTsByTopic.set(topicId, Date.now());
       return;
     }
     if (typeof since === 'number') {

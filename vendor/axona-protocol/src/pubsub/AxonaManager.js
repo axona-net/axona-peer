@@ -97,7 +97,7 @@ const T = {
   PULLUP:   'pubsub:pullup',    // "I'm behind you — replay your stamped history up to me" (§6)
   REPLAYUP: 'pubsub:replayup',  // a relay's stamped cache delta, routed UP to a behind parent
   KILL:     'pubsub:kill',      // retract a message (thin; TODO Phase 4)
-  UNPUB:    'pubsub:unpub',     // retract a topic's feed (thin; TODO Phase 4)
+  UNPUB:    'pubsub:unpub',     // RESERVED — removed v4.3.0 (no handler/sender); wire string kept so legacy frames are ignored, not misrouted
   TOUCH:    'pubsub:touch',     // extend TTL (thin; TODO Phase 4)
   PULL:     'pubsub:pull',      // on-demand fetch request — routed toward topic id
   PULLRESP: 'pubsub:pullresp',  // pull response — routed back toward the requester id
@@ -194,8 +194,7 @@ export class AxonaManager {
     on(T.PULLUP,   this._onPullUp);
     on(T.REPLAYUP, this._onReplayUp);
     on(T.KILL,     this._onKill);
-    on(T.UNPUB,    this._onUnpub);
-    on(T.TOUCH,    this._onTouch);
+    on(T.TOUCH,    this._onTouch);   // no-op (peer.touch deprecated v4.3.0); kept for wire compat
     on(T.PULL,     this._onPull);
     on(T.PULLRESP, this._onPullResp);
     on(T.ROOTBEACON, this._onRootBeacon);
@@ -264,7 +263,7 @@ export class AxonaManager {
     // The root's own renewal self-loops here. Don't seat self as a subscriber
     // (no self-fan); just replay locally if the app subscribes.
     if (idBig(subHex) === this.nodeId) {
-      if (this.mySubscriptions.has(topicBig)) this._replayLocal(role, since);
+      if (this.mySubscriptions.has(topicBig)) this._replayLocal(role, since, !!payload.latest);
       return 'consumed';
     }
     // Durability (§6 stamped-replay-up): if this subscriber holds newer stamped
@@ -274,7 +273,7 @@ export class AxonaManager {
     if (Number.isFinite(payload.hw) && payload.hw > myHw) {
       this._route(idBig(subHex), T.PULLUP, { topicId: idHex(topicBig), sinceHw: myHw, parentId: idHex(this.nodeId) });
     }
-    this._accept(role, subHex, since);
+    this._accept(role, subHex, since, !!payload.latest);
     return 'consumed';
   }
 
@@ -293,11 +292,14 @@ export class AxonaManager {
   }
 
   // Seat a subscriber on a relay, delegating to a child when over capacity.
-  _accept(role, subHex, since) {
+  // `latest` (since:'latest') folds the newest cache entry into the replay
+  // DELIVER regardless of age — served from here (we hold the cache) even when
+  // the subscriber is then delegated downward for ongoing fan-out.
+  _accept(role, subHex, since, latest = false) {
     const existing = role.subscribers.get(subHex);
     if (existing) {                                   // renewal of a current subscriber
       existing.lastRenewed = this._now();
-      this._replayTo(role, subHex, since, false);
+      this._replayTo(role, subHex, since, false, latest);
       return;
     }
     if (role.subscribers.size >= this.maxDirect) {    // overloaded → delegate
@@ -307,12 +309,16 @@ export class AxonaManager {
       // newcomer down to the child XOR-closest to it.
       if (!this._promoteChild(role)) {
         const c = this._pickChild(role, subHex);
-        if (c) { this._delegateTo(c, role, [{ subscriberId: subHex, since }]); return; }
+        if (c) {
+          if (latest) this._replayTo(role, subHex, since, false, true);  // current value from here, then hand off
+          this._delegateTo(c, role, [{ subscriberId: subHex, since }]);
+          return;
+        }
         // neither possible (no leaf to promote, no child) → seat over capacity
       }
     }
     role.subscribers.set(subHex, { since: Number.isFinite(since) ? since : 0, lastRenewed: this._now() });
-    this._replayTo(role, subHex, since, true);        // delta + a via-repin ping
+    this._replayTo(role, subHex, since, true, latest);  // delta (+ newest if latest) + a via-repin ping
   }
 
   // Choose the child relay XOR-closest to a subscriber (keyspace locality).
@@ -522,10 +528,16 @@ export class AxonaManager {
   // Replay the cache delta (publishTs > since) to one subscriber, chunked by
   // bytes. `ping` forces a (possibly empty) deliver so a freshly-seated
   // subscriber repins to us even when the cache has nothing newer.
-  _replayTo(role, subHex, sinceTs, ping) {
+  // `latest` (since:'latest') also includes the single NEWEST retained entry
+  // regardless of age — folded into this same DELIVER, no extra message. The
+  // ts-floor delta can't express "newest regardless of age": a current value
+  // published before the subscriber's now-anchored floor sits below it and is
+  // filtered out (the "subscribe latest → no callback" bug). Receiver dedups.
+  _replayTo(role, subHex, sinceTs, ping, latest = false) {
     const subBig = idBig(subHex);
     const isSelf = subBig === this.nodeId;
     let batch = [], bytes = 0, sent = false;
+    const inBatch = new Set();
     const flush = () => {
       if (!batch.length) return;
       sent = true;
@@ -538,7 +550,15 @@ export class AxonaManager {
       if (c.publishTs <= sinceTs) continue;
       if (bytes + c.bytes > REPLAY_CHUNK_BYTES) flush();
       batch.push({ json: c.json, publishTs: c.publishTs, msgId: c.msgId });
+      inBatch.add(c.msgId);
       bytes += c.bytes;
+    }
+    if (latest && role.cache.length) {               // ensure the current value rides along
+      const newest = role.cache[role.cache.length - 1];
+      if (!inBatch.has(newest.msgId)) {
+        if (bytes + newest.bytes > REPLAY_CHUNK_BYTES) flush();
+        batch.push({ json: newest.json, publishTs: newest.publishTs, msgId: newest.msgId });
+      }
     }
     flush();
     if (ping && !sent && !isSelf) {                    // repin even with no history
@@ -546,8 +566,13 @@ export class AxonaManager {
     }
   }
 
-  _replayLocal(role, sinceTs) {
-    for (const c of role.cache) if (c.publishTs > sinceTs) this._deliverToApp(role.topicId, c.json, c.msgId, c.publishTs);
+  _replayLocal(role, sinceTs, latest = false) {
+    const seen = new Set();
+    for (const c of role.cache) if (c.publishTs > sinceTs) { this._deliverToApp(role.topicId, c.json, c.msgId, c.publishTs); seen.add(c.msgId); }
+    if (latest && role.cache.length) {               // since:'latest' — newest regardless of age
+      const newest = role.cache[role.cache.length - 1];
+      if (!seen.has(newest.msgId)) this._deliverToApp(role.topicId, newest.json, newest.msgId, newest.publishTs);
+    }
   }
 
   // ── cache ────────────────────────────────────────────────────────────
@@ -763,11 +788,17 @@ export class AxonaManager {
   }
   _emitSubscribe(topicBig, via) {
     const role = this.axonRoles.get(topicBig);
+    const sub  = this.mySubscriptions.get(topicBig);
+    const latest = !!(sub && sub.replayLatest);   // since:'latest' — newest entry rides this DELIVER, regardless of age
     this._send(T.SUB, {
       topicId: idHex(topicBig), via, subscriberId: idHex(this.nodeId),
       since: this._sinceFor(topicBig),
       hw: role ? this._highWater(role) : 0,   // a cache-bearing relay advertises its history (§6)
+      latest,
     });
+    // One-shot: 'latest' delivers the current value once at subscribe, not on
+    // every renewal — clear the flag after this first emit.
+    if (latest) sub.replayLatest = false;
   }
 
   // ── public API (contract surface) ────────────────────────────────────
@@ -782,10 +813,16 @@ export class AxonaManager {
     return meta.postHash || '';
   }
 
-  pubsubSubscribe(topicId) {
+  pubsubSubscribe(topicId, opts = {}) {
     const seeded = this._lastSeenTsByTopic.get(topicId);
     const since  = Number.isFinite(seeded) ? seeded : this._now();
-    this.mySubscriptions.set(topicId, { since, lastRenewSent: this._now(), interval: this.renewFastMs });
+    // since:'latest' → carry a replayLatest flag so the root replays its newest
+    // cache entry regardless of age (the ts-floor can't express "newest"). Sticky
+    // across renewals (re-delivery is deduped); cleared by a later non-latest sub.
+    this.mySubscriptions.set(topicId, {
+      since, lastRenewSent: this._now(), interval: this.renewFastMs,
+      replayLatest: !!opts.replayLatest,
+    });
     this._sendSubscribe(topicId);
   }
 
@@ -822,7 +859,7 @@ export class AxonaManager {
   pubsubHostKeyspace(on = true) { this._hostKeyspace = !!on; }
 
   pubsubKill(topicId, kill)   { this._send(T.KILL,  { topicId: idHex(topicId), via: [], kill }); }
-  pubsubUnpub(topicId, unpub) { this._send(T.UNPUB, { topicId: idHex(topicId), via: [], unpub }); }
+  // pubsubUnpub() — REMOVED v4.3.0 (decision 2026-06-25: keep kill, drop unpub)
   pubsubTouch(topicId, touch) { this._send(T.TOUCH, { topicId: idHex(topicId), via: [], touch }); }
 
   requestPull(topicId, postHash = null, { timeoutMs = 1000 } = {}) {
@@ -868,14 +905,7 @@ export class AxonaManager {
     if (msgId) this._applyDelete(role, topicBig, { del: true, msgId, topic: payload.kill?.topic ?? null, publishTs: this._now() });
     return 'consumed';
   }
-  _onUnpub(payload, meta) {
-    const d = this._topicDecision(payload, meta);
-    if (d === 'forward') return;
-    if (d === 'reroute') { this._reroute(T.UNPUB, payload); return 'consumed'; }
-    const role = this.axonRoles.get(idBig(payload.topicId));
-    if (role) { role.cache = []; role.cacheIds.clear(); role.cacheBytes = 0; }
-    return 'consumed';
-  }
+  // _onUnpub — REMOVED v4.3.0 (keep kill, drop unpub)
   _onTouch(payload, meta) {
     const d = this._topicDecision(payload, meta);
     if (d === 'forward') return;
