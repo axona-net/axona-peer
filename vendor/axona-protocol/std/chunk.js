@@ -185,9 +185,11 @@ const DEFAULT_PUBLISH_THROTTLE_MS = 12;
  *
  * `verify` defaults true and is BEST-EFFORT: it never throws and never makes a
  * transfer worse (it only ever re-publishes gaps it positively observes). It
- * briefly subscribes to `topic` to read it back, so don't pre-subscribe the
- * publishing peer to the same transfer topic (the intended use — a fresh topic).
- * Set `verify:false` for loopback/tests where the publisher is also the consumer.
+ * briefly subscribes to `topic` to read it back and stops ONLY that read-back
+ * handle when done, so it is SAFE to pre-subscribe the publishing peer to the
+ * same topic — a persistent app subscription on this topic (e.g. a streaming
+ * channel's reassembler) survives the verify pass untouched. (Set `verify:false`
+ * only to skip the read-back entirely, e.g. a one-shot loopback test.)
  *
  * @returns {Promise<{ topic, fileId, n, msgIds: string[], repaired: number }>}
  */
@@ -233,8 +235,9 @@ export async function publishChunkedBytes(peer, bytes, {
 async function _cachedChunkSet(peer, topic, fileId, n, waitMs) {
   const have = new Set();
   const complete = () => { if (!have.has('m')) return false; for (let i = 0; i < n; i++) if (!have.has(i)) return false; return true; };
+  let handle = null;
   try {
-    await peer.sub(topic, (env) => {
+    handle = await peer.sub(topic, (env) => {
       if (!env || env.deleted) return;
       const m = env.message;
       if (!m || m.f !== CHUNK_FORMAT || m.id !== fileId) return;
@@ -244,7 +247,13 @@ async function _cachedChunkSet(peer, topic, fileId, n, waitMs) {
     const deadline = Date.now() + waitMs;
     while (Date.now() < deadline && !complete()) await delay(60);
   } finally {
-    try { await peer.unsub?.(topic); } catch { /* */ }
+    // Stop ONLY this read-back subscription's own handle — NOT peer.unsub(topic),
+    // which stops EVERY subscription on the topic and would tear down a caller's
+    // pre-existing persistent subscription (e.g. an app holding a live channel
+    // reassembler on the same topic it publishes to — axona-share). sub.stop()
+    // removes just this handle; the network unsubscribe only fires if it was the
+    // last sub on the topic. Fall back to unsub only if no handle was returned.
+    try { if (handle && typeof handle.stop === 'function') await handle.stop(); else await peer.unsub?.(topic); } catch { /* */ }
   }
   return have;
 }
@@ -262,12 +271,13 @@ export async function receiveChunkedBytes(peer, topic, {
   timeoutMs = 30000, onProgress = null,
 } = {}) {
   return new Promise((resolve, reject) => {
-    let settled = false, timer = null;
+    let settled = false, timer = null, handle = null;
     const reassembler = createReassembler((file) => finish(null, file), { onProgress });
     const finish = async (err, file) => {
       if (settled) return; settled = true;
       if (timer) clearTimeout(timer);
-      try { await peer.unsub?.(topic); } catch { /* */ }
+      // Stop only our own handle, never peer.unsub(topic) — see _cachedChunkSet.
+      try { if (handle && typeof handle.stop === 'function') await handle.stop(); else await peer.unsub?.(topic); } catch { /* */ }
       err ? reject(err) : resolve(file);
     };
     timer = setTimeout(() => {
@@ -278,7 +288,7 @@ export async function receiveChunkedBytes(peer, topic, {
     peer.sub(topic, (envelope) => {
       if (!envelope || envelope.deleted) return;
       reassembler.accept(envelope.message);
-    }, { since: 'all' }).catch((e) => finish(e));
+    }, { since: 'all' }).then((h) => { handle = h; if (settled) { try { h?.stop?.(); } catch { /* */ } } }).catch((e) => finish(e));
   });
 }
 

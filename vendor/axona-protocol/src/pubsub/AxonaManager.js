@@ -55,8 +55,16 @@ export const MAX_PUBLISH_BYTES = 256 * 1024;         // absolute hard ceiling (c
 export const MAX_RELIABLE_PUBLISH_BYTES = 15 * 1024; // WebRTC-interop reliable floor (O-5)
 
 // ── Tunable constants (design §Appendix) ────────────────────────────────
-const RENEW_MS        = 60_000;          // re-subscribe cadence
-const DROP_MS         = 180_000;         // evict a subscriber after 3 missed renewals
+const RENEW_MS        = 60_000;          // re-subscribe cadence CEILING (stable state)
+// Adaptive renewal (churn re-home fix): a subscriber re-homes only when it renews,
+// so the renewal interval IS the orphan window after its relay/root churns. A flat
+// 60s is too slow for mobile churn; a flat 5s is 12× the steady-state traffic. So
+// renew FAST right after subscribing or after a relay change (re-pin), backing off
+// ×1.5 toward the ceiling while stable. Sustained churn keeps re-pinning → stays
+// fast (measured ~82% delivery @30%/round vs 43% at 60s); calm → backs off → cheap.
+const RENEW_FAST_MS   = 5_000;           // adaptive floor: initial + post-re-home interval
+const RENEW_BACKOFF   = 1.5;             // multiply the interval each stable renewal, up to RENEW_MS
+const DROP_MS         = 180_000;         // evict a subscriber after missed renewals (≥ 3× ceiling)
 const CACHE_MAX       = 1024;            // messages cached per relay
 const CACHE_BYTES     = 16 * 1024 * 1024;// byte ceiling on a relay's cache
 const MAX_DIRECT      = 20;              // direct subscribers before a relay delegates
@@ -127,9 +135,10 @@ export class AxonaManager {
     dht,
     now = () => Date.now(),
     emitLog = null,
-    renewMs = RENEW_MS,
+    renewMs = RENEW_MS,            // adaptive renewal CEILING (stable state)
+    renewFastMs = RENEW_FAST_MS,   // adaptive renewal FLOOR (post-subscribe / post-re-home)
     dropMs = DROP_MS,
-    refreshIntervalMs = 10_000,
+    refreshIntervalMs = 5_000,     // tick — must be ≤ renewFastMs so fast renewal can fire
     replayCacheSize = CACHE_MAX,
     replayCacheBytes = CACHE_BYTES,
     maxDirect = MAX_DIRECT,
@@ -144,7 +153,8 @@ export class AxonaManager {
     this._now   = now;
     this._logSink = (typeof emitLog === 'function') ? emitLog : null;
 
-    this.renewMs   = renewMs;
+    this.renewMs     = renewMs;          // adaptive ceiling
+    this.renewFastMs = renewFastMs;      // adaptive floor
     this.dropMs    = dropMs;
     this.maxDirect = maxDirect || MAX_DIRECT;
     this.refreshIntervalMs = refreshIntervalMs;
@@ -474,7 +484,18 @@ export class AxonaManager {
   _onDeliver(payload, meta) {
     if (meta.targetId !== this.nodeId) return;        // forward (intermediate hop)
     const topicBig = idBig(payload.topicId);
-    if (payload.from) this._upstream.set(topicBig, [lc(payload.from)]);  // pin to our relay
+    if (payload.from) {
+      const fromHex = lc(payload.from);
+      const prev = this._upstream.get(topicBig);
+      // Re-pin to our relay. If the relay CHANGED (re-home after a churn), snap the
+      // adaptive renewal interval back to fast — so we monitor the new attachment
+      // closely and re-home quickly again if it too churns (the mobile common case).
+      if ((!prev || prev[0] !== fromHex)) {
+        const s = this.mySubscriptions.get(topicBig);
+        if (s) s.interval = this.renewFastMs;
+      }
+      this._upstream.set(topicBig, [fromHex]);
+    }
 
     const role = this.axonRoles.get(topicBig);        // set iff I'm a relay → re-fan
     for (const m of (Array.isArray(payload.msgs) ? payload.msgs : [])) {
@@ -764,7 +785,7 @@ export class AxonaManager {
   pubsubSubscribe(topicId) {
     const seeded = this._lastSeenTsByTopic.get(topicId);
     const since  = Number.isFinite(seeded) ? seeded : this._now();
-    this.mySubscriptions.set(topicId, { since, lastRenewSent: this._now() });
+    this.mySubscriptions.set(topicId, { since, lastRenewSent: this._now(), interval: this.renewFastMs });
     this._sendSubscribe(topicId);
   }
 
@@ -905,7 +926,12 @@ export class AxonaManager {
       const role = this.axonRoles.get(t);
       if (role && role.isRoot) continue;
       const s = this.mySubscriptions.get(t);
-      if (s) { if (now - s.lastRenewSent < this.renewMs) continue; s.lastRenewSent = now; }
+      if (s) {
+        const iv = s.interval || this.renewFastMs;
+        if (now - s.lastRenewSent < iv) continue;
+        s.lastRenewSent = now;
+        s.interval = Math.min(this.renewMs, Math.round(iv * RENEW_BACKOFF));   // back off toward ceiling while stable
+      }
       this._sendSubscribe(t);
     }
     for (const t of this._hostedTopics) {
@@ -928,7 +954,18 @@ export class AxonaManager {
       // non-root child relay with no subscribers carries only redundant cache (the
       // root has it) so it may tear down immediately.
       const holdsHistory = role.isRoot && role.cache.length > 0;
-      if (role.subscribers.size === 0 && !holdsHistory && !this.mySubscriptions.has(t) && !this._hostedTopics.has(t)) {
+      // KEYSPACE HOSTING ("host whatever lands near me"): a node with keyspace
+      // hosting on retains any topic it has become ROOT for — even with zero
+      // current subscribers and an empty cache — so it stays an always-on,
+      // durable home/convergence-anchor for topics in its keyspace neighborhood.
+      // Without this the role is torn down the instant its cache empties, so the
+      // no-arg host() volunteers nothing in the routing-only kernel (the relay
+      // fleet's default mode). Root-ness is still decided by ROUTING (this only
+      // protects roles the node legitimately won as terminus); the set is bounded
+      // by the node's keyspace share of topics that actually see traffic.
+      // TODO(Phase 4): age out keyspace-pinned empty roles after a long idle TTL.
+      const keyspacePinned = this._hostKeyspace && role.isRoot;
+      if (role.subscribers.size === 0 && !holdsHistory && !keyspacePinned && !this.mySubscriptions.has(t) && !this._hostedTopics.has(t)) {
         this.axonRoles.delete(t);
         this._upstream.delete(t);
       }
