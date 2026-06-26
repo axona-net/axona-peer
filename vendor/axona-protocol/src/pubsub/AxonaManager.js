@@ -73,6 +73,7 @@ const MAX_VIA         = 8;               // ordered-waypoint list length cap (wi
 const VIA_HOP_BUDGET  = 8;               // hops per via leg (enforced kernel-side, Phase 2+)
 const TTL_MS          = 24 * 60 * 60 * 1000;   // 24h message hold, keyed on the ROOT timestamp
 const APP_DEDUP_MAX   = 8192;            // exactly-once app-delivery LRU
+const PENDING_PUB_TTL_MS = 30_000;       // retain a recent publish this long so it can be re-sent toward the true root once a background lookup resolves (covers a stranded one-shot publish; idempotent — root dedups by msgId)
 const REPLAY_CHUNK_BYTES = 96 * 1024;    // byte budget per replay deliver batch
 const FUTURE_TOLERANCE_MS = 5 * 60 * 1000;   // §5 bad-clock rule: drop replayed stamps this far ahead
 
@@ -705,11 +706,19 @@ export class AxonaManager {
               if (h !== lc(idHex(this.nodeId))) hex = h;
             }
             this._rootHint.set(topicBig, { via: hex, at: this._now() });
-            // Heal: subscribed, not yet pinned (no deliver `from` adopted us), and
-            // the true root is someone else → re-home toward it now.
+            // Heal (subscribe): subscribed, not yet pinned (no deliver `from`
+            // adopted us), and the true root is someone else → re-home toward it.
             if (hex && this.mySubscriptions.has(topicBig) &&
                 !(this._upstream.get(topicBig) || []).length) {
               this._emitSubscribe(topicBig, [hex]);
+            }
+            // Heal (publish): a recent publish may have stranded on the greedy
+            // walk → re-send it toward the now-known root, once. Idempotent
+            // (root dedups by msgId); then drop it so we don't re-send forever.
+            const pend = this._pendingPub && this._pendingPub.get(topicBig);
+            if (hex && pend && (this._now() - pend.at) < PENDING_PUB_TTL_MS) {
+              this._send(T.PUB, { topicId: idHex(topicBig), via: [hex], json: pend.json });
+              this._pendingPub.delete(topicBig);
             }
           })
           .catch(() => { /* resolve failed → greedy stays in effect */ })
@@ -725,7 +734,7 @@ export class AxonaManager {
   // publish, never re-routing). NEVER hangs: on timeout it returns and the caller
   // proceeds greedy, with the background _rootHint_ heal still applying. Cheap in
   // steady state — a fresh cached hint or a live beacon short-circuits immediately.
-  async warmRootHint(topicBig, timeoutMs = 1500) {
+  async warmRootHint(topicBig, timeoutMs = 2500) {
     const beacon = this._rootBeacons.get(topicBig);
     if (beacon && this._now() < beacon.exp) return;
     const cached = this._rootHint.get(topicBig);
@@ -851,6 +860,12 @@ export class AxonaManager {
   // the publish on a slow live-mesh lookup.
   pubsubPublish(topicId, json, meta = {}) {
     const hint = this._rootHint_(topicId);
+    // Retain briefly so a publish that stranded on the greedy walk (hint not yet
+    // warm) is re-sent toward the true root the moment the background lookup
+    // resolves — a one-shot publish never re-routes on its own, so a cold-hint
+    // strand = a lost message. Idempotent: the root dedups by msgId.
+    if (!this._pendingPub) this._pendingPub = new Map();
+    this._pendingPub.set(topicId, { json, at: this._now() });
     this._send(T.PUB, { topicId: idHex(topicId), via: hint ? [hint] : [], json });
     return meta.postHash || '';
   }
@@ -926,6 +941,7 @@ export class AxonaManager {
     this._lastSeenTsByTopic.clear();
     this._upstream.clear();
     this._rootHint.clear();
+    this._pendingPub?.clear();
     this._lookupInflight?.clear();
     this._rootBeacons.clear();
     this._beaconSeen.clear();

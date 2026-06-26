@@ -3351,6 +3351,21 @@ export class AxonaPeer extends DHT {
       return { consumed: false, atNode: originNode.id, hops: 0, terminal: true };
     }
 
+    // Lazy channel-open on the FIRST hop (v4.3.2): the forwarding path
+    // (route_msg handler) already opens a channel to an unconnected next hop
+    // mid-walk, but the ORIGIN's first send did not — so a pub/sub routed toward
+    // a resolved-but-unconnected root (a gossip-known node in the K-closest set
+    // that isn't yet a mesh peer), and the root's reverse DELIVER toward a
+    // subscriber it isn't connected to, both silently failed → the subscriber
+    // never attached (empty `_upstream`), the dominant residual no-delivery case.
+    // Open the channel first so the routed SUB/PUB/DELIVER traverses a real link.
+    if (typeof originNode.transport.isConnected === 'function'
+        && !originNode.transport.isConnected(nextHopId)
+        && typeof originNode.transport.openConnection === 'function') {
+      try { await originNode.transport.openConnection(nextHopId); }
+      catch { /* fall through; send may still route via the bridge/relay sink */ }
+    }
+
     try {
       // Wire payload `targetId` is hex (per the v1.5 contract; the
       // receiver handles either form, but hex is the canonical wire
