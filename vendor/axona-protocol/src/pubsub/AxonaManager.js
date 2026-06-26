@@ -674,7 +674,20 @@ export class AxonaManager {
     // needed. This is the primary convergence aid (Pubsub-Root-Beacon-v0.1).
     const beacon = this._rootBeacons.get(topicBig);
     if (beacon && this._now() < beacon.exp) return beacon.root;
-    if (typeof this.dht.lookup !== 'function') return null;
+    // The true-root resolver MUST be the iterative K-closest search: it returns the
+    // node XOR-closest to the (virtual) topic id, which is exactly the emergent root.
+    // (Prior bug: this used `dht.lookup(topicBig)`, a find-NODE op that returns
+    // `{ path, hops, found }` — NOT an id — so `idBig(result)` threw, the catch
+    // swallowed it, the hint NEVER seeded, and SUB/PUB fell back to the single-pass
+    // greedy walk forever → it strands before reaching the root → ~0% cross-peer
+    // delivery on any non-trivial mesh. findKClosest(topicBig,1)[0] is the fix.)
+    const resolveClosest =
+      (typeof this.dht.findKClosest === 'function')
+        ? () => this.dht.findKClosest(topicBig, 1).then(a => (a && a.length) ? a[0] : null)
+      : (typeof this.dht.lookup === 'function')
+        ? () => this.dht.lookup(topicBig).then(r => (r && Array.isArray(r.path) && r.path.length) ? r.path[r.path.length - 1] : null)
+        : null;
+    if (!resolveClosest) return null;
     const cached = this._rootHint.get(topicBig);
     const fresh = cached && (this._now() - cached.at) < this.renewMs;
     if (!fresh) {
@@ -682,23 +695,52 @@ export class AxonaManager {
       if (!this._lookupInflight.has(topicBig)) {
         this._lookupInflight.add(topicBig);
         Promise.resolve()
-          .then(() => this.dht.lookup(topicBig))
+          .then(resolveClosest)
           .then(id => {
-            const hex = id != null ? lc(idHex(idBig(id))) : null;
+            // Self-closest → leave the hint null so we route greedily toward the
+            // bare topic id and become root as the terminus (don't via-pin to self).
+            let hex = null;
+            if (id != null) {
+              const h = lc(idHex(idBig(id)));
+              if (h !== lc(idHex(this.nodeId))) hex = h;
+            }
             this._rootHint.set(topicBig, { via: hex, at: this._now() });
             // Heal: subscribed, not yet pinned (no deliver `from` adopted us), and
             // the true root is someone else → re-home toward it now.
             if (hex && this.mySubscriptions.has(topicBig) &&
-                !(this._upstream.get(topicBig) || []).length &&
-                hex !== lc(idHex(this.nodeId))) {
+                !(this._upstream.get(topicBig) || []).length) {
               this._emitSubscribe(topicBig, [hex]);
             }
           })
-          .catch(() => { /* lookup failed → greedy stays in effect */ })
+          .catch(() => { /* resolve failed → greedy stays in effect */ })
           .finally(() => this._lookupInflight.delete(topicBig));
       }
     }
     return cached ? cached.via : null;
+  }
+
+  // Bounded warm of the root hint: await the iterative closest-node resolve up to
+  // timeoutMs and seed the hint, so the FIRST publish/subscribe routes straight to
+  // the true root instead of stranding on the greedy walk (and, for a one-shot
+  // publish, never re-routing). NEVER hangs: on timeout it returns and the caller
+  // proceeds greedy, with the background _rootHint_ heal still applying. Cheap in
+  // steady state — a fresh cached hint or a live beacon short-circuits immediately.
+  async warmRootHint(topicBig, timeoutMs = 1500) {
+    const beacon = this._rootBeacons.get(topicBig);
+    if (beacon && this._now() < beacon.exp) return;
+    const cached = this._rootHint.get(topicBig);
+    if (cached && (this._now() - cached.at) < this.renewMs) return;
+    if (typeof this.dht.findKClosest !== 'function') return;
+    try {
+      const arr = await Promise.race([
+        this.dht.findKClosest(topicBig, 1),
+        new Promise((res) => { const t = setTimeout(() => res(null), timeoutMs); if (t && typeof t.unref === 'function') t.unref(); }),
+      ]);
+      if (Array.isArray(arr) && arr.length) {
+        const h = lc(idHex(idBig(arr[0])));
+        this._rootHint.set(topicBig, { via: (h !== lc(idHex(this.nodeId))) ? h : null, at: this._now() });
+      }
+    } catch { /* greedy fallback; background heal still applies */ }
   }
 
   // ── Root beacon (Pubsub-Root-Beacon-v0.1) ───────────────────────────────

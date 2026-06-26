@@ -65,7 +65,7 @@ export const WIRE_VERSION = '4.0';
  *  own version through; this is just the default. The 4.x line is the
  *  routing-only axonic-tree pub/sub; the partition from 3.x rides on
  *  WIRE_VERSION major (the load-bearing, hermetic gate). */
-export const KERNEL_VERSION = '4.3.0';
+export const KERNEL_VERSION = '4.3.1';
 
 /** WebSocket close code for version mismatches (custom, in the
  *  application-specific 4000-4999 range). */

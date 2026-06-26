@@ -1465,6 +1465,14 @@ export class AxonaPeer extends DHT {
         { context: { topic: desc.name, size: json.length, max: this._maxPublishBytes } });
     }
 
+    // Lookup-assisted publish (v4.3.1): warm the true-root hint before the first
+    // publish so the PUB routes straight to the topic's emergent root instead of
+    // stranding on the single-pass greedy walk (a one-shot publish never re-routes,
+    // so a cold-hint strand = lost message). Bounded; no-op once warm.
+    if (typeof am.warmRootHint === 'function') {
+      try { await am.warmRootHint(desc.topicIdBig); } catch { /* proceed greedy */ }
+    }
+
     // postHash = envelope.msgId makes the replay cache searchable by content hash
     // for peer.pull (A3). v0.3: no publisher anchor, no publishId — dedup is the
     // content-addressed msgId; placement is the topic id's region byte.
@@ -1630,6 +1638,13 @@ export class AxonaPeer extends DHT {
     if (!this._subscriptions.has(topicIdBig)) this._subscriptions.set(topicIdBig, new Set());
     this._subscriptions.get(topicIdBig).add(sub);
     this._installDeliveryHook(am);
+
+    // Lookup-assisted subscribe (v4.3.1): warm the true-root hint so the SUBSCRIBE
+    // routes straight to the topic's emergent root (and replay lands), instead of
+    // relying solely on the post-strand background heal. Bounded; no-op once warm.
+    if (typeof am.warmRootHint === 'function') {
+      try { await am.warmRootHint(topicIdBig); } catch { /* proceed greedy + heal */ }
+    }
 
     am.pubsubSubscribe(topicIdBig, { replayLatest: opts.since === 'latest' });
     this._markPersistDirty('subscriptions');
