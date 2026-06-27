@@ -1034,7 +1034,12 @@ export class AxonaManager {
       this._sendSubscribe(t);
     }
     for (const t of this._hostedTopics) {
-      this._send(T.SUB, { topicId: idHex(t), via: [], subscriberId: idHex(this.nodeId), since: now });
+      // Route hosted re-announce through _sendSubscribe so it (a) renews toward the
+      // current root via _upstream and (b) advertises our high-water (§6). The old
+      // raw send omitted `hw`, so a cache-bearing host never told a freshly-promoted
+      // root it held history → the root never issued PULLUP and the cache stayed
+      // stranded below an empty root (lost on the original root's departure).
+      this._sendSubscribe(t);
     }
 
     // 2. Evict stale subscribers; expire cache + tombstones; tear down a role
