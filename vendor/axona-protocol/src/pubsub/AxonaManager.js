@@ -798,6 +798,17 @@ export class AxonaManager {
         if (role && role.isRoot && rootBig !== this.nodeId) {
           role.isRoot = false;
           this._upstream.set(tBig, [lc(payload.root)]);
+          // Pinning upstream is not enough: the new root must REGISTER us as a
+          // downstream child or it can't fan deliveries back down to us (and our
+          // subtree). Every other _upstream write is paired with a confirming
+          // subscribe-k (_onAdopt → _sendSubscribe; deliver-`from` is self-proving)
+          // — this beacon-demotion path was the lone exception, leaving a
+          // one-sided link: we renew toward the root, but the root never adopts
+          // us, so _fanout (over role.subscribers) skips our branch entirely.
+          // Symptom: chained sub→relay→root delivers 0 to the relay's subtree
+          // while the root caches the message (root subs=0, cache>0). Emit the
+          // subscribe-k now so the new root seats us and the tree fans down.
+          this._sendSubscribe(tBig);
         }
       }
     }
