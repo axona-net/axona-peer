@@ -216,10 +216,14 @@ export function webTransport({
         // re-clears the gate without bespoke caller logic.
         try {
           socket.send(JSON.stringify({
-            type:        'client-hello',
-            version:     peerVersion || KERNEL_VERSION,
-            wireVersion: WIRE_VERSION,   // major-compat axis; the bridge gate
-                                         // rejects a mismatched major (4426)
+            type:          'client-hello',
+            version:       peerVersion || KERNEL_VERSION,
+            wireVersion:   WIRE_VERSION,   // major-compat axis; the bridge gate
+                                           // rejects a mismatched major (4426)
+            kernelVersion: KERNEL_VERSION, // exact kernel build; lets a bridge
+                                           // enforce a MIN_KERNEL_VERSION floor
+                                           // (STRICT_VERSION island) independent
+                                           // of the app's own `version`
             ...(meshRelay ? { capabilities: ['mesh-relay'] } : {}),
           }));
         } catch (err) {
