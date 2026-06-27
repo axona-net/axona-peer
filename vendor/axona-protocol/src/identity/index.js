@@ -27,6 +27,7 @@ import {
   verify,
 }                                       from '../pubsub/ed25519.js';
 import { computeNodeId }                from './nodeid.js';
+import { AUTHOR_ID_BITS, AUTHOR_HEX_CHARS, getKeyspace } from '../utils/hexid.js';
 import { IdentityError, ErrorCodes }    from '../errors.js';
 import { powMint, powVerify }           from '../pow/pow.js';
 
@@ -74,10 +75,35 @@ const ALGORITHM = { name: 'Ed25519' };
  *        should pass `false` so XSS can't exfiltrate the signing key (H4).
  * @returns {Promise<Identity>}
  */
-export async function createNodeIdentity({ lat, lng, extractable = true }) {
+export async function createNodeIdentity({ lat, lng, extractable = true, fast = false }) {
   if (typeof lat !== 'number' || typeof lng !== 'number') {
     throw new IdentityError(ErrorCodes.IDENTITY_INVALID_FORMAT,
       'createNodeIdentity: region must be { lat: number, lng: number }');
+  }
+
+  // ── Fast (SIM-ONLY) path: skip the Ed25519 keygen ──────────────────────────
+  // A node identity is never signature-verified by the protocol (the sim
+  // transport doesn't sign; web-mesh DTLS-fingerprint binding is a browser-only
+  // concern), so for large in-simulator builds we can mint a routable identity
+  // from random bytes — same nodeId shape (region byte ‖ truncated SHA-256), a
+  // synthetic pubkey, and NO private key — at a fraction of the cost (keygen,
+  // not hashing, is the bottleneck at 50k nodes). Guarded to the shrunk,
+  // NON-PRODUCTION keyspace so a fast (unverifiable) identity can never ship:
+  // production (264-bit default) refuses it.
+  if (fast) {
+    if (getKeyspace().isProductionDefault) {
+      throw new IdentityError(ErrorCodes.IDENTITY_INVALID_FORMAT,
+        'createNodeIdentity({ fast }) is sim-only and refused on the production 264-bit keyspace — ' +
+        'shrink the keyspace with configureKeyspace() first');
+    }
+    const rand = new Uint8Array(32);
+    crypto.getRandomValues(rand);
+    const id = await computeNodeId(rand, lat, lng);   // region byte ‖ truncated SHA-256(rand)
+    const identity = buildIdentity({
+      id, pubkey: rand, privateKey: null, region: { lat, lng }, createdAt: Date.now(),
+    });
+    identity.fast = true;   // marker: no real keypair; never persist or sign with this
+    return identity;
   }
 
   let pair;
@@ -155,9 +181,14 @@ async function mintAuthorIdentity({ extractable }) {
 /** Author identities have a keypair only — no nodeId, no region. */
 function buildAuthorIdentity({ pubkey, privateKey, createdAt }) {
   const pubkeyHex = bytesToHex(pubkey);
+  // The Author ID is the raw 256-bit pubkey in production (== signerPubkey, the
+  // self-authenticating credential). Under a shrunk sim keyspace profile it is the
+  // pubkey TRUNCATED to the author width (e.g. 64-bit / 16-hex); the sim relaxes
+  // signature verification (decision B), so the id need not be the full key.
+  const authorId  = (AUTHOR_ID_BITS === 256) ? pubkeyHex : pubkeyHex.slice(0, AUTHOR_HEX_CHARS);
   return {
     kind:      'author',
-    authorId:  pubkeyHex,            // the public Author ID (== signerPubkey on the wire)
+    authorId,                        // the public Author ID (== signerPubkey on the wire)
     pubkey,
     pubkeyHex,
     privateKey,

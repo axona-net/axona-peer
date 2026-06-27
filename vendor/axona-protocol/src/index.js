@@ -212,6 +212,8 @@ export {
   HASH_BITS,
   S2_BITS,
   HEX_CHARS,
+  AUTHOR_ID_BITS,
+  AUTHOR_HEX_CHARS,
   MAX_ID,
   MAX_HASH,
   MAX_S2,
@@ -226,6 +228,10 @@ export {
   stratumOf,
   clz264,
   randomU256,
+  // Sim-only: shrink the keyspace so churn tests scale. SET ONCE before any
+  // identity is minted; production never calls it (default stays 264-bit).
+  configureKeyspace,
+  getKeyspace,
 } from './utils/hexid.js';
 
 export {

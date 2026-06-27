@@ -10,7 +10,7 @@
 // =====================================================================
 
 import { geoCellId }        from '../utils/s2.js';
-import { assembleId, toHex } from '../utils/hexid.js';
+import { assembleId, toHex, HASH_MASK } from '../utils/hexid.js';
 
 /**
  * Compute the 264-bit nodeId for a given Ed25519 public key + region.
@@ -27,8 +27,10 @@ export async function computeNodeIdBigInt(pubkeyBytes, lat, lng) {
   const s2Prefix = geoCellId(lat, lng, 8);
   const buf      = await crypto.subtle.digest('SHA-256', pubkeyBytes);
   const hashHex  = bytesToHex(new Uint8Array(buf));
-  const hash256  = BigInt('0x' + hashHex);
-  return assembleId(s2Prefix, hash256);
+  // Mask to the active hash width: full 256 bits in production, truncated in a
+  // shrunk sim keyspace profile (e.g. 64-bit → 72-bit nodeId).
+  const hash     = BigInt('0x' + hashHex) & HASH_MASK;
+  return assembleId(s2Prefix, hash);
 }
 
 /**

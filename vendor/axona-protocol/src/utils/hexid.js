@@ -19,18 +19,94 @@
 // the security-over-tidiness trade is deliberate.
 // =====================================================================
 
-// ─── Constants ───────────────────────────────────────────────────────
+// ─── Keyspace profile (configurable; default = production 264-bit) ────
+//
+// The width constants below are EXPORTED LET bindings so every consumer that
+// `import { ID_BITS, ... }`s them sees the live value. They default to the
+// production profile (8-bit region + 256-bit SHA-256 hash = 264-bit node/topic
+// ids, 256-bit author ids). The SIMULATOR — and only the simulator — calls
+// `configureKeyspace({ hashBits })` ONCE at startup, before any identity or
+// peer is minted, to shrink the hash component (e.g. hashBits:64 → 72-bit
+// node/topic ids, 64-bit author ids) so churn tests scale to many nodes.
+// Production never calls it. Region width stays 8 bits unless overridden.
 
-export const ID_BITS      = 264;                  // total address width
-export const HASH_BITS    = 256;                  // SHA-256 component
-export const S2_BITS      = 8;                    // S2 prefix component
-export const HEX_CHARS    = 66;                   // 264 / 4
+export let ID_BITS;          // total node/topic address width (region + hash)
+export let HASH_BITS;        // hash component (SHA-256 in prod; truncated in sim)
+export let S2_BITS;          // region/S2 prefix width
+export let HEX_CHARS;        // ceil(ID_BITS/4) — node/topic hex width
+export let AUTHOR_ID_BITS;   // author id width (= HASH_BITS; carries no region)
+export let AUTHOR_HEX_CHARS; // ceil(AUTHOR_ID_BITS/4) — author id hex width
+export let MAX_ID;           // 2^ID_BITS - 1
+export let MAX_HASH;         // 2^HASH_BITS - 1
+export let MAX_S2;           // 2^S2_BITS - 1
+export let HASH_MASK;        // = MAX_HASH (mask the hash slot)
+export let S2_SHIFT;         // region lives above the hash → BigInt(HASH_BITS)
+export let AUTH_VERIFY_RELAXED; // true when authorId is shrunk below the real pubkey
+                                // width (sim only) → signerPubkey can no longer BE the
+                                // Ed25519 pubkey, so envelope verify SKIPS the crypto
+                                // signature check. Production (256-bit) keeps full verify.
 
-export const MAX_ID       = (1n << 264n) - 1n;
-export const MAX_HASH     = (1n << 256n) - 1n;
-export const MAX_S2       = 255;                  // 2^8 - 1
-export const HASH_MASK    = MAX_HASH;
-export const S2_SHIFT     = 256n;                 // S2 prefix lives at top 8 bits
+let _hashBits   = 256;
+let _regionBits = 8;
+let _configured = false;
+
+function _recompute() {
+  HASH_BITS       = _hashBits;
+  S2_BITS         = _regionBits;
+  ID_BITS         = _regionBits + _hashBits;
+  HEX_CHARS       = Math.ceil(ID_BITS / 4);
+  AUTHOR_ID_BITS  = _hashBits;
+  AUTHOR_HEX_CHARS = Math.ceil(AUTHOR_ID_BITS / 4);
+  MAX_HASH        = (1n << BigInt(_hashBits)) - 1n;
+  MAX_ID          = (1n << BigInt(ID_BITS)) - 1n;
+  MAX_S2          = (1 << _regionBits) - 1;
+  HASH_MASK       = MAX_HASH;
+  S2_SHIFT        = BigInt(_hashBits);
+  // A sub-256-bit author id cannot also be a verifiable 256-bit Ed25519 pubkey;
+  // in that (sim-only) profile the envelope verifier skips the crypto check.
+  AUTH_VERIFY_RELAXED = _hashBits < 256;
+}
+_recompute();   // production default
+
+/**
+ * Shrink the keyspace for in-simulator runs. SET ONCE, before any identity or
+ * peer is created. PRODUCTION MUST NEVER CALL THIS — the default 264-bit profile
+ * is load-bearing for the live network. Intended caller: the dht-sim transport.
+ *
+ * @param {{ hashBits?: number, regionBits?: number }} opts
+ */
+export function configureKeyspace({ hashBits, regionBits } = {}) {
+  if (typeof hashBits === 'number') {
+    if (!Number.isInteger(hashBits) || hashBits < 8 || hashBits > 256) {
+      throw new RangeError(`configureKeyspace: hashBits must be an integer in [8, 256], got ${hashBits}`);
+    }
+    _hashBits = hashBits;
+  }
+  if (typeof regionBits === 'number') {
+    if (!Number.isInteger(regionBits) || regionBits < 0 || regionBits > 16) {
+      throw new RangeError(`configureKeyspace: regionBits must be an integer in [0, 16], got ${regionBits}`);
+    }
+    _regionBits = regionBits;
+  }
+  _recompute();
+  _configured = true;
+  // Loud, so a non-default keyspace can never go unnoticed (e.g. a sim build
+  // accidentally shipped). Stderr — never the JSON wire.
+  try {
+    (globalThis.process?.stderr?.write ?? ((s) => console.warn(s.trim())))(
+      `[axona] KEYSPACE CONFIGURED → region=${_regionBits}b hash=${_hashBits}b ` +
+      `nodeId=${ID_BITS}b authorId=${AUTHOR_ID_BITS}b (NON-PRODUCTION unless 8/256)\n`);
+  } catch { /* logging is best-effort */ }
+}
+
+/** Current keyspace profile (introspection / tests). */
+export function getKeyspace() {
+  return {
+    regionBits: S2_BITS, hashBits: HASH_BITS, idBits: ID_BITS,
+    authorIdBits: AUTHOR_ID_BITS, hexChars: HEX_CHARS, authorHexChars: AUTHOR_HEX_CHARS,
+    configured: _configured, isProductionDefault: _hashBits === 256 && _regionBits === 8,
+  };
+}
 
 // ─── Encoding ────────────────────────────────────────────────────────
 
@@ -47,7 +123,7 @@ export function toHex(id) {
     throw new TypeError(`toHex expects bigint, got ${typeof id}`);
   }
   if (id < 0n || id > MAX_ID) {
-    throw new RangeError(`id out of range [0, 2^264): ${id}`);
+    throw new RangeError(`id out of range [0, 2^${ID_BITS}): ${id}`);
   }
   return id.toString(16).padStart(HEX_CHARS, '0');
 }
@@ -109,7 +185,7 @@ export function randomU256() {
   for (let i = 0; i < 32; i++) {
     n = (n << 8n) | BigInt(bytes[i]);
   }
-  return n;
+  return n & HASH_MASK;   // profile-aware: full 256 bits in prod, truncated in a shrunk sim profile
 }
 
 // ─── Composition / decomposition ─────────────────────────────────────
@@ -204,26 +280,17 @@ export function clz264(n) {
     throw new TypeError(`clz264 expects bigint, got ${typeof n}`);
   }
   if (n === 0n) return ID_BITS;
-
-  // Walk 32 bits at a time from the top. 264 bits = 8 full u32s + 8 bits.
-  // Top chunk (bits 256..263) is 8 bits wide; bits 0..255 are 8 × 32 = 256 bits.
-  const top8 = Number(n >> 256n) & 0xff;
-  if (top8 !== 0) {
-    // top8 is at most 0xff (8 bits). Math.clz32 treats input as u32, so
-    // for an 8-bit value we get 24 + clz of an 8-bit-wide value. Subtract
-    // the unused top 24 bits to get clz of the 8-bit slot.
-    return Math.clz32(top8) - 24;
-  }
-  // Bits 0..255: 8 × u32. Index 7 holds bits 224..255, index 0 holds bits 0..31.
-  for (let i = 7; i >= 0; i--) {
+  // Width-generic: find the most-significant set bit by walking 32-bit chunks
+  // from the top of the active ID_BITS-wide keyspace. clz = ID_BITS - 1 - msb.
+  const chunks = Math.ceil(ID_BITS / 32);
+  for (let i = chunks - 1; i >= 0; i--) {
     const chunk = Number((n >> BigInt(i * 32)) & 0xFFFFFFFFn);
     if (chunk !== 0) {
-      const skipped = (7 - i) * 32;
-      return 8 + skipped + Math.clz32(chunk);
+      const msb = i * 32 + (31 - Math.clz32(chunk));   // 0-indexed bit position from LSB
+      return ID_BITS - 1 - msb;
     }
   }
-  // Should be unreachable (n !== 0n guarantees a non-zero chunk somewhere).
-  return ID_BITS;
+  return ID_BITS;   // unreachable (n !== 0n)
 }
 
 /**

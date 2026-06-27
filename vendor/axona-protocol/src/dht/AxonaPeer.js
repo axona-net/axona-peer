@@ -813,6 +813,62 @@ export class AxonaPeer extends DHT {
     // join(sponsor) takes hex (user-facing API); _seedSynaptomeWithSponsor
     // is BigInt-only (kernel-internal).
     this._seedSynaptomeWithSponsor(fromHex(sponsor));
+
+    // Self-integration (the "future enhancement" the seed comment named):
+    // a sponsor-only join leaves us at the churn FLOOR — reachable only from
+    // the sponsor, because reachability-to-us is a property of our NEIGHBOURS'
+    // tables, and they don't know us yet. So discover our own neighbourhood
+    // (findKClosest(ownId) — a read-only probe needing only our own id) and
+    // open authenticated channels to it. The bind flow (onPeerBound on BOTH
+    // ends) then makes those neighbours adopt us, so a greedy walk into our
+    // region lands on us. Best-effort: a failure here just means slower heal,
+    // never a failed join. Sim-validated: floor 7-27% → ~95-98% in one pass.
+    try { await this._selfIntegrate(); } catch { /* best-effort; anneal still heals slowly */ }
+  }
+
+  /**
+   * Self-integrate into the mesh: discover our own neighbourhood and open
+   * authenticated channels to it so neighbours adopt us (reachability lives in
+   * THEIR routing tables, not ours). Idempotent and re-runnable — call it on
+   * join, and again after a disruption to re-home quickly. Never throws.
+   *
+   *   await peer.integrate()          // K = mesh K
+   *   await peer.integrate({ K: 30 })
+   *
+   * @param {{K?: number, concurrency?: number}} [opts]
+   * @returns {Promise<number>} channels opened to neighbours
+   */
+  async integrate(opts = {}) { return this._selfIntegrate(opts); }
+
+  async _selfIntegrate({ K = this._domain?._k ?? 20, concurrency = 8 } = {}) {
+    const node = this._node;
+    if (!node?.alive || !node.transport || typeof node.transport.openConnection !== 'function') return 0;
+    const selfId = node.id;
+    let closest;
+    try { closest = await this.findKClosest(selfId, K); }
+    catch { return 0; }
+    if (!Array.isArray(closest) || closest.length === 0) return 0;
+
+    // Targets: discovered neighbours we aren't already connected to (skip self).
+    const targets = [];
+    for (const id of closest) {
+      if (typeof id !== 'bigint' || id === selfId) continue;
+      if (typeof node.transport.isConnected === 'function' && node.transport.isConnected(id)) continue;
+      targets.push(id);
+    }
+
+    let opened = 0;
+    for (let i = 0; i < targets.length; i += concurrency) {
+      const batch = targets.slice(i, i + concurrency);
+      const settled = await Promise.allSettled(
+        batch.map(id => node.transport.openConnection(toHex(id))),
+      );
+      for (const r of settled) if (r.status === 'fulfilled' && r.value !== false) opened++;
+    }
+    // Our synaptome just widened (via the bind flow on each open) — drop any
+    // stale K-closest cache so the next pub/sub recomputes against it.
+    this._axonaManager?.invalidateKClosestCache?.();
+    return opened;
   }
 
   /**
@@ -1429,10 +1485,14 @@ export class AxonaPeer extends DHT {
     }
     // Owner-only topic: only the owner key may publish. Fail fast here (the root
     // enforces the same at ingress, so this just turns a silent drop into an error).
-    if (desc.write === 'owner' && signId && signId.pubkeyHex.toLowerCase() !== desc.owner) {
+    // Compare the author's PUBLIC id (authorId) to the topic owner. In prod
+    // authorId === pubkeyHex; in a shrunk sim profile authorId is the truncated
+    // id the descriptor owner is also keyed on.
+    const signerAuthorId = signId ? (signId.authorId ?? signId.pubkeyHex) : null;
+    if (desc.write === 'owner' && signId && signerAuthorId.toLowerCase() !== desc.owner) {
       throw new PublishError(ErrorCodes.WRITE_POLICY_VIOLATION,
         `peer.pub: owner-only topic '${desc.name}' — only the owner key may publish ` +
-        `(signer ${signId.pubkeyHex.slice(0, 12)}… ≠ owner ${desc.owner.slice(0, 12)}…)`,
+        `(signer ${signerAuthorId.slice(0, 12)}… ≠ owner ${desc.owner.slice(0, 12)}…)`,
         { context: { topic: desc.name } });
     }
 

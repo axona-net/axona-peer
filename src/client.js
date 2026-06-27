@@ -74,7 +74,7 @@ const BRIDGE_DIRECTORY_DESC = Object.freeze({
 // where the bfcache can serve a stale module set for ages).  The
 // bridge version arrives separately in its `welcome` message; the
 // "version" row in the me panel shows both side by side.
-const PEER_VERSION = '3.36.0';
+const PEER_VERSION = '3.37.0';
 
 // webTransport() now owns the bridge WebSocket lifecycle (ping cadence,
 // stale window, reconnect backoff, uptime), so those constants moved
@@ -901,6 +901,15 @@ async function bootAxonaNode(opts = {}) {
     appendLog('bridge:start-failed', err.message ?? String(err), 'error');
   }
   await peer.start();
+
+  // Self-integration (kernel v4.7.0): proactively weave ourselves into our
+  // keyspace neighbourhood — findKClosest(ownId) + open authenticated channels
+  // so neighbours adopt us and we become reachable, instead of waiting on
+  // ambient annealing. Non-blocking: bootstrap (and the upgrade banner) must
+  // not wait on it; the iterative lookup + ~K channel opens run in background.
+  if (typeof peer.integrate === 'function') {
+    peer.integrate().catch((err) => appendLog('peer:integrate-failed', err?.message ?? String(err), 'warn'));
+  }
 
   // Debug surface for DevTools.  Exposed on window so operators can
   // introspect live state without rebuilding — `window.axona.synaptome()`,

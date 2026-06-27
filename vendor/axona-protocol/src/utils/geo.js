@@ -160,37 +160,33 @@ export function _collectBucket(selfId, sorted, b, k) {
     rangeStart        = peerPfx << bBig;
     rangeEnd          = rangeStart | ((1n << bBig) - 1n);
   } else {
-    // b = 63: MSB differs — peers live in the opposite half of the ID space.
-    rangeStart = (selfId >> 263n) === 0n ? (1n << 263n) : 0n;
-    rangeEnd   = (selfId >> 263n) === 0n ? MAX_ID : ((1n << 263n) - 1n);
+    // Top bucket: the MSB differs → peers live in the opposite half of the ID
+    // space. Anchored on ID_BITS-1 (NOT a hardcoded 263) so it is correct at
+    // any keyspace width — under a shrunk sim profile the longest-range bucket
+    // stays populated instead of always probing beyond MAX_ID.
+    const TOP = BigInt(ID_BITS - 1);
+    rangeStart = (selfId >> TOP) === 0n ? (1n << TOP) : 0n;
+    rangeEnd   = (selfId >> TOP) === 0n ? MAX_ID : ((1n << TOP) - 1n);
   }
 
-  // Binary search for the first index >= rangeStart.
-  let lo = 0, hi = sorted.length;
-  while (lo < hi) {
-    const mid = (lo + hi) >>> 1;
-    if (sorted[mid].id < rangeStart) lo = mid + 1; else hi = mid;
-  }
-
-  // Reservoir-sample up to k peers from [rangeStart, rangeEnd]. Reservoir
-  // sampling (instead of a deterministic "first k") is critical under a
-  // bilateral connection cap: if every node that falls in the same bucket
-  // range were to always pick the same first-k candidates, those candidates
-  // saturate instantly and the rest of the range's capacity is wasted.
-  // Random sampling spreads connection demand across the full stratum.
-  const reservoir = [];
-  let count = 0;
-  for (let i = lo; i < sorted.length; i++) {
-    if (sorted[i].id > rangeEnd) break;
-    if (count < k) {
-      reservoir.push(sorted[i]);
-    } else {
-      const j = Math.floor(Math.random() * (count + 1));
-      if (j < k) reservoir[j] = sorted[i];
-    }
-    count++;
-  }
-  return reservoir;
+  // A bucket's peers occupy a CONTIGUOUS slice [rangeStart, rangeEnd] of the
+  // id-sorted array. Binary-search BOTH ends (O(log n)) instead of scanning to
+  // rangeEnd — the high buckets span ~half the array, so the old scan made the
+  // whole builder O(n²) (the 50k-node build wall). Then uniform-random-sample k
+  // DISTINCT peers from the slice — the SAME distribution as the old reservoir
+  // (spreads connection demand across the stratum under a bilateral cap), in O(k).
+  let lo = 0, loHi = sorted.length;          // lower bound: first idx with id >= rangeStart
+  while (lo < loHi) { const m = (lo + loHi) >>> 1; if (sorted[m].id < rangeStart) lo = m + 1; else loHi = m; }
+  let hi = lo, hiHi = sorted.length;          // upper bound: first idx with id > rangeEnd
+  while (hi < hiHi) { const m = (hi + hiHi) >>> 1; if (sorted[m].id <= rangeEnd) hi = m + 1; else hiHi = m; }
+  const R = hi - lo;
+  if (R <= 0) return [];
+  if (R <= k) return sorted.slice(lo, hi);
+  const picks = new Set();
+  while (picks.size < k) picks.add(lo + Math.floor(Math.random() * R));
+  const out = [];
+  for (const idx of picks) out.push(sorted[idx]);
+  return out;
 }
 
 /**

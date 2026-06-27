@@ -21,7 +21,7 @@
 // =====================================================================
 
 import { AxonaError, TransportError, ErrorCodes } from '../../errors.js';
-import { toHex }                                  from '../../utils/hexid.js';
+import { toHex, fromHex }                         from '../../utils/hexid.js';
 import { Transport }                              from '../../contracts/Transport.js';
 import {
   buildAuthHello, verifyAuthHello, makeNonce, cbvFromNonces,
@@ -87,6 +87,9 @@ export class SimTransport extends Transport {
 
     /** @type {Set<string>} peers we have an open channel to */
     this._openTo = new Set();
+
+    /** @type {Set<(peerBig: bigint) => void>} onPeerBound listeners */
+    this._boundListeners = new Set();
 
     /** @type {Map<string, number>} per-peer RTT in ms */
     this._latency = new Map();
@@ -188,7 +191,34 @@ export class SimTransport extends Transport {
 
     this._startHeartbeat(peerId);
     target._startHeartbeat(this._localId);
+
+    // Fire bind events on BOTH ends — matches the web/node transport contract
+    // so the kernel's auto-admit-on-bind flow (AxonaPeer.start → onPeerBound →
+    // seed synaptome) runs in the sim too. Without this the sim never modelled
+    // a neighbour adopting a peer that opened a channel to it, so a freshly
+    // joined node stayed unreachable until anneal — masking churn behaviour.
+    this._fireBound(peerId);
+    target._fireBound(this._localId);
     return true;
+  }
+
+  // ─── Bind-event surface (Transport contract parity with web/node) ────
+  onPeerBound(handler) {
+    if (typeof handler === 'function') this._boundListeners.add(handler);
+    return () => this._boundListeners.delete(handler);
+  }
+
+  /** Currently-open peers as BigInt ids (contract: BigInt[]). */
+  boundPeers() {
+    const out = [];
+    for (const hex of this._openTo) { try { out.push(fromHex(hex)); } catch { /* */ } }
+    return out;
+  }
+
+  _fireBound(peerHex) {
+    if (this._boundListeners.size === 0) return;
+    let big; try { big = fromHex(peerHex); } catch { return; }
+    for (const cb of this._boundListeners) { try { cb(big); } catch { /* listener error is not ours */ } }
   }
 
   async closeConnection(peerId) {

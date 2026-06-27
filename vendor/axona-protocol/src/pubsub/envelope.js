@@ -65,6 +65,7 @@
 import { canonical, sha256Hex }              from './post.js';
 import { sign, verify, importPublicKey }     from './ed25519.js';
 import { powMint }                           from '../pow/pow.js';
+import { AUTH_VERIFY_RELAXED }               from '../utils/hexid.js';
 
 const _enc = new TextEncoder();
 
@@ -134,7 +135,12 @@ export async function buildEnvelope({ topic, message, ts = Date.now(), seq = 0, 
     const bytes = _enc.encode(canonical({ d: ENVELOPE_DOMAIN, seq, ts, topic, message }));
     const sigBytes = await sign(identity.privateKey, bytes);
     signature    = 'ed25519:' + bytesToHex(sigBytes);
-    signerPubkey = identity.pubkeyHex;
+    // The carried publisher identity is the author's PUBLIC id. In production
+    // `authorId === pubkeyHex` (the raw Ed25519 key), so this is the verifiable
+    // key. In a shrunk sim profile `authorId` is the truncated routing id (the
+    // same value owner-topic descriptors key off), keeping signerPubkey, the
+    // owner-write check, and the msgId author all consistent at the small width.
+    signerPubkey = identity.authorId ?? identity.pubkeyHex;
   }
 
   // msgId = hash(publisher + message). `publisher` is the signer's pubkey
@@ -209,17 +215,26 @@ export async function verifyEnvelope(envelope) {
     if (!envelope.signature.startsWith('ed25519:')) {
       return { ok: false, reason: 'unknown_signature_scheme', signed: true };
     }
-    const sigBytes = hexToBytes(envelope.signature.slice('ed25519:'.length));
-    const pkBytes  = hexToBytes(envelope.signerPubkey);
-    if (sigBytes.length !== 64 || pkBytes.length !== 32) {
-      return { ok: false, reason: 'wrong_key_or_signature_length', signed: true };
+    // Sim-only relaxed profile: when the author id is shrunk below the full
+    // 256-bit Ed25519 pubkey width, `signerPubkey` is a truncated routing id —
+    // not a key the crypto can verify against. The simulator tests routing and
+    // delivery, not auth (the B-4 sig-verify path stays exercised only at the
+    // production 256-bit profile). Skip the crypto check but KEEP the structural
+    // checks above and the msgId recompute below (signerPubkey still binds the
+    // author id into the content address consistently with buildEnvelope).
+    if (!AUTH_VERIFY_RELAXED) {
+      const sigBytes = hexToBytes(envelope.signature.slice('ed25519:'.length));
+      const pkBytes  = hexToBytes(envelope.signerPubkey);
+      if (sigBytes.length !== 64 || pkBytes.length !== 32) {
+        return { ok: false, reason: 'wrong_key_or_signature_length', signed: true };
+      }
+      // Verify against the SAME domain-tagged core buildEnvelope signed (E-4).
+      const core    = { d: ENVELOPE_DOMAIN, seq: envelope.seq, ts: envelope.ts, topic: envelope.topic, message: envelope.message };
+      const bytes   = _enc.encode(canonical(core));
+      const pubKey  = await importPublicKey(pkBytes);
+      const sigOk   = await verify(pubKey, bytes, sigBytes);
+      if (!sigOk) return { ok: false, reason: 'bad_signature', signed: true };
     }
-    // Verify against the SAME domain-tagged core buildEnvelope signed (E-4).
-    const core    = { d: ENVELOPE_DOMAIN, seq: envelope.seq, ts: envelope.ts, topic: envelope.topic, message: envelope.message };
-    const bytes   = _enc.encode(canonical(core));
-    const pubKey  = await importPublicKey(pkBytes);
-    const sigOk   = await verify(pubKey, bytes, sigBytes);
-    if (!sigOk) return { ok: false, reason: 'bad_signature', signed: true };
   }
 
   // Recompute msgId = hash(publisher + message), where publisher is the

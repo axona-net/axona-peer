@@ -42,6 +42,7 @@
 // =====================================================================
 
 import { resolveRegion } from '../utils/region-names.js';
+import { HEX_CHARS, AUTHOR_HEX_CHARS } from '../utils/hexid.js';
 
 /**
  * Stable, total, JSON-valid canonical encoding (finding C-1).
@@ -164,8 +165,8 @@ export async function resolveTopic({ region = null, owner = null, name, write } 
     throw new TypeError('resolveTopic: name must be a non-empty string');
   }
   const ownerLc = owner == null ? null : String(owner).toLowerCase();
-  if (ownerLc != null && !/^[0-9a-f]{64}$/.test(ownerLc)) {
-    throw new RangeError('resolveTopic: owner must be a 64-hex Author ID or null');
+  if (ownerLc != null && !new RegExp(`^[0-9a-f]{${AUTHOR_HEX_CHARS}}$`).test(ownerLc)) {
+    throw new RangeError(`resolveTopic: owner must be a ${AUTHOR_HEX_CHARS}-hex Author ID or null`);
   }
   // Write policy is keyed on whether an owner is named:
   //   no owner   → the topic is necessarily 'open' (there's no owner to restrict
@@ -213,7 +214,10 @@ export async function resolveTopic({ region = null, owner = null, name, write } 
   // resolved code so the descriptor is self-contained (recomputable without
   // re-running key-derivation).
   const hash256 = await sha256Hex(canonical({ owner: ownerLc, name, write: w }));
-  return { region: code, owner: ownerLc, name, write: w, topicId: prefix + hash256 };
+  // Topic id = 2-hex region byte + hash truncated to the active keyspace width
+  // (full 64-hex SHA-256 in prod → HEX_CHARS 66; truncated in a shrunk sim profile).
+  const topicId = prefix + hash256.slice(0, HEX_CHARS - 2);
+  return { region: code, owner: ownerLc, name, write: w, topicId };
 }
 
 /** Convenience: just the 66-hex topic id for a topic descriptor. `selfRegion`
