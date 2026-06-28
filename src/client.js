@@ -74,7 +74,7 @@ const BRIDGE_DIRECTORY_DESC = Object.freeze({
 // where the bfcache can serve a stale module set for ages).  The
 // bridge version arrives separately in its `welcome` message; the
 // "version" row in the me panel shows both side by side.
-const PEER_VERSION = '3.41.0';
+const PEER_VERSION = '3.42.0';
 
 // webTransport() now owns the bridge WebSocket lifecycle (ping cadence,
 // stale window, reconnect backoff, uptime), so those constants moved
@@ -768,28 +768,18 @@ function fmtNodeId(id) {
   return id.toString(16).padStart(66, '0');
 }
 
-// Mesh-ready gate: wait until the synaptome holds at least a handful
-// of peers before treating "the mesh is wide enough to subscribe."
-// Mirrors the kernel demo's waitForMeshReady (READY_SYNAPSE_COUNT=4
-// is bridge + ~3 WebRTC peers).  Solo-tab runs that never find more
-// than the bridge fall through to subscribing after the timeout — UX
-// stays usable, the only risk is the stale-K-closest behaviour the
-// arming of _axonaManager.start() at sub time then papers over.
+// Mesh-ready gate: wait until the mesh is wide enough to subscribe. Delegates to
+// the kernel's peer.ready() (v4.8.2) — which resolves on synaptome>=minPeers OR a
+// stable (no-longer-growing) synaptome OR timeout. The stable case is the win
+// over the old hand-rolled poll: a solo/small-mesh tab resolves in ~1.5s instead
+// of burning the full timeout waiting for a count it can never reach.
 const READY_SYNAPSE_COUNT = 4;
 const READY_TIMEOUT_MS    = 10_000;
 async function waitForMeshReady() {
-  const t0 = Date.now();
-  while (Date.now() - t0 < READY_TIMEOUT_MS) {
-    const size = peer?.getSynaptome?.().length ?? 0;
-    if (size >= READY_SYNAPSE_COUNT) {
-      appendLog('mesh:ready', `synaptome=${size}`);
-      return size;
-    }
-    await new Promise(r => setTimeout(r, 200));
-  }
-  const size = peer?.getSynaptome?.().length ?? 0;
-  appendLog('mesh:ready-timeout', `synaptome=${size} (proceeding anyway)`);
-  return size;
+  const r = await peer.ready({ minPeers: READY_SYNAPSE_COUNT, timeoutMs: READY_TIMEOUT_MS });
+  appendLog(r.ready ? 'mesh:ready' : 'mesh:ready-timeout',
+    `synaptome=${r.peers} (${r.reason}, ${r.ms}ms)${r.ready ? '' : ' — proceeding anyway'}`);
+  return r.peers;
 }
 
 async function bootAxonaNode(opts = {}) {
