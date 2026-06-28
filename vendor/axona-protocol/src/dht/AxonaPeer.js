@@ -842,6 +842,45 @@ export class AxonaPeer extends DHT {
    */
   async integrate(opts = {}) { return this._selfIntegrate(opts); }
 
+  /**
+   * Resolve when the mesh is ready for reliable pub/sub — i.e. this peer has
+   * formed enough synapses that a routed subscribe/publish attaches to the topic
+   * tree instead of stranding in a not-yet-formed mesh. Subscribing the instant
+   * after join() (synaptome = just the bridge) is the dominant cause of slow
+   * first delivery; `await peer.ready()` before your first sub/pub.
+   *
+   * Resolves as soon as EITHER:
+   *   • synaptome.size >= minPeers (a healthy mesh formed), OR
+   *   • the synaptome stopped growing for `stableMs` — so a small/relay-poor mesh
+   *     converges to whatever is available (a 3-node mesh resolves at 2 synapses,
+   *     never hangs waiting for an unreachable minPeers), OR
+   *   • timeoutMs elapses (resolves `ready:false` so the caller can proceed or
+   *     back off — never throws).
+   *
+   *   const { ready, peers } = await peer.ready();
+   *   await peer.ready({ minPeers: 4, timeoutMs: 8000 });
+   *
+   * @param {{minPeers?:number, timeoutMs?:number, stableMs?:number, pollMs?:number}} [opts]
+   * @returns {Promise<{ready:boolean, peers:number, ms:number, reason:'minPeers'|'stable'|'timeout'}>}
+   */
+  async ready({ minPeers = 4, timeoutMs = 10_000, stableMs = 1500, pollMs = 150 } = {}) {
+    const t0 = Date.now();
+    const size = () => this._node?.synaptome?.size ?? 0;
+    let last = -1, stableSince = t0;
+    for (;;) {
+      const n = size();
+      if (n >= minPeers) return { ready: true, peers: n, ms: Date.now() - t0, reason: 'minPeers' };
+      if (n !== last) { last = n; stableSince = Date.now(); }
+      else if (n > 0 && Date.now() - stableSince >= stableMs) {
+        return { ready: true, peers: n, ms: Date.now() - t0, reason: 'stable' };
+      }
+      if (Date.now() - t0 >= timeoutMs) {
+        return { ready: n > 0, peers: n, ms: Date.now() - t0, reason: 'timeout' };
+      }
+      await new Promise(r => setTimeout(r, pollMs));
+    }
+  }
+
   async _selfIntegrate({ K = this._domain?._k ?? 20, concurrency = 8 } = {}) {
     const node = this._node;
     if (!node?.alive || !node.transport || typeof node.transport.openConnection !== 'function') return 0;
