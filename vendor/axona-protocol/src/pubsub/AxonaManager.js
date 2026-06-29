@@ -46,6 +46,7 @@
 // =====================================================================
 
 import { verifyEnvelope, checkFreshness } from './envelope.js';
+import { verifyKill }                     from './kill.js';
 import { deriveTopicIdBig }               from './post.js';
 
 // ── Inbound caps (D-1: bound attacker-controlled payloads) ──────────────
@@ -438,6 +439,7 @@ export class AxonaManager {
     }
 
     if (role.cacheIds.has(env.msgId)) return;                            // idempotent re-publish
+    if (this._tombstoned(role, env.msgId, json)) return;                 // killed (or republish-after-kill) → suppress
 
     // STAMP — single serialization point; strictly monotonic, floored at now.
     const ts = Math.max(role.lastTs + 1, this._now());
@@ -485,6 +487,7 @@ export class AxonaManager {
     if (!v.ok || env.msgId !== m.msgId) { this._log('warn', 'drop-bad-replayup', { reason: v.reason }); return; }
     if (m.publishTs > this._now() + FUTURE_TOLERANCE_MS) { this._log('warn', 'drop-future-replayup'); return; } // §5 bad-clock
     if (role.cacheIds.has(m.msgId)) return;                              // already have it
+    if (this._tombstoned(role, m.msgId, m.json)) return;                 // killed → don't resurrect via replay-up
     this._cachePush(role, { msgId: m.msgId, publishTs: m.publishTs, json: m.json });
     if (m.publishTs > role.lastTs) role.lastTs = m.publishTs;            // continue stamping above recovered history
     this._fanout(role, { json: m.json, publishTs: m.publishTs, msgId: m.msgId }, null);
@@ -552,7 +555,8 @@ export class AxonaManager {
     const role = this.axonRoles.get(topicBig);        // set iff I'm a relay → re-fan
     for (const m of (Array.isArray(payload.msgs) ? payload.msgs : [])) {
       if (!m) continue;
-      if (m.del) { this._applyDelete(role, topicBig, m); continue; }
+      if (m.del) { this._applyKill(role, topicBig, m); continue; }   // del-marker carries killTs+signer
+      if (this._tombstoned(role, m.msgId, m.json)) continue;          // killed → suppress (don't cache/deliver/re-fan)
       if (role && !role.cacheIds.has(m.msgId)) {       // relay: cache once + re-fan once
         this._cachePush(role, { msgId: m.msgId, publishTs: m.publishTs, json: m.json });
         this._fanout(role, m, lc(payload.from));       // exclude the sender
@@ -607,6 +611,21 @@ export class AxonaManager {
       }
     }
     flush();
+    // Self-heal kills: a kill is a publish-with-a-side-effect, so it rides the
+    // SAME renewal replay as cached messages — re-send every active tombstone the
+    // subscriber's `since` predates. A subscriber that missed the live delete
+    // re-acquires it here on its next renewal (and stops, since the kill advances
+    // its since past killTs). Carries killTs+signer so the receiver's tombstone
+    // matches (consistent re-fan + provisional authorship enforcement).
+    const dels = [];
+    for (const [tgt, tomb] of role.tombstones) {
+      if ((tomb?.killTs ?? 0) > sinceTs) dels.push({ del: true, msgId: tgt, killTs: tomb.killTs, signer: tomb.signer ?? null, publishTs: tomb.killTs });
+    }
+    if (dels.length) {
+      sent = true;
+      if (isSelf) for (const dm of dels) this._deliverKillToApp(role.topicId, dm.msgId, dm.killTs);
+      else this._route(subBig, T.DELIVER, { topicId: idHex(role.topicId), from: idHex(this.nodeId), msgs: dels });
+    }
     if (ping && !sent && !isSelf) {                    // repin even with no history
       this._route(subBig, T.DELIVER, { topicId: idHex(role.topicId), from: idHex(this.nodeId), msgs: [] });
     }
@@ -619,6 +638,8 @@ export class AxonaManager {
       const newest = role.cache[role.cache.length - 1];
       if (!seen.has(newest.msgId)) this._deliverToApp(role.topicId, newest.json, newest.msgId, newest.publishTs);
     }
+    // kills replay alongside the cache (exactly-once on the kill-specific key).
+    for (const [tgt, tomb] of role.tombstones) if ((tomb?.killTs ?? 0) > sinceTs) this._deliverKillToApp(role.topicId, tgt, tomb.killTs);
   }
 
   // ── cache ────────────────────────────────────────────────────────────
@@ -658,17 +679,44 @@ export class AxonaManager {
     }
   }
 
-  _applyDelete(role, topicBig, m) {
-    if (role && !role.tombstones.has(m.msgId)) {       // relay: drop from cache + re-fan delete once
-      role.tombstones.set(m.msgId, this._now() + TTL_MS);
-      const i = role.cache.findIndex(c => c.msgId === m.msgId);
+  // Apply a (verified) kill: a kill is a publish-with-a-delete-side-effect. We
+  // record a TOMBSTONE keyed by the target msgId — carrying the kill's stamp
+  // (killTs) and its authorizing signer — drop the target from cache, and fan the
+  // delete down ONCE. The tombstone is now first-class replayable state (see the
+  // tombstone emit in _replayTo/_replayLocal): a subscriber that missed the live
+  // delete re-acquires it on its next renewal, exactly like a missed publish
+  // re-acquires from cache. Idempotent: the fan-out + cache-drop happen only the
+  // first time we see the kill (tombstone-gated).
+  _applyKill(role, topicBig, m) {
+    const target = m.msgId;
+    const killTs = m.killTs ?? this._now();
+    if (role && !role.tombstones.has(target)) {
+      role.tombstones.set(target, { exp: this._now() + TTL_MS, killTs, signer: m.signer ?? null });
+      const i = role.cache.findIndex(c => c.msgId === target);
       if (i >= 0) { role.cacheBytes -= role.cache[i].bytes; role.cache.splice(i, 1); }
-      role.cacheIds.delete(m.msgId);
-      this._fanout(role, m, null);
+      role.cacheIds.delete(target);
+      // fan the delete down — carries killTs + signer so each receiver records an
+      // identical tombstone (consistent replay + provisional authorship enforcement).
+      this._fanout(role, { del: true, msgId: target, killTs, signer: m.signer ?? null, publishTs: killTs }, null);
     }
-    this._confirmPending(topicBig, m.msgId);           // our own kill landed → stop retrying it
-    if (this.mySubscriptions.has(topicBig) && this._deliveryCallback) {
-      try { this._deliveryCallback(topicBig, JSON.stringify({ deleted: true, msgId: m.msgId, topic: m.topic ?? null }), m.msgId, m.publishTs ?? this._now()); }
+    this._confirmPending(topicBig, target);            // our own kill landed → stop retrying it
+    this._deliverKillToApp(topicBig, target, killTs);
+  }
+
+  // Deliver a kill to the local app (exactly-once, keyed distinctly from the
+  // target's own delivery) and advance our since-floor to the kill's stamp so a
+  // renewal stops re-pulling it once seen — while a MISSED kill (since still below
+  // killTs) is re-pulled and self-heals.
+  _deliverKillToApp(topicBig, target, killTs) {
+    if (!this.mySubscriptions.has(topicBig)) return;   // pure relay stores+forwards, doesn't consume
+    const prev = this._lastSeenTsByTopic.get(topicBig) || 0;
+    if (killTs > prev) this._lastSeenTsByTopic.set(topicBig, killTs);
+    const key = topicBig.toString(16) + ':kill:' + target;
+    if (this._appDelivered.has(key)) return;           // exactly-once
+    this._appDelivered.set(key, true);
+    if (this._appDelivered.size > APP_DEDUP_MAX) this._appDelivered.delete(this._appDelivered.keys().next().value);
+    if (this._deliveryCallback) {
+      try { this._deliveryCallback(topicBig, JSON.stringify({ deleted: true, msgId: target, topic: null }), target, killTs); }
       catch (e) { this._log('warn', 'delete-callback-threw', { err: e?.message }); }
     }
   }
@@ -683,6 +731,25 @@ export class AxonaManager {
     if (!msgId) return;                                // pending maps are keyed by msgId (globally unique)
     this._pendingPub?.delete(msgId);
     this._pendingKill?.delete(msgId);
+  }
+
+  // A target message arriving (publish / replay / fan-out) for which we hold a
+  // tombstone: SUPPRESS it iff the kill was authorized by the message's own author
+  // — this is where a PROVISIONAL kill (accepted before we held the target) is
+  // enforced. A signer MISMATCH (or an unsigned/anonymous target a signed kill
+  // can't own) means the kill was forged or unauthorized → REVOKE the tombstone
+  // and accept the message. Returns true to drop the message.
+  _tombstoned(role, msgId, json) {
+    if (!role) return false;
+    const tomb = role.tombstones.get(msgId);
+    if (!tomb) return false;
+    if (tomb.signer) {
+      let author = null; try { author = JSON.parse(json)?.signerPubkey ?? null; } catch { /* */ }
+      if (author && lc(author) === lc(tomb.signer)) return true;      // authorized kill → stays dead
+      role.tombstones.delete(msgId);                                   // unauthorized/forged → revoke
+      return false;
+    }
+    return true;                                                       // signer-less tombstone (defensive) → suppress
   }
 
   _becomeRoot(topicBig) {
@@ -1043,14 +1110,35 @@ export class AxonaManager {
   }
 
   // ── side-function handlers (thin; TODO Phase 4) ──────────────────────
-  _onKill(payload, meta) {
+  async _onKill(payload, meta) {
     const d = this._topicDecision(payload, meta);
     if (d === 'forward') return;
     if (d === 'reroute') { this._reroute(T.KILL, payload); return 'consumed'; }
     const topicBig = idBig(payload.topicId);
     const role = this.axonRoles.get(topicBig) || this._becomeRoot(topicBig);
-    const msgId = payload.kill?.msgId;
-    if (msgId) this._applyDelete(role, topicBig, { del: true, msgId, topic: payload.kill?.topic ?? null, publishTs: this._now() });
+    const kill = payload.kill;
+    const target = kill?.msgId;
+    if (!target) return 'consumed';
+    // AUTHZ: a kill must be signed, and only the AUTHOR of the target may kill it.
+    // (1) signature self-valid (B-4 analog for kills).
+    const v = await verifyKill(kill);
+    if (!v.ok) { this._log('warn', 'drop-bad-kill', { reason: v.reason }); return 'consumed'; }
+    // (2) authorship: if we hold the target, enforce signer===author NOW; if we
+    // don't (kill races ahead of the publish, or we're a fresh root), accept
+    // PROVISIONALLY — record the kill's signer and enforce when the target arrives
+    // (ingest checks the tombstone's signer; a forged kill is revoked on mismatch).
+    const cached = role.cache.find(c => c.msgId === target);
+    if (cached) {
+      let author = null; try { author = JSON.parse(cached.json)?.signerPubkey ?? null; } catch { /* */ }
+      if (!author || lc(author) !== lc(kill.signerPubkey)) {
+        this._log('warn', 'drop-unauthorized-kill', { target: String(target).slice(0, 12) });
+        return 'consumed';
+      }
+    }
+    // STAMP the kill like a publish (monotonic) so it orders + replays via `since`.
+    const ts = Math.max(role.lastTs + 1, this._now());
+    role.lastTs = ts;
+    this._applyKill(role, topicBig, { msgId: target, killTs: ts, signer: lc(kill.signerPubkey) });
     return 'consumed';
   }
   // _onUnpub — REMOVED v4.3.0 (keep kill, drop unpub)
@@ -1156,7 +1244,7 @@ export class AxonaManager {
       for (const [subHex, sub] of role.subscribers) {
         if (now - sub.lastRenewed > this.dropMs) { role.subscribers.delete(subHex); role.children.delete(subHex); }
       }
-      for (const [msgId, exp] of role.tombstones) if (exp <= now) role.tombstones.delete(msgId);
+      for (const [msgId, t] of role.tombstones) if ((t?.exp ?? 0) <= now) role.tombstones.delete(msgId);
       this._expireCache(role, now);
       // A ROOT holding non-expired cache MUST persist even with zero subscribers
       // — otherwise a message published before anyone subscribes (or after the
