@@ -611,15 +611,19 @@ export class AxonaManager {
       }
     }
     flush();
-    // Self-heal kills: a kill is a publish-with-a-side-effect, so it rides the
-    // SAME renewal replay as cached messages — re-send every active tombstone the
-    // subscriber's `since` predates. A subscriber that missed the live delete
-    // re-acquires it here on its next renewal (and stops, since the kill advances
-    // its since past killTs). Carries killTs+signer so the receiver's tombstone
-    // matches (consistent re-fan + provisional authorship enforcement).
+    // Self-heal kills: re-send EVERY active (non-expired) tombstone on each
+    // renewal — NOT gated on `since`. A since-delta can't express "you're missing
+    // an OLD deletion": a node that missed the kill but kept receiving newer
+    // messages has a `since` already PAST killTs, so a killTs>since gate would
+    // never backfill it → it keeps the killed body forever and serves it to late
+    // subscribers (the v4.8.7 permanent-leak edge found by the soak). Replaying all
+    // live tombstones guarantees convergence; the receiver dedups idempotently
+    // (tombstone-set gate on re-fan + exactly-once kill key on app delivery), so a
+    // sub that already has them does no extra work. Bounded by the TTL'd tombstone
+    // set. Carries killTs+signer so the receiver's tombstone matches.
     const dels = [];
     for (const [tgt, tomb] of role.tombstones) {
-      if ((tomb?.killTs ?? 0) > sinceTs) dels.push({ del: true, msgId: tgt, killTs: tomb.killTs, signer: tomb.signer ?? null, publishTs: tomb.killTs });
+      if ((tomb?.exp ?? 0) > this._now()) dels.push({ del: true, msgId: tgt, killTs: tomb.killTs, signer: tomb.signer ?? null, publishTs: tomb.killTs });
     }
     if (dels.length) {
       sent = true;
@@ -639,7 +643,7 @@ export class AxonaManager {
       if (!seen.has(newest.msgId)) this._deliverToApp(role.topicId, newest.json, newest.msgId, newest.publishTs);
     }
     // kills replay alongside the cache (exactly-once on the kill-specific key).
-    for (const [tgt, tomb] of role.tombstones) if ((tomb?.killTs ?? 0) > sinceTs) this._deliverKillToApp(role.topicId, tgt, tomb.killTs);
+    for (const [tgt, tomb] of role.tombstones) if ((tomb?.exp ?? 0) > this._now()) this._deliverKillToApp(role.topicId, tgt, tomb.killTs);
   }
 
   // ── cache ────────────────────────────────────────────────────────────
