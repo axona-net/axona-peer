@@ -73,7 +73,8 @@ const MAX_VIA         = 8;               // ordered-waypoint list length cap (wi
 const VIA_HOP_BUDGET  = 8;               // hops per via leg (enforced kernel-side, Phase 2+)
 const TTL_MS          = 24 * 60 * 60 * 1000;   // 24h message hold, keyed on the ROOT timestamp
 const APP_DEDUP_MAX   = 8192;            // exactly-once app-delivery LRU
-const PENDING_PUB_TTL_MS = 30_000;       // retain a recent publish this long so it can be re-sent toward the true root once a background lookup resolves (covers a stranded one-shot publish; idempotent — root dedups by msgId)
+const PENDING_PUB_TTL_MS = 30_000;       // retain a recent publish/kill this long so refreshTick can RE-SEND it toward the true root until the publisher observes its own msgId (implicit ack) — covers a strand on the greedy walk AND packet loss; idempotent (root dedups by msgId)
+const PENDING_PUB_MAX_TRIES = 6;         // cap re-sends so a never-confirmed publish (e.g. a non-subscribed publisher under loss) can't re-send unboundedly; loss^7 is negligible even at 30%
 const REPLAY_CHUNK_BYTES = 96 * 1024;    // byte budget per replay deliver batch
 const FUTURE_TOLERANCE_MS = 5 * 60 * 1000;   // §5 bad-clock rule: drop replayed stamps this far ahead
 
@@ -443,6 +444,7 @@ export class AxonaManager {
     role.lastTs = ts;
     const msg = { json, publishTs: ts, msgId: env.msgId };
     this._cachePush(role, { msgId: env.msgId, publishTs: ts, json });
+    this._confirmPending(role.topicId, env.msgId);                       // our own publish landed (we're its root) → stop retrying
     this._fanout(role, msg, null);                                       // to subscribers
     this._deliverToApp(role.topicId, json, env.msgId, ts);              // local app (if subscribed)
   }
@@ -649,6 +651,7 @@ export class AxonaManager {
     if (this._appDelivered.size > APP_DEDUP_MAX) this._appDelivered.delete(this._appDelivered.keys().next().value);
     const prev = this._lastSeenTsByTopic.get(topicBig) || 0;
     if (publishTs > prev) this._lastSeenTsByTopic.set(topicBig, publishTs);
+    this._confirmPending(topicBig, msgId);             // a subscribed publisher saw its own msg → stop retrying
     if (this._deliveryCallback) {
       try { this._deliveryCallback(topicBig, json, msgId, publishTs); }
       catch (e) { this._log('warn', 'delivery-callback-threw', { err: e?.message }); }
@@ -663,10 +666,23 @@ export class AxonaManager {
       role.cacheIds.delete(m.msgId);
       this._fanout(role, m, null);
     }
+    this._confirmPending(topicBig, m.msgId);           // our own kill landed → stop retrying it
     if (this.mySubscriptions.has(topicBig) && this._deliveryCallback) {
       try { this._deliveryCallback(topicBig, JSON.stringify({ deleted: true, msgId: m.msgId, topic: m.topic ?? null }), m.msgId, m.publishTs ?? this._now()); }
       catch (e) { this._log('warn', 'delete-callback-threw', { err: e?.message }); }
     }
+  }
+
+  // Implicit ACK for the persistent publish/kill retry: when this node OBSERVES a
+  // msgId locally (it became root and cached it / it relayed it / it was delivered
+  // to our app, or a kill tombstoned it), any pending publish/kill we hold for that
+  // msgId has demonstrably reached a holder — stop re-sending it. Publishers that
+  // never observe their own msg (non-subscribed, non-root) fall back to the bounded
+  // maxTries/TTL in refreshTick.
+  _confirmPending(_topicBig, msgId) {
+    if (!msgId) return;                                // pending maps are keyed by msgId (globally unique)
+    this._pendingPub?.delete(msgId);
+    this._pendingKill?.delete(msgId);
   }
 
   _becomeRoot(topicBig) {
@@ -761,21 +777,13 @@ export class AxonaManager {
                 !(this._upstream.get(topicBig) || []).length) {
               this._emitSubscribe(topicBig, [hex]);
             }
-            // Heal (publish): a recent publish may have stranded on the greedy
-            // walk → re-send it toward the now-known root, once. Idempotent
-            // (root dedups by msgId); then drop it so we don't re-send forever.
-            const pend = this._pendingPub && this._pendingPub.get(topicBig);
-            if (hex && pend && (this._now() - pend.at) < PENDING_PUB_TTL_MS) {
-              this._send(T.PUB, { topicId: idHex(topicBig), via: [hex], json: pend.json });
-              this._pendingPub.delete(topicBig);
-            }
-            // Same strand-heal for a kill (tombstone): re-send toward the now-known
-            // root, once. Idempotent — the root dedups the tombstone by msgId.
-            const pkill = this._pendingKill && this._pendingKill.get(topicBig);
-            if (hex && pkill && (this._now() - pkill.at) < PENDING_PUB_TTL_MS) {
-              this._send(T.KILL, { topicId: idHex(topicBig), via: [hex], kill: pkill.kill });
-              this._pendingKill.delete(topicBig);
-            }
+            // Heal (publish/kill): a stranded publish/kill is RE-SENT toward the
+            // true root by the persistent retry loop in refreshTick (until the
+            // publisher observes its own msgId — implicit ack — or TTL/maxTries).
+            // Single one-shot here was insufficient under packet loss: initial +
+            // one retry both dropping = the message lost forever, the root never
+            // gets it, no subscriber can ever receive it (the ~1/3 publish-strand
+            // under 10-30% loss, captured by repro_lossy_restart.mjs).
           })
           .catch(() => { /* resolve failed → greedy stays in effect */ })
           .finally(() => this._lookupInflight.delete(topicBig));
@@ -932,7 +940,10 @@ export class AxonaManager {
     // resolves — a one-shot publish never re-routes on its own, so a cold-hint
     // strand = a lost message. Idempotent: the root dedups by msgId.
     if (!this._pendingPub) this._pendingPub = new Map();
-    this._pendingPub.set(topicId, { json, at: this._now() });
+    // Keyed by msgId (not topic) so two quick publishes to the SAME topic don't
+    // overwrite each other's pending retry — each message is independently retried.
+    let pmsgId = null; try { pmsgId = JSON.parse(json)?.msgId ?? null; } catch { /* opaque body */ }
+    if (pmsgId) this._pendingPub.set(pmsgId, { topicBig: topicId, json, at: this._now(), tries: 0 });
     this._send(T.PUB, { topicId: idHex(topicId), via: hint ? [hint] : [], json });
     return meta.postHash || '';
   }
@@ -992,7 +1003,7 @@ export class AxonaManager {
   pubsubKill(topicId, kill) {
     const hint = this._rootHint_(topicId);
     if (!this._pendingKill) this._pendingKill = new Map();
-    this._pendingKill.set(topicId, { kill, at: this._now() });
+    if (kill?.msgId) this._pendingKill.set(kill.msgId, { topicBig: topicId, kill, at: this._now(), tries: 0 });
     this._send(T.KILL, { topicId: idHex(topicId), via: hint ? [hint] : [], kill });
   }
   // pubsubUnpub() — REMOVED v4.3.0 (decision 2026-06-25: keep kill, drop unpub)
@@ -1117,6 +1128,26 @@ export class AxonaManager {
       // root it held history → the root never issued PULLUP and the cache stayed
       // stranded below an empty root (lost on the original root's departure).
       this._sendSubscribe(t);
+    }
+
+    // 1c. Persistent publish/kill retry (reliability under packet loss). A routed
+    //     PUB/KILL is one-shot fire-and-forget; under loss the initial send +
+    //     a single heal both dropping = the message never reaches the root and is
+    //     lost for everyone. Re-send each tick toward the CURRENT root hint until
+    //     the publisher observes its own msgId (implicit ack, _confirmPending) or
+    //     maxTries/TTL — idempotent (the root dedups by msgId). Repro:
+    //     test/repro_lossy_restart.mjs (root held full backlog ~20/30 → 30/30).
+    for (const map of [this._pendingPub, this._pendingKill]) {
+      if (!map) continue;
+      const isKill = map === this._pendingKill;
+      for (const [msgId, p] of map) {                  // keyed by msgId; p.topicBig is the topic
+        if (now - p.at > PENDING_PUB_TTL_MS || (p.tries || 0) >= PENDING_PUB_MAX_TRIES) { map.delete(msgId); continue; }
+        p.tries = (p.tries || 0) + 1;
+        const tb = p.topicBig;
+        const hint = this._rootHint_(tb);
+        if (isKill) this._send(T.KILL, { topicId: idHex(tb), via: hint ? [hint] : [], kill: p.kill });
+        else        this._send(T.PUB,  { topicId: idHex(tb), via: hint ? [hint] : [], json: p.json });
+      }
     }
 
     // 2. Evict stale subscribers; expire cache + tombstones; tear down a role
