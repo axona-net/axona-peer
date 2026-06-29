@@ -108,9 +108,20 @@ export class AxonaPeer extends DHT {
    *        signed publishes (the default).  Apps that only call
    *        `peer.pub(topic, message, { sign: false })` can omit it.
    */
-  constructor({ engine = null, domain = null, node, axonaManager = null, nodeIdentity = null, transport = null, persist = null, maxPublishBytes = null }) {
+  constructor({ engine = null, domain = null, node, axonaManager = null, nodeIdentity = null, transport = null, persist = null, maxPublishBytes = null, synaptomeMaintain = null }) {
     super();
     if (!node) throw new Error('AxonaPeer: node is required');
+    // Synaptome maintenance (Synaptome-Maintenance-v0.1): continuously refill the
+    // K_NEAR XOR-nearest "successor" quota so greedy routing's last-mile descent
+    // always completes through churn. OPT-IN (default off) — when omitted the peer
+    // behaves exactly as before. `{ kNear, intervalMs, maxPerTick }` overrides.
+    this._maintainCfg = (synaptomeMaintain && typeof synaptomeMaintain === 'object')
+      ? { kNear: synaptomeMaintain.kNear ?? 5, intervalMs: synaptomeMaintain.intervalMs ?? 15000, maxPerTick: synaptomeMaintain.maxPerTick ?? 3 }
+      : (synaptomeMaintain === true)
+        ? { kNear: 5, intervalMs: 15000, maxPerTick: 3 }
+        : null;
+    this._maintainTimer = null;
+    this._maintainInflight = false;
     // O-5: a publish must be RECEIVABLE by any peer on any browser across any
     // path → default the per-publish limit to the WebRTC-interop floor (16 KiB),
     // never above the absolute ingress cap. Override only for controlled,
@@ -374,6 +385,8 @@ export class AxonaPeer extends DHT {
           (node._deadPeers ??= new Set()).add(dead);
           this._axonaManager?.invalidateKClosestCache?.();
           this._emitLog?.('info', 'peer-died-evicted', { peer: toHex(dead) });
+          this._scheduleMaintain();   // a lost peer may have been a near-quota successor → refill
+
         } catch (err) {
           if (typeof console !== 'undefined') console.warn('AxonaPeer.onPeerDied: eviction failed', err);
         }
@@ -381,6 +394,16 @@ export class AxonaPeer extends DHT {
     }
 
     this._started = true;
+
+    // Synaptome-maintenance tick (opt-in): a deterministic cadence to refill the
+    // near-quota, independent of routing traffic (anneal only fires on activity,
+    // so an idle node would never refresh). No-op when the flag is off.
+    if (this._maintainCfg && !this._maintainTimer) {
+      this._maintainTimer = setInterval(() => {
+        this._maintainSynaptome().catch(() => { /* best-effort */ });
+      }, this._maintainCfg.intervalMs);
+      if (this._maintainTimer && typeof this._maintainTimer.unref === 'function') this._maintainTimer.unref();
+    }
   }
 
   /**
@@ -735,6 +758,10 @@ export class AxonaPeer extends DHT {
       this._onPeerDiedUnsub();
       this._onPeerDiedUnsub = null;
     }
+    if (this._maintainTimer) {
+      clearInterval(this._maintainTimer);
+      this._maintainTimer = null;
+    }
     this._started = false;
   }
 
@@ -910,6 +937,67 @@ export class AxonaPeer extends DHT {
     // stale K-closest cache so the next pub/sub recomputes against it.
     this._axonaManager?.invalidateKClosestCache?.();
     return opened;
+  }
+
+  // ── Synaptome maintenance (Synaptome-Maintenance-v0.1) ─────────────────
+  // Continuously refill the K_NEAR XOR-nearest "successor" quota — the cheap,
+  // local repair that keeps greedy routing's last-mile descent complete through
+  // churn (sim-validated: near-stratum erodes without it, delivery drifts down).
+  // Candidates route through `_considerCandidate` → B-3 first-party verification
+  // + budgeted openConnection, so a forged "near" id can NEVER poison the table
+  // (eclipse-safe). Bounded per tick; a no-op once the quota is full. Long-range
+  // / per-stratum "finger" coverage is maintained by the existing anneal path
+  // (`_tryAnneal`); both are needed (sim: near-only holds occupancy but delivery
+  // still collapses when long-range is starved).
+  //
+  // OPT-IN via the `synaptomeMaintain` constructor option (default off → inert).
+  // v1 uses `findKClosest` as the authoritative nearest source (local-first,
+  // probe-bounded); a pure 2-hop-neighbourhood source — cheaper, the sims show it
+  // suffices — is a documented follow-up optimization.
+  async _maintainSynaptome() {
+    const cfg = this._maintainCfg;
+    const node = this._node;
+    if (!cfg || this._maintainInflight || !node?.alive) return 0;
+    if (typeof node.transport?.openConnection !== 'function') return 0;
+    this._maintainInflight = true;
+    try {
+      const self = node.id;
+      let nearest;
+      // Request kNear+1: findKClosest(self, …) returns self as the closest entry,
+      // so without the +1 we'd only ever fill kNear-1 successors.
+      try { nearest = await this.findKClosest(self, cfg.kNear + 1); }
+      catch { return 0; }
+      if (!Array.isArray(nearest)) return 0;
+      const isConn = (id) => node.synaptome?.has(id)
+        || (typeof node.transport?.isConnected === 'function' && node.transport.isConnected(id));
+      const deficit = [];
+      for (const id of nearest) {
+        if (typeof id !== 'bigint' || id === self) continue;
+        if (!isConn(id)) deficit.push(id);
+        if (deficit.length >= cfg.maxPerTick) break;
+      }
+      let attempted = 0;
+      for (const id of deficit) {
+        attempted++;
+        try { await this._considerCandidate(id, 'maintain'); } catch { /* verified-connect is best-effort */ }
+      }
+      if (attempted) {
+        this._axonaManager?.invalidateKClosestCache?.();
+        this._emitLog?.('info', 'synaptome-refill', { near: cfg.kNear, attempted });
+      }
+      return attempted;
+    } finally { this._maintainInflight = false; }
+  }
+
+  // Debounced trigger — coalesce a burst of near-neighbour losses into one pass.
+  _scheduleMaintain() {
+    if (!this._maintainCfg || this._maintainPending) return;
+    this._maintainPending = true;
+    const t = setTimeout(() => {
+      this._maintainPending = false;
+      this._maintainSynaptome().catch(() => { /* best-effort */ });
+    }, 250);
+    if (t && typeof t.unref === 'function') t.unref();
   }
 
   /**

@@ -146,6 +146,8 @@ export class AxonaManager {
     replayCacheSize = CACHE_MAX,
     replayCacheBytes = CACHE_BYTES,
     maxDirect = MAX_DIRECT,
+    beaconFanout = BEACON_FANOUT,  // K XOR-closest neighbors per beacon layer (root-announce reach)
+    beaconLayers = BEACON_LAYERS,  // recursive forward depth (reach ≈ K + K² + … + K^layers)
     ..._legacy   // accepted-and-ignored clean-break tunables (pickRelayPeer, rootSetSize, …)
   } = {}) {
     if (!dht || typeof dht.routeMessage !== 'function' || typeof dht.getSelfId !== 'function'
@@ -178,6 +180,8 @@ export class AxonaManager {
     this._beaconSeen      = new Map();  // beaconId -> exp  (flood dedup)
     this._lastBeaconAt    = 0;
     this._beaconSeq       = 0;
+    this._beaconFanout    = beaconFanout;   // tunable root-announce reach (see _emitRootBeacons)
+    this._beaconLayers    = beaconLayers;
     this._appDelivered    = new Map();  // "topicHex:msgId" -> true (exactly-once LRU)
     this._deliveryCallback = null;
     this._hostKeyspace    = false;
@@ -899,12 +903,12 @@ export class AxonaManager {
     if (!rooted.length) return;
     const neigh = (this.dht.neighbors() || []).map(idBig).filter(n => n !== this.nodeId);
     if (!neigh.length) return;
-    const basin = neigh.slice().sort((a, b) => this._cmpXor(a, b, this.nodeId)).slice(0, BEACON_FANOUT);
+    const basin = neigh.slice().sort((a, b) => this._cmpXor(a, b, this.nodeId)).slice(0, this._beaconFanout);
     const payload = {
       root: lc(idHex(this.nodeId)),
       topics: rooted.map(idHex),
       beaconId: `${idHex(this.nodeId).slice(0, 10)}-${this._now()}-${this._beaconSeq++}`,
-      layer: BEACON_LAYERS,
+      layer: this._beaconLayers,
     };
     this._beaconSeen.set(payload.beaconId, this._now() + BEACON_SEEN_MS);   // never re-forward my own
     for (const nb of basin) this._route(nb, T.ROOTBEACON, payload);
@@ -951,7 +955,7 @@ export class AxonaManager {
       let from = null; try { if (meta && meta.fromId != null) from = idBig(meta.fromId); } catch { /* */ }
       const neigh = (this.dht.neighbors() || []).map(idBig).filter(n => n !== this.nodeId && n !== from);
       const fwd = { ...payload, layer: payload.layer - 1 };
-      for (const nb of neigh.sort((a, b) => this._cmpXor(a, b, this.nodeId)).slice(0, BEACON_FANOUT)) {
+      for (const nb of neigh.sort((a, b) => this._cmpXor(a, b, this.nodeId)).slice(0, this._beaconFanout)) {
         this._route(nb, T.ROOTBEACON, fwd);
       }
     }
