@@ -830,11 +830,9 @@ async function bootAxonaNode(opts = {}) {
   node.transport = transport;
 
   const domain = new AxonaDomain({ k: 20 });
-  // synaptomeMaintain: refill the K_NEAR XOR-nearest successor quota through churn
-  // (Synaptome-Maintenance-v0.1; enabled in dev per 2026-06-29 decision — E-1 is
-  // pre-production hardening, not a dev blocker).
-  peer = new AxonaPeer({ domain, node, nodeIdentity: identity, transport,
-                         synaptomeMaintain: { kNear: 5, intervalMs: 15000, maxPerTick: 3 } });   // publishes are signed per-call via { signWith: authorIdentity }
+  // synaptomeMaintain REVERTED to off (2026-06-29) — enabling near-quota maintenance
+  // regressed Howard's suite; re-enable only behind a fix + Howard gate.
+  peer = new AxonaPeer({ domain, node, nodeIdentity: identity, transport });   // publishes are signed per-call via { signWith: authorIdentity }
 
   // ── Wire UI events BEFORE start so we don't miss the first welcome
   //    / state transition that lands during the handshake. ──────────
