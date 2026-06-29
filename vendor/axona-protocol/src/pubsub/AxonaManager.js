@@ -97,6 +97,7 @@ const T = {
   ADOPT:    'pubsub:adopt',     // delegate: "become my child relay + take these subscribers"
   PULLUP:   'pubsub:pullup',    // "I'm behind you — replay your stamped history up to me" (§6)
   REPLAYUP: 'pubsub:replayup',  // a relay's stamped cache delta, routed UP to a behind parent
+  HANDOFF:  'pubsub:handoff',   // graceful-leave: a departing root pushes its cache to its heir
   KILL:     'pubsub:kill',      // retract a message (thin; TODO Phase 4)
   UNPUB:    'pubsub:unpub',     // RESERVED — removed v4.3.0 (no handler/sender); wire string kept so legacy frames are ignored, not misrouted
   TOUCH:    'pubsub:touch',     // extend TTL (thin; TODO Phase 4)
@@ -194,6 +195,7 @@ export class AxonaManager {
     on(T.ADOPT,    this._onAdopt);
     on(T.PULLUP,   this._onPullUp);
     on(T.REPLAYUP, this._onReplayUp);
+    on(T.HANDOFF,  this._onHandoff);
     on(T.KILL,     this._onKill);
     on(T.TOUCH,    this._onTouch);   // no-op (peer.touch deprecated v4.3.0); kept for wire compat
     on(T.PULL,     this._onPull);
@@ -487,6 +489,47 @@ export class AxonaManager {
     this._deliverToApp(role.topicId, m.json, m.msgId, m.publishTs);
   }
 
+  // ── graceful-leave cache handoff ─────────────────────────────────────
+  // A departing root pushes its cache to its heir (the next-closest live node)
+  // BEFORE it leaves, so a topic's history survives the root's departure even
+  // when no relay/host held a copy. The heir adopts the cache and becomes the
+  // root, so subscribers that re-home to it (or join after) still replay the
+  // pre-departure history via since:'all'. This is the common-case durability fix
+  // for single-root topics — nodes that leave gracefully (peer.leave()) hand off;
+  // abrupt death still needs a replica/in-region host (separate work).
+  async _onHandoff(payload, meta) {
+    if (meta.targetId !== this.nodeId) return;
+    const topicBig = idBig(payload.topicId);
+    // Adopt as a root: _becomeRoot makes the role (isRoot) if we don't have one,
+    // so we serve the inherited history; routing/beacons reconcile root-ness.
+    const role = this.axonRoles.get(topicBig) || this._becomeRoot(topicBig);
+    for (const m of (Array.isArray(payload.msgs) ? payload.msgs : [])) {
+      if (m && typeof m.json === 'string' && Number.isFinite(m.publishTs)) await this._ingestStamped(role, m);
+    }
+    return 'consumed';
+  }
+
+  // Called from AxonaPeer.leave() while the transport is still up: for every
+  // topic we ROOT and hold cache for, push the cache to the heir (next-closest
+  // live node) so the history isn't lost when we go. Best-effort; never throws.
+  async pubsubLeaveHandoff() {
+    if (typeof this.dht.findKClosest !== 'function') return;
+    for (const [t, role] of this.axonRoles) {
+      if (!role.isRoot || !role.cache.length) continue;
+      let heir = null;
+      try {
+        const arr = await this.dht.findKClosest(t, 3);
+        for (const id of (Array.isArray(arr) ? arr : [])) {
+          const b = idBig(id);
+          if (b !== this.nodeId) { heir = b; break; }   // closest node that isn't us
+        }
+      } catch { /* no heir resolvable → nothing we can do */ }
+      if (heir === null) continue;
+      const msgs = role.cache.map(c => ({ json: c.json, publishTs: c.publishTs, msgId: c.msgId }));
+      try { this._route(heir, T.HANDOFF, { topicId: idHex(t), msgs }); } catch { /* best-effort */ }
+    }
+  }
+
   // ── DELIVER (parent → subscriber; a relay re-fans down the tree) ──────
   _onDeliver(payload, meta) {
     if (meta.targetId !== this.nodeId) return;        // forward (intermediate hop)
@@ -690,7 +733,13 @@ export class AxonaManager {
         : null;
     if (!resolveClosest) return null;
     const cached = this._rootHint.get(topicBig);
-    const fresh = cached && (this._now() - cached.at) < this.renewMs;
+    // While we have no pin (a fresh subscriber, or one whose root just churned and
+    // we dropped the pin), treat the cached hint as stale after only renewFastMs
+    // so we re-resolve the CURRENT closest reachable root every few seconds —
+    // instead of sitting on a 60s-cached hint that points at a dead/wrong node.
+    const attached = (this._upstream.get(topicBig) || []).length > 0;
+    const freshFor = attached ? this.renewMs : this.renewFastMs;
+    const fresh = cached && (this._now() - cached.at) < freshFor;
     if (!fresh) {
       if (!this._lookupInflight) this._lookupInflight = new Set();
       if (!this._lookupInflight.has(topicBig)) {
@@ -719,6 +768,13 @@ export class AxonaManager {
             if (hex && pend && (this._now() - pend.at) < PENDING_PUB_TTL_MS) {
               this._send(T.PUB, { topicId: idHex(topicBig), via: [hex], json: pend.json });
               this._pendingPub.delete(topicBig);
+            }
+            // Same strand-heal for a kill (tombstone): re-send toward the now-known
+            // root, once. Idempotent — the root dedups the tombstone by msgId.
+            const pkill = this._pendingKill && this._pendingKill.get(topicBig);
+            if (hex && pkill && (this._now() - pkill.at) < PENDING_PUB_TTL_MS) {
+              this._send(T.KILL, { topicId: idHex(topicBig), via: [hex], kill: pkill.kill });
+              this._pendingKill.delete(topicBig);
             }
           })
           .catch(() => { /* resolve failed → greedy stays in effect */ })
@@ -926,7 +982,19 @@ export class AxonaManager {
   }
   pubsubHostKeyspace(on = true) { this._hostKeyspace = !!on; }
 
-  pubsubKill(topicId, kill)   { this._send(T.KILL,  { topicId: idHex(topicId), via: [], kill }); }
+  // Route the kill (tombstone) toward the topic's root EXACTLY like a publish:
+  // via the warm true-root hint if we have one, else greedy. A kill is a one-shot
+  // routed message — without the hint it strands on the greedy walk just as a cold
+  // publish does, and (unlike a renewed subscribe) never re-routes on its own, so a
+  // stranded kill = a tombstone that never reaches subscribers (the ~30% "kill not
+  // received" flake). Retain it briefly so the background lookup re-sends it toward
+  // the true root once resolved. Idempotent — the root dedups the tombstone by msgId.
+  pubsubKill(topicId, kill) {
+    const hint = this._rootHint_(topicId);
+    if (!this._pendingKill) this._pendingKill = new Map();
+    this._pendingKill.set(topicId, { kill, at: this._now() });
+    this._send(T.KILL, { topicId: idHex(topicId), via: hint ? [hint] : [], kill });
+  }
   // pubsubUnpub() — REMOVED v4.3.0 (decision 2026-06-25: keep kill, drop unpub)
   pubsubTouch(topicId, touch) { this._send(T.TOUCH, { topicId: idHex(topicId), via: [], touch }); }
 
@@ -1026,10 +1094,19 @@ export class AxonaManager {
       if (role && role.isRoot) continue;
       const s = this.mySubscriptions.get(t);
       if (s) {
-        const iv = s.interval || this.renewFastMs;
+        // Stay at the fast floor while UNATTACHED (no upstream pin yet — a fresh
+        // or stranded subscriber) so it retries + re-resolves quickly; back off
+        // ×1.5 only once attached + stable. Paired with the unattached root-hint
+        // re-resolve in _rootHint_, this turns a stranded subscriber's 60s-cached
+        // dead-hint wait into a few-second re-home (the dead-pin case is already
+        // covered by the route-via-dead-waypoint reroute).
+        const attached = (this._upstream.get(t) || []).length > 0;
+        const iv = attached ? (s.interval || this.renewFastMs) : this.renewFastMs;
         if (now - s.lastRenewSent < iv) continue;
         s.lastRenewSent = now;
-        s.interval = Math.min(this.renewMs, Math.round(iv * RENEW_BACKOFF));   // back off toward ceiling while stable
+        s.interval = attached
+          ? Math.min(this.renewMs, Math.round((s.interval || this.renewFastMs) * RENEW_BACKOFF))
+          : this.renewFastMs;
       }
       this._sendSubscribe(t);
     }

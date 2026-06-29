@@ -955,6 +955,13 @@ export class AxonaPeer extends DHT {
       }
     }
 
+    // (1b) graceful-leave cache handoff: push any topic we ROOT to its heir
+    // (next-closest live node) while the transport is still up, so the topic's
+    // history survives our departure (since:'all' replay keeps working for
+    // subscribers that re-home or join after we go). Best-effort; bounded by the
+    // drain window below. Must run BEFORE we tear down the transport/listeners.
+    try { await this._axonaManager?.pubsubLeaveHandoff?.(); } catch { /* best-effort */ }
+
     // (2) optional drain — pause for in-flight publishes / pulls
     if (drain && timeoutMs > 0) {
       // Without a per-publish ack stream we can only bound by time.
