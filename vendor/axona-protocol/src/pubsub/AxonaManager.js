@@ -66,6 +66,21 @@ const RENEW_MS        = 60_000;          // re-subscribe cadence CEILING (stable
 const RENEW_FAST_MS   = 5_000;           // adaptive floor: initial + post-re-home interval
 const RENEW_BACKOFF   = 1.5;             // multiply the interval each stable renewal, up to RENEW_MS
 const DROP_MS         = 180_000;         // evict a subscriber after missed renewals (≥ 3× ceiling)
+// Reachable-root fallback (cold-convergence fix). An unpinned subscriber whose
+// iterative root hint names a node CLOSER in XOR but that never adopts it back
+// (unreachable on the greedy data path / "broken-but-authentic") would otherwise
+// defer forever and the topic never roots → total strand. After this confirmation
+// window with no upstream pin, if we are the closest node among our REACHABLE
+// neighbours we claim root locally — preferring a reachable root over a
+// closer-but-unconfirmed one. Long enough (≥2 ticks) that a genuinely reachable
+// multi-hop closer root has time to adopt us first; a wrongly-claimed farther root
+// is self-corrected by the strictly-closer beacon demotion (_onRootBeacon).
+const ROOT_CLAIM_MS   = 6_000;           // unconfirmed-deferral window before self-claiming root
+// ≈1 renewFastMs cycle: long enough that a genuinely reachable multi-hop closer
+// root adopts us first (deliver-`from` pin), short enough that a cold topic roots
+// within a couple of seconds instead of stranding. (12s was measured too slow —
+// convergence was bottlenecked on the window: conv-strand 8/10 @7s wait vs 5/5
+// @20s; dropping the window lets the would-be root claim ~1 tick after subscribe.)
 const CACHE_MAX       = 1024;            // messages cached per relay
 const CACHE_BYTES     = 16 * 1024 * 1024;// byte ceiling on a relay's cache
 const MAX_DIRECT      = 20;              // direct subscribers before a relay delegates
@@ -125,7 +140,12 @@ function makeRole(topicId, isRoot) {
     cacheIds: new Set(),             // msgId set for O(1) dedup (root-stamp + relay re-fan)
     cacheBytes: 0,
     lastTs: 0,                       // highest stamp emitted (monotonic; root authority)
-    tombstones: new Map(),           // msgId -> expireTs (kill; thin)
+    seq: 0,                          // DENSE per-topic counter (root authority): ++ per emitted
+                                     // message AND kill, so subscribers detect GAPS (env.seq jumps
+                                     // ⇒ a message was missed). Distinct from the time-floored
+                                     // publishTs (which is monotonic but sparse). Recovered to the
+                                     // max seen seq on replay-up/handoff so a new root continues densely.
+    tombstones: new Map(),           // msgId -> { exp, killTs, signer, seq }  (kill; thin)
   };
 }
 
@@ -176,6 +196,7 @@ export class AxonaManager {
     // Internal.
     this._upstream        = new Map();  // topicIdBig -> [hex]  the relay we renew toward
     this._rootHint        = new Map();  // topicIdBig -> { via:hex|null, at }  cached iterative-lookup root
+    this._unattachedSince = new Map();  // topicIdBig -> ts  first tick seen subscribed-but-unpinned (reachable-root fallback)
     this._rootBeacons     = new Map();  // topicIdBig -> { root:hex, at, exp }  inbound root advert (soft state)
     this._beaconSeen      = new Map();  // beaconId -> exp  (flood dedup)
     this._lastBeaconAt    = 0;
@@ -448,11 +469,12 @@ export class AxonaManager {
     // STAMP — single serialization point; strictly monotonic, floored at now.
     const ts = Math.max(role.lastTs + 1, this._now());
     role.lastTs = ts;
-    const msg = { json, publishTs: ts, msgId: env.msgId };
-    this._cachePush(role, { msgId: env.msgId, publishTs: ts, json });
+    const seq = ++role.seq;                                              // dense per-topic counter (gap detection)
+    const msg = { json, publishTs: ts, msgId: env.msgId, seq };
+    this._cachePush(role, { msgId: env.msgId, publishTs: ts, json, seq });
     this._confirmPending(role.topicId, env.msgId);                       // our own publish landed (we're its root) → stop retrying
     this._fanout(role, msg, null);                                       // to subscribers
-    this._deliverToApp(role.topicId, json, env.msgId, ts);              // local app (if subscribed)
+    this._deliverToApp(role.topicId, json, env.msgId, ts, seq);          // local app (if subscribed)
   }
 
   // ── stamped-replay-up durability (§6) ────────────────────────────────
@@ -464,7 +486,7 @@ export class AxonaManager {
     if (!role || !role.cache.length) return 'consumed';
     const sinceHw = Number.isFinite(payload.sinceHw) ? payload.sinceHw : 0;
     const msgs = role.cache.filter(c => c.publishTs > sinceHw)
-                           .map(c => ({ json: c.json, publishTs: c.publishTs, msgId: c.msgId }));
+                           .map(c => ({ json: c.json, publishTs: c.publishTs, msgId: c.msgId, seq: c.seq }));
     if (msgs.length && isHexId(lc(payload.parentId))) {
       this._route(idBig(payload.parentId), T.REPLAYUP, { topicId: idHex(role.topicId), msgs });
     }
@@ -492,10 +514,11 @@ export class AxonaManager {
     if (m.publishTs > this._now() + FUTURE_TOLERANCE_MS) { this._log('warn', 'drop-future-replayup'); return; } // §5 bad-clock
     if (role.cacheIds.has(m.msgId)) return;                              // already have it
     if (this._tombstoned(role, m.msgId, m.json)) return;                 // killed → don't resurrect via replay-up
-    this._cachePush(role, { msgId: m.msgId, publishTs: m.publishTs, json: m.json });
+    this._cachePush(role, { msgId: m.msgId, publishTs: m.publishTs, json: m.json, seq: m.seq });
     if (m.publishTs > role.lastTs) role.lastTs = m.publishTs;            // continue stamping above recovered history
-    this._fanout(role, { json: m.json, publishTs: m.publishTs, msgId: m.msgId }, null);
-    this._deliverToApp(role.topicId, m.json, m.msgId, m.publishTs);
+    if (Number.isFinite(m.seq) && m.seq > role.seq) role.seq = m.seq;   // recover dense counter → a new root continues it
+    this._fanout(role, { json: m.json, publishTs: m.publishTs, msgId: m.msgId, seq: m.seq }, null);
+    this._deliverToApp(role.topicId, m.json, m.msgId, m.publishTs, m.seq);
   }
 
   // ── graceful-leave cache handoff ─────────────────────────────────────
@@ -534,7 +557,7 @@ export class AxonaManager {
         }
       } catch { /* no heir resolvable → nothing we can do */ }
       if (heir === null) continue;
-      const msgs = role.cache.map(c => ({ json: c.json, publishTs: c.publishTs, msgId: c.msgId }));
+      const msgs = role.cache.map(c => ({ json: c.json, publishTs: c.publishTs, msgId: c.msgId, seq: c.seq }));
       try { this._route(heir, T.HANDOFF, { topicId: idHex(t), msgs }); } catch { /* best-effort */ }
     }
   }
@@ -562,10 +585,11 @@ export class AxonaManager {
       if (m.del) { this._applyKill(role, topicBig, m); continue; }   // del-marker carries killTs+signer
       if (this._tombstoned(role, m.msgId, m.json)) continue;          // killed → suppress (don't cache/deliver/re-fan)
       if (role && !role.cacheIds.has(m.msgId)) {       // relay: cache once + re-fan once
-        this._cachePush(role, { msgId: m.msgId, publishTs: m.publishTs, json: m.json });
-        this._fanout(role, m, lc(payload.from));       // exclude the sender
+        this._cachePush(role, { msgId: m.msgId, publishTs: m.publishTs, json: m.json, seq: m.seq });
+        if (Number.isFinite(m.seq) && m.seq > role.seq) role.seq = m.seq;   // keep counter ready if we're promoted to root
+        this._fanout(role, m, lc(payload.from));       // exclude the sender (m carries seq)
       }
-      this._deliverToApp(topicBig, m.json, m.msgId, m.publishTs);
+      this._deliverToApp(topicBig, m.json, m.msgId, m.publishTs, m.seq);
     }
     return 'consumed';
   }
@@ -595,7 +619,7 @@ export class AxonaManager {
     const flush = () => {
       if (!batch.length) return;
       sent = true;
-      if (isSelf) for (const m of batch) this._deliverToApp(role.topicId, m.json, m.msgId, m.publishTs);
+      if (isSelf) for (const m of batch) this._deliverToApp(role.topicId, m.json, m.msgId, m.publishTs, m.seq);
       else this._route(subBig, T.DELIVER,
         { topicId: idHex(role.topicId), from: idHex(this.nodeId), msgs: batch });
       batch = []; bytes = 0;
@@ -603,7 +627,7 @@ export class AxonaManager {
     for (const c of role.cache) {
       if (c.publishTs <= sinceTs) continue;
       if (bytes + c.bytes > REPLAY_CHUNK_BYTES) flush();
-      batch.push({ json: c.json, publishTs: c.publishTs, msgId: c.msgId });
+      batch.push({ json: c.json, publishTs: c.publishTs, msgId: c.msgId, seq: c.seq });
       inBatch.add(c.msgId);
       bytes += c.bytes;
     }
@@ -611,7 +635,7 @@ export class AxonaManager {
       const newest = role.cache[role.cache.length - 1];
       if (!inBatch.has(newest.msgId)) {
         if (bytes + newest.bytes > REPLAY_CHUNK_BYTES) flush();
-        batch.push({ json: newest.json, publishTs: newest.publishTs, msgId: newest.msgId });
+        batch.push({ json: newest.json, publishTs: newest.publishTs, msgId: newest.msgId, seq: newest.seq });
       }
     }
     flush();
@@ -627,11 +651,11 @@ export class AxonaManager {
     // set. Carries killTs+signer so the receiver's tombstone matches.
     const dels = [];
     for (const [tgt, tomb] of role.tombstones) {
-      if ((tomb?.exp ?? 0) > this._now()) dels.push({ del: true, msgId: tgt, killTs: tomb.killTs, signer: tomb.signer ?? null, publishTs: tomb.killTs });
+      if ((tomb?.exp ?? 0) > this._now()) dels.push({ del: true, msgId: tgt, killTs: tomb.killTs, signer: tomb.signer ?? null, publishTs: tomb.killTs, seq: tomb.seq });
     }
     if (dels.length) {
       sent = true;
-      if (isSelf) for (const dm of dels) this._deliverKillToApp(role.topicId, dm.msgId, dm.killTs);
+      if (isSelf) for (const dm of dels) this._deliverKillToApp(role.topicId, dm.msgId, dm.killTs, dm.seq);
       else this._route(subBig, T.DELIVER, { topicId: idHex(role.topicId), from: idHex(this.nodeId), msgs: dels });
     }
     if (ping && !sent && !isSelf) {                    // repin even with no history
@@ -641,13 +665,13 @@ export class AxonaManager {
 
   _replayLocal(role, sinceTs, latest = false) {
     const seen = new Set();
-    for (const c of role.cache) if (c.publishTs > sinceTs) { this._deliverToApp(role.topicId, c.json, c.msgId, c.publishTs); seen.add(c.msgId); }
+    for (const c of role.cache) if (c.publishTs > sinceTs) { this._deliverToApp(role.topicId, c.json, c.msgId, c.publishTs, c.seq); seen.add(c.msgId); }
     if (latest && role.cache.length) {               // since:'latest' — newest regardless of age
       const newest = role.cache[role.cache.length - 1];
-      if (!seen.has(newest.msgId)) this._deliverToApp(role.topicId, newest.json, newest.msgId, newest.publishTs);
+      if (!seen.has(newest.msgId)) this._deliverToApp(role.topicId, newest.json, newest.msgId, newest.publishTs, newest.seq);
     }
     // kills replay alongside the cache (exactly-once on the kill-specific key).
-    for (const [tgt, tomb] of role.tombstones) if ((tomb?.exp ?? 0) > this._now()) this._deliverKillToApp(role.topicId, tgt, tomb.killTs);
+    for (const [tgt, tomb] of role.tombstones) if ((tomb?.exp ?? 0) > this._now()) this._deliverKillToApp(role.topicId, tgt, tomb.killTs, tomb.seq);
   }
 
   // ── cache ────────────────────────────────────────────────────────────
@@ -672,7 +696,7 @@ export class AxonaManager {
   }
 
   // ── app delivery (exactly-once) ──────────────────────────────────────
-  _deliverToApp(topicBig, json, msgId, publishTs) {
+  _deliverToApp(topicBig, json, msgId, publishTs, seq) {
     if (!this.mySubscriptions.has(topicBig)) return;   // pure relay stores+forwards, doesn't consume
     const key = topicBig.toString(16) + ':' + msgId;
     if (this._appDelivered.has(key)) return;           // exactly-once
@@ -682,7 +706,7 @@ export class AxonaManager {
     if (publishTs > prev) this._lastSeenTsByTopic.set(topicBig, publishTs);
     this._confirmPending(topicBig, msgId);             // a subscribed publisher saw its own msg → stop retrying
     if (this._deliveryCallback) {
-      try { this._deliveryCallback(topicBig, json, msgId, publishTs); }
+      try { this._deliveryCallback(topicBig, json, msgId, publishTs, seq); }
       catch (e) { this._log('warn', 'delivery-callback-threw', { err: e?.message }); }
     }
   }
@@ -698,24 +722,26 @@ export class AxonaManager {
   _applyKill(role, topicBig, m) {
     const target = m.msgId;
     const killTs = m.killTs ?? this._now();
+    const seq = m.seq;                                 // root-assigned dense counter for this kill
+    if (role && Number.isFinite(seq) && seq > role.seq) role.seq = seq;   // recover counter (kill occupied a slot)
     if (role && !role.tombstones.has(target)) {
-      role.tombstones.set(target, { exp: this._now() + TTL_MS, killTs, signer: m.signer ?? null });
+      role.tombstones.set(target, { exp: this._now() + TTL_MS, killTs, signer: m.signer ?? null, seq });
       const i = role.cache.findIndex(c => c.msgId === target);
       if (i >= 0) { role.cacheBytes -= role.cache[i].bytes; role.cache.splice(i, 1); }
       role.cacheIds.delete(target);
-      // fan the delete down — carries killTs + signer so each receiver records an
-      // identical tombstone (consistent replay + provisional authorship enforcement).
-      this._fanout(role, { del: true, msgId: target, killTs, signer: m.signer ?? null, publishTs: killTs }, null);
+      // fan the delete down — carries killTs + signer + seq so each receiver records
+      // an identical tombstone (consistent replay + ordering + provisional authorship).
+      this._fanout(role, { del: true, msgId: target, killTs, signer: m.signer ?? null, publishTs: killTs, seq }, null);
     }
     this._confirmPending(topicBig, target);            // our own kill landed → stop retrying it
-    this._deliverKillToApp(topicBig, target, killTs);
+    this._deliverKillToApp(topicBig, target, killTs, seq);
   }
 
   // Deliver a kill to the local app (exactly-once, keyed distinctly from the
   // target's own delivery) and advance our since-floor to the kill's stamp so a
   // renewal stops re-pulling it once seen — while a MISSED kill (since still below
   // killTs) is re-pulled and self-heals.
-  _deliverKillToApp(topicBig, target, killTs) {
+  _deliverKillToApp(topicBig, target, killTs, seq) {
     if (!this.mySubscriptions.has(topicBig)) return;   // pure relay stores+forwards, doesn't consume
     const prev = this._lastSeenTsByTopic.get(topicBig) || 0;
     if (killTs > prev) this._lastSeenTsByTopic.set(topicBig, killTs);
@@ -724,7 +750,7 @@ export class AxonaManager {
     this._appDelivered.set(key, true);
     if (this._appDelivered.size > APP_DEDUP_MAX) this._appDelivered.delete(this._appDelivered.keys().next().value);
     if (this._deliveryCallback) {
-      try { this._deliveryCallback(topicBig, JSON.stringify({ deleted: true, msgId: target, topic: null }), target, killTs); }
+      try { this._deliveryCallback(topicBig, JSON.stringify({ deleted: true, msgId: target, topic: null }), target, killTs, seq); }
       catch (e) { this._log('warn', 'delete-callback-threw', { err: e?.message }); }
     }
   }
@@ -965,16 +991,37 @@ export class AxonaManager {
   // any cached beacon root. Never triggers a network lookup (keeps the verify
   // step cheap and non-amplifying).
   _bestKnownClosest(tBig) {
+    const bridge = (typeof this.dht.bridgeId === 'function') ? this.dht.bridgeId() : null;
     let best = this.nodeId, bestD = this.nodeId ^ tBig;
     if (typeof this.dht.neighbors === 'function') {
       for (const n of (this.dht.neighbors() || [])) {
         let nb; try { nb = idBig(n); } catch { continue; }
+        if (bridge != null && nb === bridge) continue;   // bridge never a root → don't let it gate beacon acceptance
         const d = nb ^ tBig; if (d < bestD) { bestD = d; best = nb; }
       }
     }
     const b = this._rootBeacons.get(tBig);
     if (b) { try { const rb = idBig(b.root); const d = rb ^ tBig; if (d < bestD) { bestD = d; best = rb; } } catch { /* */ } }
     return best;
+  }
+
+  // True iff `self` is XOR-closest to `tBig` among the nodes we can ACTUALLY reach
+  // (self + direct, authenticated neighbours), excluding the bridge (signaling infra,
+  // never a topic root). The iterative findKClosest hint may name a node closer in
+  // XOR than any of these, but if it never adopts us it is effectively unreachable;
+  // when self beats every reachable neighbour, self is the best reachable root. Pure
+  // local read — no network probe. Sim/fabric without neighbours() → trivially self.
+  _selfClosestReachable(tBig) {
+    const bridge = (typeof this.dht.bridgeId === 'function') ? this.dht.bridgeId() : null;
+    let bestD = this.nodeId ^ tBig;
+    if (typeof this.dht.neighbors === 'function') {
+      for (const n of (this.dht.neighbors() || [])) {
+        let nb; try { nb = idBig(n); } catch { continue; }
+        if (nb === this.nodeId || (bridge != null && nb === bridge)) continue;
+        if ((nb ^ tBig) < bestD) return false;     // a reachable neighbour is closer → route to it
+      }
+    }
+    return true;
   }
 
   // Subscribe — always sent SYNCHRONOUSLY and immediately (fast path, never blocked
@@ -1143,10 +1190,12 @@ export class AxonaManager {
         return 'consumed';
       }
     }
-    // STAMP the kill like a publish (monotonic) so it orders + replays via `since`.
+    // STAMP the kill like a publish (monotonic + dense counter) so it orders +
+    // replays via `since` AND occupies a seq slot (a missed kill shows as a gap).
     const ts = Math.max(role.lastTs + 1, this._now());
     role.lastTs = ts;
-    this._applyKill(role, topicBig, { msgId: target, killTs: ts, signer: lc(kill.signerPubkey) });
+    const seq = ++role.seq;
+    this._applyKill(role, topicBig, { msgId: target, killTs: ts, signer: lc(kill.signerPubkey), seq });
     return 'consumed';
   }
   // _onUnpub — REMOVED v4.3.0 (keep kill, drop unpub)
@@ -1208,6 +1257,27 @@ export class AxonaManager {
         // dead-hint wait into a few-second re-home (the dead-pin case is already
         // covered by the route-via-dead-waypoint reroute).
         const attached = (this._upstream.get(t) || []).length > 0;
+        // Reachable-root fallback: if we've been subscribed-but-unpinned past the
+        // confirmation window (the iterative hint named a closer node that never
+        // adopted us — unreachable / broken-but-authentic) AND no reachable
+        // neighbour is closer to the topic than us, claim root locally rather than
+        // defer forever to an unreachable node. Prefer a reachable root over a
+        // closer-but-unconfirmed one. (A wrongly-claimed farther root self-corrects
+        // via the strictly-closer beacon demotion in _onRootBeacon.)
+        if (attached) {
+          this._unattachedSince.delete(t);
+        } else {
+          if (!this._unattachedSince.has(t)) this._unattachedSince.set(t, now);
+          if (now - this._unattachedSince.get(t) >= ROOT_CLAIM_MS && this._selfClosestReachable(t)) {
+            const role2 = this.axonRoles.get(t) || this._becomeRoot(t);
+            role2.isRoot = true;
+            this._upstream.delete(t);
+            this._rootHint.delete(t);          // stop deferring to the unreachable hint
+            this._unattachedSince.delete(t);
+            this._log('info', 'root-claimed-reachable', { topic: idHex(t).slice(0, 12) });
+            continue;                          // we are root now — no upstream to renew toward
+          }
+        }
         const iv = attached ? (s.interval || this.renewFastMs) : this.renewFastMs;
         if (now - s.lastRenewSent < iv) continue;
         s.lastRenewSent = now;

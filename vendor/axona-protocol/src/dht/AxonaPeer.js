@@ -2571,6 +2571,10 @@ export class AxonaPeer extends DHT {
         }
         return [...out];
       },
+      // The bridge node id (signaling infra, never a topic root). Lets AxonaManager
+      // exclude it from the reachable-closest test in its root-claim fallback, the
+      // same way findKClosest/routeMessage already skip it.
+      bridgeId: () => node.transport?.bridgeNodeIdBig ?? null,
       findKClosest: async (targetIdBig, K = 5) => {
         // AxonaManager now passes BigInt targetId; the adapter is
         // BigInt-throughout.  No hex conversion needed.
@@ -2580,18 +2584,26 @@ export class AxonaPeer extends DHT {
           );
         }
         const dist = new Map();
+        // The bridge is signaling infra, NEVER a topic root. It must be excluded
+        // here too — this local adapter is what AxonaManager's _rootHint_ prefers,
+        // and the bridge is in every peer's synaptome (bootstrap link). Without
+        // this skip, any topic XOR-closest to the bridge resolves its root hint TO
+        // the bridge, the SUB/PUB re-homes toward it, the bridge can't serve as a
+        // root → the tree never forms (the same strand the iterative findKClosest
+        // [bridgeId skip] and the greedy route hop already guard against).
+        const bridgeId = node.transport?.bridgeNodeIdBig ?? null;
         if (typeof selfId === 'bigint') {
           dist.set(selfId, selfId ^ targetIdBig);
         }
         for (const syn of node.synaptome?.values?.() ?? []) {
           const pid = syn.peerId;
-          if (typeof pid === 'bigint' && !dist.has(pid)) {
+          if (typeof pid === 'bigint' && !dist.has(pid) && pid !== bridgeId) {
             dist.set(pid, pid ^ targetIdBig);
           }
         }
         for (const syn of node.incomingSynapses?.values?.() ?? []) {
           const pid = syn.peerId;
-          if (typeof pid === 'bigint' && !dist.has(pid)) {
+          if (typeof pid === 'bigint' && !dist.has(pid) && pid !== bridgeId) {
             dist.set(pid, pid ^ targetIdBig);
           }
         }
@@ -2678,13 +2690,6 @@ export class AxonaPeer extends DHT {
       return 'consumed';
     });
 
-    // Match axona-peer's wiring: do NOT call am.start() here.
-    // axona-peer constructs AxonaManager via engine.axonFor(node)
-    // and never arms the 10s refreshTick interval.  Applications
-    // call peer.sub after the mesh has stabilised, so the
-    // initial K-closest is already wide and refresh isn't needed
-    // to recover from a stale boot-time target set.
-    //
     // Wire `pickRelayPeer` so sub-axon recruitment uses BATCH ADOPTION
     // (pick a relay XOR-closest to the new subscriber from the whole
     // synaptome, hand off a batch) instead of the fallback that promotes
@@ -2693,23 +2698,36 @@ export class AxonaPeer extends DHT {
     // (measured in dht-sim: depth ~21 at 600 subscribers vs ~4 with batch
     // adoption) — a latency/fragility scaling problem.  `shouldRecruitSubAxon`
     // keeps its default (recruit past `maxDirectSubs`).
-    return new AxonaManager({
+    const am = new AxonaManager({
       dht,
       pickRelayPeer: (role, subscriberId, forwarderId) =>
         this._pickRelayPeer(role, subscriberId, forwarderId),
     });
+    // ARM the periodic refreshTick (kernel v4.9.1). Earlier this was deliberately
+    // left un-armed ("apps subscribe after the mesh stabilises"), but that left the
+    // whole periodic healing layer — adaptive renewal/re-home, persistent pub/kill
+    // retry, and the reachable-root fallback — running ONLY on subscribe/publish
+    // events, never on cadence. On a real WebRTC mesh that under-heals: a subscriber
+    // stranded at a transient local-minimum (or whose root churns between its sparse
+    // sub/pub events) never re-resolves until the app happens to act again. Arming the
+    // tick is what those mechanisms were designed around. Idempotent + unref()'d, so
+    // it never holds the process open. The bridge already arms its own (bridge_axona_node).
+    // The sim/engine path (axonaManagerFor) does NOT reach here, so it keeps its
+    // injected clock and manual tick — only the standalone (browser/relay) peers arm.
+    am.start();
+    return am;
   }
 
   _installDeliveryHook(am) {
     if (this._deliveryHookInstalled) return;
     if (typeof am.onPubsubDelivery !== 'function') return;
-    am.onPubsubDelivery((topicId, json, publishId, publishTs) => {
-      this._dispatchDelivery(topicId, json, publishId, publishTs);
+    am.onPubsubDelivery((topicId, json, publishId, publishTs, seq) => {
+      this._dispatchDelivery(topicId, json, publishId, publishTs, seq);
     });
     this._deliveryHookInstalled = true;
   }
 
-  _dispatchDelivery(topicId, json, publishId, publishTs) {
+  _dispatchDelivery(topicId, json, publishId, publishTs, seq) {
     const set = this._subscriptions.get(topicId);
     if (!set || set.size === 0) return;
     let envelope;
@@ -2721,7 +2739,10 @@ export class AxonaPeer extends DHT {
       // skip the normal envelope shape check.
       if (envelope && typeof envelope === 'object' && envelope.deleted === true &&
           typeof envelope.msgId === 'string') {
-        for (const sub of set) sub._deliver({ msgId: envelope.msgId, topic: envelope.topic ?? null, deleted: true });
+        // A kill is a publish with a delete side-effect: it carries the SAME
+        // root-assigned `ts` (the kill's killTs stamp) so apps order it on the one
+        // topic timeline exactly like a message.
+        for (const sub of set) sub._deliver({ msgId: envelope.msgId, topic: envelope.topic ?? null, deleted: true, ts: publishTs, seq });
         return;
       }
       // Defence: enforce envelope shape so apps always see consistent
@@ -2744,10 +2765,23 @@ export class AxonaPeer extends DHT {
       envelope = {
         msgId:    publishId,
         ts:       publishTs,
+        seq,
         topic:    null,
         message:  json,
       };
     }
+    // ROOT TIME IS THE SINGLE ORDERING AUTHORITY. Overwrite the envelope's `ts`
+    // (the publisher's signed, clock-skew-prone claim) with the root-assigned
+    // monotonic stamp, so every subscriber ranks messages identically regardless
+    // of publisher clocks. The publisher's ts still gates envelope FRESHNESS at the
+    // root ingress (C-2 anti-replay); by the time a message is delivered the root
+    // has serialized it onto the topic timeline, and THAT stamp is what apps must
+    // order + replay (`since`) by. (Kills carry the same stamp — see the delete
+    // branch above.) Guarded so a missing stamp never clobbers ts with undefined.
+    if (Number.isFinite(publishTs)) envelope.ts = publishTs;
+    // The dense per-topic root counter (gap detection): env.seq jumps ⇒ a message
+    // was missed. Guarded so a missing counter never clobbers with undefined.
+    if (Number.isFinite(seq)) envelope.seq = seq;
     // Kernel keeps loopback semantics — a publisher's own publishes
     // do bounce back through the K-closest tree and deliver to its
     // own subscriptions.  Tests rely on this for single-peer e2e
@@ -3753,12 +3787,14 @@ export class AxonaPeer extends DHT {
     if (!node?.alive) return null;
     const selfBig = (typeof node.id === 'bigint') ? node.id : fromHex(node.id);
     const dead    = node._deadPeers || new Set();
+    const bridgeId = node.transport?.bridgeNodeIdBig ?? null;   // never recruit the bridge as a relay axon
 
     const considered = new Map();
     for (const syn of node.synaptome.values()) {
       const peerId = syn.peerId;
       if (dead.has(peerId)) continue;
       if (peerId === selfBig)       continue;
+      if (bridgeId !== null && peerId === bridgeId) continue;   // signaling infra, not a relay/root → would black-hole the subtree
       if (peerId === forwarderId)   continue;
       if (peerId === subscriberId)  continue;
       if (role.children.has(peerId)) continue;
