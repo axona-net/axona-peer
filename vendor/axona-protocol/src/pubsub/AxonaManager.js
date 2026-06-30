@@ -76,6 +76,15 @@ const DROP_MS         = 180_000;         // evict a subscriber after missed rene
 // multi-hop closer root has time to adopt us first; a wrongly-claimed farther root
 // is self-corrected by the strictly-closer beacon demotion (_onRootBeacon).
 const ROOT_CLAIM_MS   = 6_000;           // unconfirmed-deferral window before self-claiming root
+// Singleton-root durability: a root with no sub-axon tree (the small-topic common
+// case) has no cache-holding backup, so an abrupt root churn loses all history for
+// future since:'all' joiners. The root proactively replicates its full cache to its
+// REPLICAS nearest reachable neighbours (the natural successors); on churn the
+// now-closest backup already holds everything and the reachable-root fallback
+// promotes it with no gap. Backups are re-evaluated each tick (closer newcomers
+// recruited, farther ones retired). 0 disables.
+const ROOT_REPLICAS   = 2;
+const REPLICA_STALE_MS = 65_000;         // a backup whose root stopped replicating this long is presumed gone
 // ≈1 renewFastMs cycle: long enough that a genuinely reachable multi-hop closer
 // root adopts us first (deliver-`from` pin), short enough that a cold topic roots
 // within a couple of seconds instead of stranding. (12s was measured too slow —
@@ -121,6 +130,7 @@ const T = {
   PULL:     'pubsub:pull',      // on-demand fetch request — routed toward topic id
   PULLRESP: 'pubsub:pullresp',  // pull response — routed back toward the requester id
   ROOTBEACON: 'pubsub:rootbeacon', // soft-state root advertisement to the topic's neighborhood
+  REPLICATE: 'pubsub:replicate', // singleton-root durability: root pushes cache+tombstones to its N nearest neighbours (warm backup roots)
 };
 
 // ── id helpers (264-bit ids ⇄ 66-char hex) ──────────────────────────────
@@ -146,6 +156,9 @@ function makeRole(topicId, isRoot) {
                                      // publishTs (which is monotonic but sparse). Recovered to the
                                      // max seen seq on replay-up/handoff so a new root continues densely.
     tombstones: new Map(),           // msgId -> { exp, killTs, signer, seq }  (kill; thin)
+    replicas: new Map(),             // (when ROOT) backupHex -> { at }  nodes holding a warm copy of our cache
+    backupOf: null,                  // (when BACKUP) hex of the root replicating to us; null if we're not a backup
+    lastReplicaAt: 0,                // (when BACKUP) _now() of the last replica push from our root (staleness → presume root gone)
   };
 }
 
@@ -168,6 +181,7 @@ export class AxonaManager {
     maxDirect = MAX_DIRECT,
     beaconFanout = BEACON_FANOUT,  // K XOR-closest neighbors per beacon layer (root-announce reach)
     beaconLayers = BEACON_LAYERS,  // recursive forward depth (reach ≈ K + K² + … + K^layers)
+    rootReplicas = ROOT_REPLICAS,  // singleton-root durability: # of nearest backup roots holding the full cache
     ..._legacy   // accepted-and-ignored clean-break tunables (pickRelayPeer, rootSetSize, …)
   } = {}) {
     if (!dht || typeof dht.routeMessage !== 'function' || typeof dht.getSelfId !== 'function'
@@ -186,6 +200,7 @@ export class AxonaManager {
     this.refreshIntervalMs = refreshIntervalMs;
     this._cacheMax   = replayCacheSize || CACHE_MAX;
     this._cacheBytes = replayCacheBytes || CACHE_BYTES;
+    this._rootReplicas = Number.isFinite(rootReplicas) ? Math.max(0, rootReplicas) : ROOT_REPLICAS;
 
     // Public/inspectable state (contract surface).
     this.axonRoles       = new Map();   // topicIdBig -> Role  (topics I host: root or relay)
@@ -223,6 +238,7 @@ export class AxonaManager {
     on(T.PULLUP,   this._onPullUp);
     on(T.REPLAYUP, this._onReplayUp);
     on(T.HANDOFF,  this._onHandoff);
+    on(T.REPLICATE, this._onReplicate);
     on(T.KILL,     this._onKill);
     on(T.TOUCH,    this._onTouch);   // no-op (peer.touch deprecated v4.3.0); kept for wire compat
     on(T.PULL,     this._onPull);
@@ -475,6 +491,15 @@ export class AxonaManager {
     this._confirmPending(role.topicId, env.msgId);                       // our own publish landed (we're its root) → stop retrying
     this._fanout(role, msg, null);                                       // to subscribers
     this._deliverToApp(role.topicId, json, env.msgId, ts, seq);          // local app (if subscribed)
+    // EAGER cohort distribution: push the freshly-stamped message to the K-closest the
+    // instant it's stamped — a kill is just a publish with a side effect, so a publish
+    // must reach the whole cohort exactly as a kill must, else a subscriber landing on a
+    // co-hosting root misses it (the post-churn loss). Fire-and-forget; the periodic tick
+    // reconciles any miss.
+    if (role.isRoot) {
+      const bridge = (typeof this.dht.bridgeId === 'function') ? this.dht.bridgeId() : null;
+      this._replicateRole(role.topicId, role, bridge, this._now()).catch(() => {});
+    }
   }
 
   // ── stamped-replay-up durability (§6) ────────────────────────────────
@@ -487,8 +512,11 @@ export class AxonaManager {
     const sinceHw = Number.isFinite(payload.sinceHw) ? payload.sinceHw : 0;
     const msgs = role.cache.filter(c => c.publishTs > sinceHw)
                            .map(c => ({ json: c.json, publishTs: c.publishTs, msgId: c.msgId, seq: c.seq }));
-    if (msgs.length && isHexId(lc(payload.parentId))) {
-      this._route(idBig(payload.parentId), T.REPLAYUP, { topicId: idHex(role.topicId), msgs });
+    // Carry tombstones UP too — else a behind parent adopting this history would
+    // resurrect a message we've already killed (kill-leak via cache migration).
+    const dels = this._activeDels(role);
+    if ((msgs.length || dels.length) && isHexId(lc(payload.parentId))) {
+      this._route(idBig(payload.parentId), T.REPLAYUP, { topicId: idHex(role.topicId), msgs, dels });
     }
     return 'consumed';
   }
@@ -498,8 +526,10 @@ export class AxonaManager {
   // new publishes continue monotonically above it, and propagate it down.
   async _onReplayUp(payload, meta) {
     if (meta.targetId !== this.nodeId) return;
-    const role = this.axonRoles.get(idBig(payload.topicId));
+    const topicBig = idBig(payload.topicId);
+    const role = this.axonRoles.get(topicBig);
     if (!role) return 'consumed';
+    this._applyDels(role, topicBig, payload.dels);   // tombstones FIRST → suppress any killed body in this batch
     for (const m of (Array.isArray(payload.msgs) ? payload.msgs : [])) {
       if (m && typeof m.json === 'string' && Number.isFinite(m.publishTs)) await this._ingestStamped(role, m);
     }
@@ -535,6 +565,7 @@ export class AxonaManager {
     // Adopt as a root: _becomeRoot makes the role (isRoot) if we don't have one,
     // so we serve the inherited history; routing/beacons reconcile root-ness.
     const role = this.axonRoles.get(topicBig) || this._becomeRoot(topicBig);
+    this._applyDels(role, topicBig, payload.dels);   // inherit the heir's tombstones, not just its bodies
     for (const m of (Array.isArray(payload.msgs) ? payload.msgs : [])) {
       if (m && typeof m.json === 'string' && Number.isFinite(m.publishTs)) await this._ingestStamped(role, m);
     }
@@ -558,8 +589,131 @@ export class AxonaManager {
       } catch { /* no heir resolvable → nothing we can do */ }
       if (heir === null) continue;
       const msgs = role.cache.map(c => ({ json: c.json, publishTs: c.publishTs, msgId: c.msgId, seq: c.seq }));
-      try { this._route(heir, T.HANDOFF, { topicId: idHex(t), msgs }); } catch { /* best-effort */ }
+      const dels = this._activeDels(role);
+      try { this._route(heir, T.HANDOFF, { topicId: idHex(t), msgs, dels }); } catch { /* best-effort */ }
     }
+  }
+
+  // ── singleton-root replication (warm backup roots) ───────────────────
+  // The N reachable neighbours XOR-closest to a topic — its natural successors and
+  // therefore the right backup roots (whoever routing re-converges on if the root
+  // leaves). Excludes self and the bridge (signaling infra, never a root).
+  // The active (non-expired) tombstones as a wire-shaped `dels` array. Every cache
+  // MIGRATION (replicate, pull-up/replay-up, graceful handoff) must carry these
+  // alongside `msgs`: a node that adopts cached history without the matching tombstones
+  // would resurrect a killed message and serve it to a late joiner (the kill-leak class).
+  _activeDels(role) {
+    const now = this._now();
+    const dels = [];
+    for (const [tgt, tomb] of (role?.tombstones ?? [])) {
+      if ((tomb?.exp ?? 0) > now) dels.push({ del: true, msgId: tgt, killTs: tomb.killTs, signer: tomb.signer ?? null, seq: tomb.seq, publishTs: tomb.killTs });
+    }
+    return dels;
+  }
+
+  // Apply a batch of migrated tombstones BEFORE ingesting the migrated bodies, so a
+  // killed message in the same batch is suppressed (not briefly fanned/delivered then
+  // retracted). Shared by the replay-up and handoff receive paths.
+  _applyDels(role, topicBig, dels) {
+    for (const d of (Array.isArray(dels) ? dels : [])) {
+      if (d && d.msgId) this._applyKill(role, topicBig, d);
+    }
+  }
+
+  _nearestReachable(tBig, n, bridge) {
+    if (n <= 0 || typeof this.dht.neighbors !== 'function') return [];
+    const cand = [];
+    for (const nb of (this.dht.neighbors() || [])) {
+      let b; try { b = idBig(nb); } catch { continue; }
+      if (b === this.nodeId || (bridge != null && b === bridge)) continue;
+      cand.push(b);
+    }
+    cand.sort((a, b) => (a ^ tBig) < (b ^ tBig) ? -1 : 1);
+    return cand.slice(0, n).map(b => lc(idHex(b)));
+  }
+
+  // Replicate each SINGLETON root's cache to its N nearest neighbours as warm
+  // backups, so an abrupt root churn doesn't lose the history (the dominant
+  // post-churn since:'all' recovery failure). Only for roots with NO sub-axon tree
+  // (children) — larger topics already have cache-holding relays. Idempotent: the
+  // full cache+tombstones are (re)pushed each tick (singleton caches are small), which
+  // also serves as a liveness heartbeat (refreshes the backup's lastReplicaAt) and
+  // self-heals any miss. Backups track the closest-N: closer newcomers are recruited,
+  // farther ones retired. On root churn the now-closest backup already holds everything
+  // and promotes (via _onSub-terminal when a joiner routes to it, or the stale-promote
+  // check below) with no gap.
+  _replicateRoots() {
+    if (!this._rootReplicas) return;
+    const bridge = (typeof this.dht.bridgeId === 'function') ? this.dht.bridgeId() : null;
+    const now = this._now();
+    for (const [t, role] of this.axonRoles) {
+      if (!role.isRoot) continue;
+      this._replicateRole(t, role, bridge, now).catch(() => {});   // async (findKClosest); fire-and-forget
+    }
+  }
+
+  // Replicate a root's full cache+tombstones to its K-closest COHORT — the set a
+  // subscriber can actually land on. We target `findKClosest(topic, K)` (the same
+  // local, non-probing nearest source subscribe resolves its root with), NOT just our
+  // direct neighbours: a late subscriber attaches to the GLOBALLY closest node, which
+  // may be several hops from us, so a neighbour-only push silently misses it (the
+  // post-churn "message reaches one root but not the root the joiner picks" loss — a
+  // KILL just makes that loss conspicuous). Because the cohort = the K closest and a
+  // subscriber routes to the closest-1, the joiner's node is by construction in the
+  // cohort. Idempotent FULL-state push (singleton caches are small) → also a liveness
+  // heartbeat + anti-entropy: co-hosting roots converge to the union of cache+tombstones,
+  // and tombstones keep killed bodies suppressed. Called every tick AND eagerly the
+  // instant a message is stamped or a kill lands, so no holder lags the cohort.
+  async _replicateRole(t, role, bridge, now) {
+    if (!this._rootReplicas || !role || !role.isRoot) return;
+    if (role.cache.length === 0 && role.tombstones.size === 0) return;         // nothing to preserve yet
+    let want;
+    if (typeof this.dht.findKClosest === 'function') {
+      let arr = [];
+      try { arr = await this.dht.findKClosest(t, this._rootReplicas + 1); } catch { arr = []; }  // +1: self is usually closest
+      const seen = new Set(); want = [];
+      for (const id of (Array.isArray(arr) ? arr : [])) {
+        let b; try { b = idBig(id); } catch { continue; }
+        if (b === this.nodeId || (bridge != null && b === bridge)) continue;   // never self / bridge
+        const hex = lc(idHex(b)); if (seen.has(hex)) continue; seen.add(hex);
+        want.push(hex); if (want.length >= this._rootReplicas) break;
+      }
+    } else {
+      want = this._nearestReachable(t, this._rootReplicas, bridge);            // sim/fallback: neighbour-based
+    }
+    const wantSet = new Set(want);
+    for (const hex of [...role.replicas.keys()]) if (!wantSet.has(hex)) role.replicas.delete(hex);   // retire those no longer in the cohort
+    if (want.length === 0) return;
+    const msgs = role.cache.map(c => ({ json: c.json, publishTs: c.publishTs, msgId: c.msgId, seq: c.seq }));
+    const dels = this._activeDels(role);
+    for (const hex of want) {
+      try { this._route(idBig(hex), T.REPLICATE, { topicId: idHex(t), from: idHex(this.nodeId), msgs, dels }); } catch { /* best-effort */ }
+      role.replicas.set(hex, { at: now });
+    }
+  }
+
+  // Receive a replica push: become (or refresh) a passive BACKUP for this topic —
+  // hold the full cache + tombstones without claiming root or fanning to subscribers
+  // while the root keeps replicating. Verifies each message (don't-trust) via the
+  // normal stamped-ingest. On root churn this cache is what makes instant takeover
+  // gap-free (see the stale-promote in refreshTick + _onSub-terminal promotion).
+  async _onReplicate(payload, meta) {
+    if (meta.targetId !== this.nodeId) return;          // routed to me as the backup
+    if (!this._rootReplicas) return 'consumed';         // replication disabled on this node
+    let topicBig; try { topicBig = idBig(payload.topicId); } catch { return 'consumed'; }
+    let from = null;
+    if (payload.from && isHexId(lc(payload.from))) from = lc(payload.from);
+    else if (meta.fromId != null) { try { from = lc(idHex(idBig(meta.fromId))); } catch { /* */ } }
+    let role = this.axonRoles.get(topicBig);
+    if (!role) { role = makeRole(topicBig, false); this.axonRoles.set(topicBig, role); }
+    if (role.isRoot) return 'consumed';                 // I'm already (a closer) root — ignore a backup push
+    role.backupOf = from;
+    role.lastReplicaAt = this._now();
+    this._applyDels(role, topicBig, payload.dels);   // tombstones FIRST → a killed body in the same push is suppressed
+    for (const m of (Array.isArray(payload.msgs) ? payload.msgs : [])) {
+      if (m && typeof m.json === 'string' && Number.isFinite(m.publishTs)) await this._ingestStamped(role, m);
+    }
+    return 'consumed';
   }
 
   // ── DELIVER (parent → subscriber; a relay re-fans down the tree) ──────
@@ -732,6 +886,14 @@ export class AxonaManager {
       // fan the delete down — carries killTs + signer + seq so each receiver records
       // an identical tombstone (consistent replay + ordering + provisional authorship).
       this._fanout(role, { del: true, msgId: target, killTs, signer: m.signer ?? null, publishTs: killTs, seq }, null);
+      // Replicas/cohort aren't subscribers/children — they don't see the fan-out. Push the
+      // new tombstone to the cohort EAGERLY (not on the next tick) so a co-hosting root or a
+      // backup that promotes mid-window can't serve the killed body it already holds (the
+      // kill-leak race). Same eager path a publish takes — a kill is just a publish + side effect.
+      if (role.isRoot) {
+        const bridge = (typeof this.dht.bridgeId === 'function') ? this.dht.bridgeId() : null;
+        this._replicateRole(topicBig, role, bridge, this._now()).catch(() => {});
+      }
     }
     this._confirmPending(topicBig, target);            // our own kill landed → stop retrying it
     this._deliverKillToApp(topicBig, target, killTs, seq);
@@ -749,6 +911,15 @@ export class AxonaManager {
     if (this._appDelivered.has(key)) return;           // exactly-once
     this._appDelivered.set(key, true);
     if (this._appDelivered.size > APP_DEDUP_MAX) this._appDelivered.delete(this._appDelivered.keys().next().value);
+    // A kill retracts a message the app is holding. If this app NEVER received the body
+    // (a since:'all' joiner that arrived after the kill — the killed body is spliced from
+    // cache and never replayed), there is nothing to retract: delivering a spurious
+    // "deleted" event for a message it never saw is noise. Record the tombstone + advance
+    // the floor (above) so we converge and suppress the body if it ever arrives, but only
+    // CALL BACK when the body was actually delivered to this app. (Now reliably reproduced
+    // once cohort anti-entropy made tombstone propagation dependable.)
+    const bodyKey = topicBig.toString(16) + ':' + target;
+    if (!this._appDelivered.has(bodyKey)) return;      // never had the body → nothing to retract
     if (this._deliveryCallback) {
       try { this._deliveryCallback(topicBig, JSON.stringify({ deleted: true, msgId: target, topic: null }), target, killTs, seq); }
       catch (e) { this._log('warn', 'delete-callback-threw', { err: e?.message }); }
@@ -1295,6 +1466,33 @@ export class AxonaManager {
       // stranded below an empty root (lost on the original root's departure).
       this._sendSubscribe(t);
     }
+    // 1b. Cache-bearing-root re-announce (history-recovery durability) — A/B GATED OFF.
+    // Generalising the hosted re-announce to ANY cache-bearing root measured BELOW
+    // the deploy gate (Howard 25/30, regressing the kill/since:'all' recovery —
+    // hypothesis: multiple cache-bearing roots dueling per tick). Disabled pending a
+    // controlled A/B + a safer design (transient-non-host roots only, or rate-limited).
+    if (this._reannounceCacheRoots) {
+      for (const [t, role] of this.axonRoles) {
+        if (!role.isRoot || role.cache.length === 0) continue;     // only roots holding history
+        if (this._hostedTopics.has(t) || this.mySubscriptions.has(t)) continue;  // already re-announced above
+        this._sendSubscribe(t);
+      }
+    }
+    // 1b-rep. Singleton-root replication (warm backup roots) + backup promotion.
+    this._replicateRoots();
+    for (const [t, role] of this.axonRoles) {
+      if (!role.backupOf) continue;
+      if (now - role.lastReplicaAt <= REPLICA_STALE_MS) continue;   // root still replicating → stay a passive standby
+      // Root stopped replicating ⇒ presumed gone. Stop being a passive backup; if we
+      // are the closest reachable node, promote NOW with our full cache (gap-free
+      // takeover). Otherwise drop the backup marker (a closer node should hold it).
+      role.backupOf = null;
+      if (this._selfClosestReachable(t)) {
+        role.isRoot = true;
+        this._announceRoot(t);
+        this._log('info', 'backup-promoted-root', { topic: idHex(t).slice(0, 12) });
+      }
+    }
 
     // 1c. Persistent publish/kill retry (reliability under packet loss). A routed
     //     PUB/KILL is one-shot fire-and-forget; under loss the initial send +
@@ -1343,7 +1541,9 @@ export class AxonaManager {
       // by the node's keyspace share of topics that actually see traffic.
       // TODO(Phase 4): age out keyspace-pinned empty roles after a long idle TTL.
       const keyspacePinned = this._hostKeyspace && role.isRoot;
-      if (role.subscribers.size === 0 && !holdsHistory && !keyspacePinned && !this.mySubscriptions.has(t) && !this._hostedTopics.has(t)) {
+      // A BACKUP holds a deliberate warm copy of another root's history — never tear
+      // it down for being subscriber-less, or the durability replica vanishes.
+      if (role.subscribers.size === 0 && !holdsHistory && !keyspacePinned && !role.backupOf && !this.mySubscriptions.has(t) && !this._hostedTopics.has(t)) {
         this.axonRoles.delete(t);
         this._upstream.delete(t);
       }

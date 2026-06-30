@@ -108,9 +108,12 @@ export class AxonaPeer extends DHT {
    *        signed publishes (the default).  Apps that only call
    *        `peer.pub(topic, message, { sign: false })` can omit it.
    */
-  constructor({ engine = null, domain = null, node, axonaManager = null, nodeIdentity = null, transport = null, persist = null, maxPublishBytes = null, synaptomeMaintain = null }) {
+  constructor({ engine = null, domain = null, node, axonaManager = null, nodeIdentity = null, transport = null, persist = null, maxPublishBytes = null, synaptomeMaintain = null, rootReplicas = null }) {
     super();
     if (!node) throw new Error('AxonaPeer: node is required');
+    // Singleton-root replication fan-out (kernel v4.9.2). null → kernel default (2).
+    // Set 0 to disable (A/B diagnostics, or deployments that don't want backup roots).
+    this._rootReplicas = rootReplicas;
     // Synaptome maintenance (Synaptome-Maintenance-v0.1): continuously refill the
     // K_NEAR XOR-nearest "successor" quota so greedy routing's last-mile descent
     // always completes through churn. OPT-IN (default off) — when omitted the peer
@@ -2702,6 +2705,7 @@ export class AxonaPeer extends DHT {
       dht,
       pickRelayPeer: (role, subscriberId, forwarderId) =>
         this._pickRelayPeer(role, subscriberId, forwarderId),
+      ...(this._rootReplicas != null ? { rootReplicas: this._rootReplicas } : {}),
     });
     // ARM the periodic refreshTick (kernel v4.9.1). Earlier this was deliberately
     // left un-armed ("apps subscribe after the mesh stabilises"), but that left the
