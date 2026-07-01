@@ -1,6 +1,6 @@
 {
   "name": "axona-peer",
-  "version": "4.11.1",
+  "version": "4.11.2",
   "private": true,
   "description": "Axona browser peer: WebRTC mesh + AxonaPeer (NH-1 routing).  Static-served; no build step.  This package.json exists only for Node-side smoke tests.",
   "type": "module",

@@ -1464,23 +1464,28 @@ export class AxonaManager {
   }
   _onPull(payload, meta) {
     const role = this.axonRoles.get(idBig(payload.topicId));
-    // Cache-hit early-answer (v4.11.1): a pull for a SPECIFIC message (postHash) is a
-    // read of immutable, replicated state — msgId = H(publisher‖message), so any node
-    // en route that holds it in cache can answer, no need to reach the root. This
-    // short-circuits the walk at the first replica it crosses (lower latency; a pull
-    // that would otherwise strand toward the root still gets served by any cohort
-    // member / child / host it passes). A message held in cache is by definition not
-    // tombstoned here (a kill drops it), so this can't resurrect a killed message.
-    // Scoped to by-msgId ONLY: a pull-LATEST must still resolve at the terminus/root,
-    // since a lagging replica's "latest" could be older than the root's newest publish.
-    if (role && payload.postHash) {
-      const hit = role.cache.find(c => c.msgId === payload.postHash);
+    // Cache-hit early-answer (v4.11.1 by-msgId; v4.11.2 pull-latest too): a pull is a
+    // read of replicated state — answer from the FIRST replica the routed PULL reaches
+    // (a cohort member / child / host) instead of always driving it to the single root.
+    //   • by-msgId    → exact: msgId = H(publisher‖message), so a nearer copy IS the copy.
+    //   • pull-latest → served with whatever NEWEST this replica holds. Deliberately
+    //     "recent, not necessarily THE newest": a hot read path (many pull-latest, e.g.
+    //     polling current state) is spread across the cohort/children rather than
+    //     hammering the root, which would otherwise be a read throughput bottleneck +
+    //     SPOF. The small staleness window closes as the cohort converges (anti-entropy);
+    //     a caller that needs the linearizable newest should pull a specific msgId.
+    // A cached message is by definition NOT tombstoned here (a kill drops it), so neither
+    // path can resurrect a killed message. A replica with an EMPTY cache does not
+    // early-answer (nothing on hand) — it forwards so a populated node / the root answers.
+    if (role && role.cache.length) {
+      const hit = payload.postHash ? role.cache.find(c => c.msgId === payload.postHash)
+                                   : role.cache[role.cache.length - 1];
       if (hit) { this._answerPull(payload, hit); return 'consumed'; }
     }
     const d = this._topicDecision(payload, meta);
     if (d === 'forward') return;
     if (d === 'reroute') { this._reroute(T.PULL, payload); return 'consumed'; }
-    // Terminus (root/closest): answer by-msgId, or the newest cache entry for a pull-latest.
+    // Terminus (root/closest) fall-through: answer if we hold it, else a genuine null.
     const hit = role ? (payload.postHash ? role.cache.find(c => c.msgId === payload.postHash) : role.cache[role.cache.length - 1]) : null;
     this._answerPull(payload, hit || null);
     return 'consumed';
