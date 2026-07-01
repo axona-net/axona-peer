@@ -2076,50 +2076,68 @@ export class AxonaPeer extends DHT {
    *
    * Mechanism (kernel v4.3.0): metrics are no longer scatter-gathered — the topic's
    * root PUBLISHES a signed snapshot to metricTopic(dataId) every ~20s (the relay
-   * fleet runs this publisher). This call briefly subscribes to that metric topic and
-   * returns the freshest snapshot via replay-on-subscribe. For a live dashboard,
-   * **prefer `sub(metricTopic(dataId), …)` directly** (one subscription, latest +
-   * rolling history) — this one-shot is a convenience.
+   * fleet runs this publisher). Under the v4.10.0 cohort model EVERY co-hosting root
+   * publishes its own snapshot, so this call collects them across a short window and
+   * AGGREGATES: `subscribers` is summed (each root reports its own subset),
+   * `current_count`/`seq`/`bytes` are maxed (they converge across the cohort via
+   * anti-entropy; max tolerates a lagging member). For a live dashboard, **prefer
+   * `sub(metricTopic(dataId), …)` directly** — this one-shot is a convenience.
    *
    * @param {string} topic
    * @param {object} [opts]
-   * @param {number} [opts.timeoutMs=1500]  how long to wait for a snapshot
-   * @returns {Promise<{ current_count:number, subscribers:number, bytes:number,
-   *   publishes:number, ts:number|null, signer:string|null, stale:boolean }>}
-   *   `current_count` = live (non-expired/non-killed) retained posts; `subscribers`
-   *   = the publishing root's direct-child count (a lower bound once the tree splits);
-   *   `stale:true` ⇒ no snapshot seen (no metrics publisher is rooting this topic).
-   *   Advisory: the metric topic is open, so check `signer` if you need provenance.
+   * @param {number} [opts.timeoutMs=1500]  window to collect cohort snapshots
+   * @returns {Promise<{ current_count:number, seq:number, subscribers:number,
+   *   bytes:number, publishes:number, ts:number|null, signer:string|null,
+   *   cohortSize:number, stale:boolean }>}
+   *   `current_count` = messages currently in cache (live, non-expired/non-killed);
+   *   `seq` = the root's dense message counter (monotonic high-water — total events
+   *   ever emitted, incl. kills); `subscribers` = topic-wide total across the cohort;
+   *   `cohortSize` = # of distinct roots that reported; `stale:true` ⇒ no snapshot
+   *   seen. Advisory: the metric topic is open, so check `signer` for provenance.
    */
   async metrics(topic, { timeoutMs = 1500 } = {}) {
     const desc   = await this._resolveReadTopic(topic, 'metrics');
     const mTopic = metricTopic(desc.topicId);     // open, derived; same for owned + open data topics
-    // Read the latest published snapshot: briefly sub the metric topic (since:'all'
-    // → the root replays its cached snapshots immediately) and keep the freshest.
-    let best = null;
+    // Collect every cohort member's snapshot over the window, keyed by the computing
+    // node (`by`), keeping each node's freshest. One snapshot = one partial cohort view,
+    // so we wait the full window rather than taking the first.
+    const byNode = new Map();
     let handle = null;
     await new Promise((resolve) => {
+      // NOTE: do NOT unref this timer — it is the sole resolver of the collection
+      // window (the callback only accumulates), so it must keep the loop alive for
+      // the full window; unref'ing lets the process exit before it fires (hang).
       const timer = setTimeout(resolve, timeoutMs);
       this.sub(mTopic, (env) => {
         let s = env?.message;
         if (typeof s === 'string') { try { s = JSON.parse(s); } catch { return; } }
         if (!s || typeof s !== 'object') return;
         const ts = Number(s.ts ?? env?.publishTs ?? 0);
+        const by = s.by ?? env?.signerPubkey ?? s.signer ?? 'unknown';
+        const prev = byNode.get(by);
         // Prefer the envelope's cryptographic signer over the self-asserted body field.
-        const signer = env?.signerPubkey ?? s.signer ?? null;
-        if (!best || ts >= best._ts) best = { ...s, signer, _ts: ts };
-        clearTimeout(timer); resolve();                 // first (replayed-latest) is enough
+        if (!prev || ts >= prev._ts) byNode.set(by, { ...s, signer: env?.signerPubkey ?? s.signer ?? null, _ts: ts });
       }, { since: 'all' }).then((h) => { handle = h; }).catch(() => { clearTimeout(timer); resolve(); });
     });
     try { if (handle && typeof handle.stop === 'function') await handle.stop(); } catch { /* */ }
+
+    const snaps = [...byNode.values()];
+    if (snaps.length === 0) {
+      return { current_count: 0, seq: 0, subscribers: 0, bytes: 0, publishes: 0, ts: null, signer: null, cohortSize: 0, stale: true };
+    }
+    const max = (f) => snaps.reduce((m, s) => Math.max(m, Number(s[f] ?? 0)), 0);
+    const sum = (f) => snaps.reduce((a, s) => a + Number(s[f] ?? 0), 0);
+    const newest = snaps.reduce((a, b) => (b._ts >= a._ts ? b : a));
     return {
-      current_count: best?.current_count ?? 0,
-      subscribers:   best?.subscribers   ?? 0,
-      bytes:         best?.bytes          ?? 0,
-      publishes:     best?.publishes      ?? 0,   // present only if the publisher tracks it; else 0
-      ts:            best?.ts             ?? null,
-      signer:        best?.signer         ?? null,
-      stale:         best == null,                 // true ⇒ no snapshot seen (no metrics publisher for this topic)
+      current_count: max('current_count'),   // converges across cohort → max
+      seq:           max('seq'),             // monotonic counter → max is the true high-water
+      subscribers:   sum('subscribers'),     // per-member subset → sum = topic-wide total
+      bytes:         max('bytes'),
+      publishes:     max('publishes'),        // present only if a publisher tracks it; else 0
+      ts:            newest.ts ?? null,
+      signer:        newest.signer ?? null,
+      cohortSize:    snaps.length,            // # of distinct roots that reported
+      stale:         false,
     };
   }
 

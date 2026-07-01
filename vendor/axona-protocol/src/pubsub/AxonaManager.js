@@ -1275,9 +1275,12 @@ export class AxonaManager {
 
   pubsubHost(topicId) {
     this._hostedTopics.add(topicId);
-    // Participate so the node won't be torn down and can root the topic if
-    // closest. TODO(Phase 4): proper host-as-durable-relay semantics.
-    this._send(T.SUB, { topicId: idHex(topicId), via: [], subscriberId: idHex(this.nodeId), since: this._now() });
+    // Participate so the node won't be torn down and can root the topic if closest.
+    // Route the announce through _sendSubscribe (lookup-assisted → the true root, and
+    // advertises our high-water for §6 PULLUP) rather than a bare greedy via:[] — the
+    // bare send stranded the initial host announce until the next refreshTick healed it
+    // (the tick already renews hosts via _sendSubscribe). v4.10.1.
+    this._sendSubscribe(topicId);
   }
   pubsubUnhost(topicId) {
     this._hostedTopics.delete(topicId);
@@ -1304,14 +1307,50 @@ export class AxonaManager {
 
   requestPull(topicId, postHash = null, { timeoutMs = 1000 } = {}) {
     const corrId = idHex(this.nodeId).slice(0, 8) + ':' + (++this._pullSeq);
+    // Route toward the true root via the warm lookup-assist hint (like publish/kill),
+    // not a bare greedy via:[] — a pull that strands on a local minimum reaches a
+    // non-cohort node and returns null (a false "no message") even though the cohort
+    // holds it. The hint seeds the walk at the topic-closest node it can serve. v4.10.1.
+    const hint = this._rootHint_(topicId);
     return new Promise((resolve) => {
       const timer = setTimeout(() => { this._pending.delete(corrId); resolve(null); }, timeoutMs);
       if (typeof timer.unref === 'function') timer.unref();
       this._pending.set(corrId, { resolve, timer });
-      this._send(T.PULL, { topicId: idHex(topicId), via: [], corrId, postHash: postHash || null, requesterId: idHex(this.nodeId) });
+      this._send(T.PULL, { topicId: idHex(topicId), via: hint ? [hint] : [], corrId, postHash: postHash || null, requesterId: idHex(this.nodeId) });
     });
   }
   requestMetrics() { return Promise.resolve({ accumulated: [] }); }   // TODO(Phase 4)
+
+  // Enumerate the topics THIS node currently roots, each with a locally-computed
+  // metric snapshot. The producer side of the derived-metric-topic convention: an
+  // infrastructure root walks this on a timer and republishes each to metricTopic(T).
+  // (Re-added in v4.10.1 — the routing-only clean break (v3.12) dropped it, silently
+  // killing all metrics on the 4.x line.) Under the v4.10.0 cohort model EVERY
+  // co-hosting root publishes its own snapshot; `seq` and `current_count` converge
+  // across the cohort (anti-entropy), while `subscribers` is this member's local
+  // subset — the reader (peer.metrics) aggregates across the cohort.
+  rootedTopics() {
+    const out = [];
+    const now = this._now();
+    for (const [t, role] of this.axonRoles) {
+      if (!role.isRoot) continue;
+      // Recover the signed topic descriptor from the newest cached envelope (the role
+      // holds only the topic id as a bigint). No cache → nothing to describe → skip.
+      let descriptor = null;
+      for (let i = role.cache.length - 1; i >= 0; i--) {
+        try { const env = JSON.parse(role.cache[i].json); if (env && env.topic) { descriptor = env.topic; break; } } catch { /* */ }
+      }
+      out.push({
+        topicId:       idHex(t),
+        descriptor,                          // { region, owner, name, write } | null
+        current_count: role.cache.length,    // messages currently in cache (swept of expired/killed)
+        seq:           role.seq,             // message counter — dense per-topic high-water (monotonic)
+        subscribers:   role.subscribers.size,// this cohort member's local subscriber subset
+        bytes:         role.cacheBytes,      // live cached envelope bytes
+      });
+    }
+    return out;
+  }
 
   onPubsubDelivery(cb) { this._deliveryCallback = cb; }
   setLogSink(fn) { this._logSink = (typeof fn === 'function') ? fn : null; }
