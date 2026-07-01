@@ -100,6 +100,19 @@ const TTL_MS          = 24 * 60 * 60 * 1000;   // 24h message hold, keyed on the
 const APP_DEDUP_MAX   = 8192;            // exactly-once app-delivery LRU
 const PENDING_PUB_TTL_MS = 30_000;       // retain a recent publish/kill this long so refreshTick can RE-SEND it toward the true root until the publisher observes its own msgId (implicit ack) — covers a strand on the greedy walk AND packet loss; idempotent (root dedups by msgId)
 const PENDING_PUB_MAX_TRIES = 6;         // cap re-sends so a never-confirmed publish (e.g. a non-subscribed publisher under loss) can't re-send unboundedly; loss^7 is negligible even at 30%
+// Cold-publish burst (v4.11.0): a publish from a freshly-joined, not-yet-integrated
+// node is the worst case for the one-shot greedy PUB — its routing table lacks the
+// keyspace breadth to route to the true root, so the message strands and (unlike a
+// renewing subscribe) never re-homes. Waiting for the table to warm is harmful: it's
+// OUTBOUND traffic that integrates a newcomer (reachability to a node lives in its
+// NEIGHBOURS' tables, healed by directed sends — same lesson as churn-in warmup). So
+// while cold, re-send the SAME signed envelope a few times over the first second:
+// idempotent (root dedups by msgId), each send both integrates us further AND gets a
+// fresh shot at the true root as tables converge. Naturally disabled once warm (the
+// gate is low neighbour count), and the slow refreshTick retry still backstops after.
+const COLD_BURST_TRIES     = 5;          // extra fast re-sends on a cold publish
+const COLD_BURST_INTERVAL_MS = 200;      // spacing of the burst (≈1s total)
+const COLD_PEER_THRESHOLD  = 8;          // "cold" = fewer than this many neighbours (not yet integrated)
 const REPLAY_CHUNK_BYTES = 96 * 1024;    // byte budget per replay deliver batch
 const FUTURE_TOLERANCE_MS = 5 * 60 * 1000;   // §5 bad-clock rule: drop replayed stamps this far ahead
 
@@ -224,6 +237,7 @@ export class AxonaManager {
     this._pending         = new Map();  // pull corrId -> { resolve, timer }
     this._pullSeq         = 0;
     this._timer           = null;
+    this._burstTimers     = new Set();  // cold-publish burst setTimeout handles (cleared on stop)
 
     this._registerHandlers();
   }
@@ -1238,7 +1252,40 @@ export class AxonaManager {
     let pmsgId = null; try { pmsgId = JSON.parse(json)?.msgId ?? null; } catch { /* opaque body */ }
     if (pmsgId) this._pendingPub.set(pmsgId, { topicBig: topicId, json, at: this._now(), tries: 0 });
     this._send(T.PUB, { topicId: idHex(topicId), via: hint ? [hint] : [], json });
+    // Cold-publish burst: if we're not yet integrated, front-load a few fast re-sends
+    // (see COLD_BURST_* above) — idempotent, and each send also integrates us.
+    if (pmsgId && this._isColdPublisher()) this._coldPublishBurst(topicId, pmsgId);
     return meta.postHash || '';
+  }
+
+  // "Cold" = this node hasn't accreted enough neighbours to route reliably to an
+  // arbitrary topic root yet (a freshly-joined node). Cheap, and self-clearing:
+  // once the synaptome fills past the threshold, publishes go back to a single send.
+  _isColdPublisher() {
+    if (typeof this.dht.neighbors !== 'function') return false;
+    let n = 0; try { n = (this.dht.neighbors() || []).length; } catch { /* */ }
+    return n < COLD_PEER_THRESHOLD;
+  }
+
+  // Re-send the SAME pending envelope a few times over the first ~second. Each tick
+  // re-resolves the root hint (the background lookup that nudges integration) and
+  // stops early the moment the publish is confirmed/expired (_pendingPub no longer
+  // holds this msgId). Idempotent end-to-end: the root dedups by msgId.
+  _coldPublishBurst(topicBig, msgId) {
+    let i = 0;
+    const schedule = () => {
+      const h = setTimeout(() => {
+        this._burstTimers.delete(h);
+        const p = this._pendingPub?.get(msgId);
+        if (!p) return;                                 // confirmed or aged out → done
+        const hint = this._rootHint_(topicBig);
+        this._send(T.PUB, { topicId: idHex(topicBig), via: hint ? [hint] : [], json: p.json });
+        if (++i < COLD_BURST_TRIES) schedule();
+      }, COLD_BURST_INTERVAL_MS);
+      if (typeof h.unref === 'function') h.unref();
+      this._burstTimers.add(h);
+    };
+    schedule();
   }
 
   pubsubSubscribe(topicId, opts = {}) {
@@ -1446,7 +1493,11 @@ export class AxonaManager {
     this._timer = setInterval(() => { this.refreshTick().catch(() => {}); }, this.refreshIntervalMs);
     if (typeof this._timer.unref === 'function') this._timer.unref();
   }
-  stop() { if (this._timer) { clearInterval(this._timer); this._timer = null; } }
+  stop() {
+    if (this._timer) { clearInterval(this._timer); this._timer = null; }
+    for (const h of this._burstTimers) clearTimeout(h);
+    this._burstTimers.clear();
+  }
 
   async refreshTick() {
     const now = this._now();
