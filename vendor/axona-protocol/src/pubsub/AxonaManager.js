@@ -1463,17 +1463,32 @@ export class AxonaManager {
     return 'consumed';
   }
   _onPull(payload, meta) {
+    const role = this.axonRoles.get(idBig(payload.topicId));
+    // Cache-hit early-answer (v4.11.1): a pull for a SPECIFIC message (postHash) is a
+    // read of immutable, replicated state — msgId = H(publisher‖message), so any node
+    // en route that holds it in cache can answer, no need to reach the root. This
+    // short-circuits the walk at the first replica it crosses (lower latency; a pull
+    // that would otherwise strand toward the root still gets served by any cohort
+    // member / child / host it passes). A message held in cache is by definition not
+    // tombstoned here (a kill drops it), so this can't resurrect a killed message.
+    // Scoped to by-msgId ONLY: a pull-LATEST must still resolve at the terminus/root,
+    // since a lagging replica's "latest" could be older than the root's newest publish.
+    if (role && payload.postHash) {
+      const hit = role.cache.find(c => c.msgId === payload.postHash);
+      if (hit) { this._answerPull(payload, hit); return 'consumed'; }
+    }
     const d = this._topicDecision(payload, meta);
     if (d === 'forward') return;
     if (d === 'reroute') { this._reroute(T.PULL, payload); return 'consumed'; }
-    const role = this.axonRoles.get(idBig(payload.topicId));
-    let hit = null;
-    if (role) hit = payload.postHash ? role.cache.find(c => c.msgId === payload.postHash) : role.cache[role.cache.length - 1];
-    const reqBig = idBig(payload.requesterId);
-    const resp = { corrId: payload.corrId, json: hit ? hit.json : null, publishTs: hit ? hit.publishTs : null, requesterId: payload.requesterId };
-    if (reqBig === this.nodeId) this._onPullResp(resp, { targetId: this.nodeId });
-    else this._route(reqBig, T.PULLRESP, resp);
+    // Terminus (root/closest): answer by-msgId, or the newest cache entry for a pull-latest.
+    const hit = role ? (payload.postHash ? role.cache.find(c => c.msgId === payload.postHash) : role.cache[role.cache.length - 1]) : null;
+    this._answerPull(payload, hit || null);
     return 'consumed';
+  }
+  _answerPull(payload, hit) {
+    const resp = { corrId: payload.corrId, json: hit ? hit.json : null, publishTs: hit ? hit.publishTs : null, requesterId: payload.requesterId };
+    if (idBig(payload.requesterId) === this.nodeId) this._onPullResp(resp, { targetId: this.nodeId });
+    else this._route(idBig(payload.requesterId), T.PULLRESP, resp);
   }
   _onPullResp(payload, meta) {
     if (meta.targetId !== this.nodeId && idBig(payload.requesterId) !== this.nodeId) return;
