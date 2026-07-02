@@ -74,7 +74,7 @@ const BRIDGE_DIRECTORY_DESC = Object.freeze({
 // where the bfcache can serve a stale module set for ages).  The
 // bridge version arrives separately in its `welcome` message; the
 // "version" row in the me panel shows both side by side.
-const PEER_VERSION = '3.42.0';
+const PEER_VERSION = '3.43.0';
 
 // webTransport() now owns the bridge WebSocket lifecycle (ping cadence,
 // stale window, reconnect backoff, uptime), so those constants moved

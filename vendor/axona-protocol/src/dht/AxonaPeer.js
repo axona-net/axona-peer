@@ -40,7 +40,7 @@
 import { DHT }            from '../contracts/DHT.js';
 import { Synapse }        from './Synapse.js';
 import { Subscription }   from './Subscription.js';
-import { clz264, toHex, fromHex, isHexId, extractS2Prefix, BAD_ID_CODE } from '../utils/hexid.js';
+import { clz264, toHex, fromHex, isHexId, extractS2Prefix, asId, BAD_ID_CODE } from '../utils/hexid.js';
 import { resolveTopic, deriveTopicId, deriveTopicIdBig } from '../pubsub/post.js';
 
 /**
@@ -53,8 +53,8 @@ export const ANONYMOUS = Symbol.for('axona.publish.anonymous');
 import { buildEnvelope }  from '../pubsub/envelope.js';
 import { buildKill }      from '../pubsub/kill.js';
 import { buildTouch }     from '../pubsub/touch.js';
-import { AxonaManager, MAX_PUBLISH_BYTES, MAX_RELIABLE_PUBLISH_BYTES } from '../pubsub/AxonaManager.js';
-import { metricTopic } from '../pubsub/metrics.js';
+import { AxonaManager, MAX_PUBLISH_BYTES, MAX_RELIABLE_PUBLISH_BYTES, isRegionLockEnforced } from '../pubsub/AxonaManager.js';
+import { metricTopic, isMetricTopicName, dataTopicIdOf } from '../pubsub/metrics.js';
 import { authorClassTopic, buildAuthorClass, verifyAuthorClass } from '../pubsub/authorClass.js';
 import { PublishError, SubscribeError, KillError, TouchError, PullError, MetricsError, ErrorCodes } from '../errors.js';
 
@@ -582,9 +582,7 @@ export class AxonaPeer extends DHT {
     // excluding the requestor itself (otherwise they'd see themselves
     // as a candidate — useless).
     transport.onRequest('local_probe', async (fromId, _payload) => {
-      const fromBig = (typeof fromId === 'bigint')
-        ? fromId
-        : BigInt('0x' + fromId);
+      const fromBig = asId(fromId);   // wire→internal id gate
       const peerIds = [];
       for (const syn of node.synaptome.values()) {
         if (syn.peerId !== fromBig) peerIds.push(syn.peerId);
@@ -608,9 +606,7 @@ export class AxonaPeer extends DHT {
     // discovery.  Insertion-sorted scan; cheap because synaptome is
     // bounded by MAX_SYNAPTOME.  Caller merges results across rounds.
     transport.onRequest('find_closest_set', async (_fromId, payload) => {
-      const targetBig = (typeof payload.target === 'bigint')
-        ? payload.target
-        : BigInt('0x' + String(payload.target));
+      const targetBig = asId(payload.target);   // wire→internal id gate
       const K = payload.K ?? domain._k;
       const top = [];
       for (const syn of node.synaptome.values()) {
@@ -637,9 +633,7 @@ export class AxonaPeer extends DHT {
     // route_msg request and bubbles the downstream reply unchanged.
     transport.onRequest('route_msg', async (fromId, msg) => {
       const { type, payload, targetId, hops, originId } = msg;
-      const targetBig = (typeof targetId === 'bigint')
-        ? targetId
-        : BigInt('0x' + String(targetId));
+      const targetBig = asId(targetId);   // wire→internal id gate
 
       // Greedy 1-hop forward — only over synapses we are actually connected
       // to (skip dead/unbound entries, e.g. the bridge after it drops; see
@@ -1568,7 +1562,7 @@ export class AxonaPeer extends DHT {
         ? ErrorCodes.TOPIC_REGION_REQUIRED : ErrorCodes.PUBLISH_INVALID_TOPIC;
       throw new PublishError(code, `peer.${op}: ${cause.message}`, { cause, context: { topic } });
     }
-    r.topicIdBig = BigInt('0x' + r.topicId);
+    r.topicIdBig = asId(r.topicId);
     return r;
   }
 
@@ -1595,7 +1589,7 @@ export class AxonaPeer extends DHT {
       return {
         region: parseInt(id.slice(0, 2), 16),
         owner: null, name: null, write: null,
-        topicId: id, topicIdBig: BigInt('0x' + id), byId: true,
+        topicId: id, topicIdBig: asId(id), byId: true,
       };
     }
     return this._resolveTopicOrThrow(topic, op);
@@ -1604,6 +1598,7 @@ export class AxonaPeer extends DHT {
   async pub(topic, message, opts = {}) {
     const desc = await this._resolveTopicOrThrow(topic, 'pub');
     const am   = this._requireAxonaManager('pub');
+    await this._assertRegionUsable(desc.topicIdBig, PublishError, 'pub');   // region-occupancy rule
 
     // Signer (design v0.3 §5/§6): opts.signWith is an AUTHOR identity, or the
     // ANONYMOUS sentinel for a deliberately unsigned publish. There is NO default
@@ -1820,6 +1815,7 @@ export class AxonaPeer extends DHT {
     const desc       = await this._resolveReadTopic(topic, 'sub');
     const am         = this._requireAxonaManager('sub');
     const topicIdBig = desc.topicIdBig;
+    await this._assertRegionUsable(topicIdBig, SubscribeError, 'sub');   // region-occupancy rule
 
     // Apply `since` mode by seeding AxonaManager's per-topic lastSeenTs
     // BEFORE the subscribe call.  AxonaManager passes lastSeenTs in the
@@ -1846,8 +1842,65 @@ export class AxonaPeer extends DHT {
     }
 
     am.pubsubSubscribe(topicIdBig, { replayLatest: opts.since === 'latest' });
+
+    // Demand-driven metrics: subscribing to a metricTopic(dataId) turns metrics ON
+    // for the underlying DATA topic — a renewable METRICSON lease routed to that
+    // topic's root, which then publishes snapshots to this metric topic. ANY node
+    // that roots the data topic honors it (no special/relay node); the lease lapses
+    // when the last metric subscriber unsubscribes. See AxonaManager metrics block.
+    if (isMetricTopicName(desc.name) && typeof am.pubsubMetricsOn === 'function') {
+      const dataIdHex = dataTopicIdOf(desc);
+      if (dataIdHex) {
+        const dataBig = asId(dataIdHex);
+        this._ensureMetricsPublisher(am);
+        if (!this._metricDataByMetricTopic) this._metricDataByMetricTopic = new Map();
+        this._metricDataByMetricTopic.set(topicIdBig, dataBig);
+        am.pubsubMetricsOn(dataBig);
+      }
+    }
+
     this._markPersistDirty('subscriptions');
     return sub;
+  }
+
+  // Register (once) the hook the kernel calls to publish a metric snapshot: any
+  // root with an active metrics lease produces a snapshot, and we publish it to
+  // the derived metric topic — ANONYMOUS (the metric topic is open + advisory, so
+  // no node exposes an author key just to emit infra stats).
+  _ensureMetricsPublisher(am) {
+    if (this._metricsPublisherSet || typeof am.setMetricsPublisher !== 'function') return;
+    this._metricsPublisherSet = true;
+    am.setMetricsPublisher((dataTopicIdHex, snapshot) =>
+      this.pub(metricTopic(dataTopicIdHex), JSON.stringify(snapshot), { signWith: ANONYMOUS }));
+  }
+
+  // REGION RULE (region occupancy): a topic is served only by nodes IN ITS REGION.
+  // You may pub/sub to any region, but if the topic's region has no operational
+  // (reachable) node, there's no valid root — refuse rather than let a neighbouring
+  // region absorb it (which would hotspot that region). Fast-fail BEFORE sending, so
+  // it's a pre-send guard, not a delivery ack. If we can't yet tell (cold/isolated
+  // lookup), we don't false-refuse — the kernel still won't root an out-of-region
+  // topic, so the worst case is a silent no-op, never a wrong-region hotspot.
+  async _assertRegionUsable(topicIdBig, ErrCls, opName) {
+    // Gated (v4.15.0): the region-occupancy rule is OFF by default pre-critical-mass —
+    // most regions have no node yet, so refusing empty-region pub/sub would break nearly
+    // everything. When off, this guard is a no-op and the nearest node roots (pre-4.13.0).
+    // configureRegionLock({ enforce: true }) turns it back on once coverage exists.
+    if (!isRegionLockEnforced()) return;
+    // node.id is a BigInt by construction (DHTNode gate); asId() keeps the topic arg
+    // honest whether it arrived as a BigInt or a hex id, without any local type-guessing.
+    const selfRegion  = (this._node?.id != null) ? extractS2Prefix(asId(this._node.id)) : null;
+    const topicRegion = extractS2Prefix(asId(topicIdBig));
+    if (selfRegion === topicRegion) return;          // we ARE an in-region node → the region is populated
+    let closest = null;
+    try { const a = await this.findKClosest(asId(topicIdBig), 1); closest = (Array.isArray(a) && a.length) ? asId(a[0]) : null; }
+    catch { closest = null; }
+    if (closest == null) return;                     // indeterminate — don't false-refuse
+    if (extractS2Prefix(closest) !== topicRegion) {
+      throw new ErrCls(ErrorCodes.REGION_UNPOPULATED,
+        `peer.${opName}: region 0x${topicRegion.toString(16)} has no operational node — a topic is served only by nodes in its own region`,
+        { context: { topicRegion } });
+    }
   }
 
   /**
@@ -1921,6 +1974,15 @@ export class AxonaPeer extends DHT {
       return { ok: true, scope: 'keyspace' };
     }
     const desc = await this._resolveTopicOrThrow(topic, 'host');
+    // REGION RULE: hosting a specific topic makes this node its root — only valid
+    // if the topic is in THIS node's region (no node roots a foreign region).
+    const selfRegion = (this._node?.id != null) ? extractS2Prefix(this._node.id) : null;
+    const topicRegion = extractS2Prefix(desc.topicIdBig);
+    if (selfRegion !== topicRegion) {
+      throw new PublishError(ErrorCodes.REGION_UNPOPULATED,
+        `peer.host: cannot host a topic in region 0x${topicRegion.toString(16)} from a node in region 0x${(selfRegion ?? 0).toString(16)} — a node roots/hosts only topics in its own region`,
+        { context: { topicRegion, selfRegion } });
+    }
     this._applySince(am, desc.topicIdBig, opts.since);
     am.pubsubHost(desc.topicIdBig);
     this._markPersistDirty('hosting');
@@ -1961,7 +2023,12 @@ export class AxonaPeer extends DHT {
       if (set.size === 0) {
         this._subscriptions.delete(key);
         try {
-          this._requireAxonaManager('unsubscribe').pubsubUnsubscribe(key);
+          const am = this._requireAxonaManager('unsubscribe');
+          am.pubsubUnsubscribe(key);
+          // If this was a metric-topic subscription, drop the metrics lease on the
+          // underlying data topic so its root stops publishing (soft-state turn-off).
+          const dataBig = this._metricDataByMetricTopic?.get(key);
+          if (dataBig !== undefined && typeof am.pubsubMetricsOff === 'function') { am.pubsubMetricsOff(dataBig); this._metricDataByMetricTopic.delete(key); }
         } catch { /* unsubscribe is best-effort */ }
       }
       this._markPersistDirty('subscriptions');
@@ -2502,6 +2569,10 @@ export class AxonaPeer extends DHT {
       am.setLogSink((level, msg, context) => this._emitLog(level, msg, context));
       this._managerLogWired = am;
     }
+    // Wire the metrics publisher eagerly so ANY node that ever roots a topic with
+    // an active metrics lease publishes its snapshots — including a headless host()
+    // relay that never subscribes to a metric topic itself.
+    if (am) this._ensureMetricsPublisher(am);
     return am;
   }
 
@@ -3026,9 +3097,7 @@ export class AxonaPeer extends DHT {
    */
   _greedyNextHopToward(targetId) {
     if (!this._node?.alive) return null;
-    const target = (typeof targetId === 'bigint')
-      ? targetId
-      : BigInt('0x' + targetId);
+    const target = asId(targetId);   // wire→internal id gate
     // Only forward to a synapse we are ACTUALLY connected to.  A dead synapse
     // (e.g. the bridge after it dies — peers keep the synapse until anneal
     // cleans it) is XOR-near many targets and would be picked as the greedy
@@ -3071,9 +3140,7 @@ export class AxonaPeer extends DHT {
    */
   async _findCloserInTwoHops(targetId) {
     const node = this._node;
-    const target = (typeof targetId === 'bigint')
-      ? targetId
-      : BigInt('0x' + targetId);
+    const target = asId(targetId);   // wire→internal id gate
     const myDist = node.id ^ target;
     let bestPeerId = null;        // the FIRST-HOP (adjacent) peer to forward to
     let bestDist   = myDist;

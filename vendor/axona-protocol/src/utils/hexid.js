@@ -166,6 +166,50 @@ export function isHexId(hex) {
          /^[0-9a-fA-F]+$/.test(hex);
 }
 
+/**
+ * asId — THE canonical coercion gate for Axona addresses.
+ *
+ * The rule: an address (nodeId / peerId / topicId / targetId / via / subscriberId)
+ * is a BigInt everywhere inside the system. A hex string is legitimate ONLY inside
+ * a JSON wire frame or as an identity object's serialized `.id`/`.authorId`. Every
+ * value crossing INTO the internal world passes through here; every value crossing
+ * OUT to JSON passes through `toHex()`/`idHex()`. Internal code never has to ask
+ * "is this a string or a bigint?" — it can assume bigint, because construction and
+ * wire ingress both run through this gate.
+ *
+ * Accepts a bigint (idempotent) or a hex string (optionally `0x`-prefixed). Both are
+ * range-checked to [0, MAX_ID]. Anything else throws a BAD_ID_CODE-tagged error, so a
+ * transport dispatch boundary can classify a malformed-frame drop apart from a bug.
+ *
+ * Deliberately width-LENIENT (unlike `fromHex`): it validates the numeric range, not
+ * the hex length. `idHex` pads to 66 chars even in a shrunk sim profile (HEX_CHARS<66),
+ * and zero-padding never changes the value, so a strict-width check would wrongly reject
+ * valid sim ids. Use `fromHex` where an exact-width parse of an untrusted frame is wanted.
+ *
+ * @param {bigint|string} v
+ * @returns {bigint}
+ */
+export function asId(v) {
+  if (typeof v === 'bigint') {
+    if (v < 0n || v > MAX_ID) {
+      throw badId(new RangeError(`asId: id out of range [0, 2^${ID_BITS}): ${v}`));
+    }
+    return v;
+  }
+  if (typeof v === 'string') {
+    const h = (v.startsWith('0x') || v.startsWith('0X')) ? v.slice(2) : v;
+    if (h.length === 0 || !/^[0-9a-fA-F]+$/.test(h)) {
+      throw badId(new TypeError(`asId: not a hex id string: ${JSON.stringify(v)}`));
+    }
+    const n = BigInt('0x' + h);
+    if (n > MAX_ID) {
+      throw badId(new RangeError(`asId: id out of range [0, 2^${ID_BITS}): ${v}`));
+    }
+    return n;
+  }
+  throw badId(new TypeError(`asId expects bigint or hex string, got ${typeof v}`));
+}
+
 // ─── Random ──────────────────────────────────────────────────────────
 
 /**

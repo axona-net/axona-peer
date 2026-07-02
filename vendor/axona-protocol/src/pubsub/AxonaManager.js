@@ -48,12 +48,31 @@
 import { verifyEnvelope, checkFreshness } from './envelope.js';
 import { verifyKill }                     from './kill.js';
 import { deriveTopicIdBig }               from './post.js';
+import { extractS2Prefix, asId }          from '../utils/hexid.js';
 
 // ── Inbound caps (D-1: bound attacker-controlled payloads) ──────────────
 // Re-exported unchanged — AxonaPeer and std/chunk import these as the
 // publish-size contract; independent of the pub/sub mechanism.
 export const MAX_PUBLISH_BYTES = 256 * 1024;         // absolute hard ceiling (chars)
 export const MAX_RELIABLE_PUBLISH_BYTES = 15 * 1024; // WebRTC-interop reliable floor (O-5)
+
+// ── Region-occupancy enforcement (v4.13.0), gated (v4.15.0) ─────────────
+// The region rule — a topic may only be rooted by a node IN ITS REGION, and a
+// pub/sub to a region with no reachable in-region node is refused — is correct
+// long-term (it prevents cross-region hotspots). But PRE-critical-mass most
+// regions, even populated ones, have no nodes yet, so enforcing it would refuse
+// nearly every real pub/sub. So it is OFF BY DEFAULT: when disabled, an
+// out-of-region node may root a topic (pre-4.13.0 behavior — nearest node wins),
+// and the peer-side REGION_UNPOPULATED pre-send guard is a no-op. Flip it on with
+// configureRegionLock({ enforce: true }) once the network has enough regional
+// coverage. Gates BOTH layers (manager _regionOk + peer _assertRegionUsable) so
+// disabling it never leaves an empty-region topic silently un-rooted.
+let _regionLockEnforced = false;
+export function configureRegionLock({ enforce } = {}) {
+  _regionLockEnforced = !!enforce;
+  return _regionLockEnforced;
+}
+export function isRegionLockEnforced() { return _regionLockEnforced; }
 
 // ── Tunable constants (design §Appendix) ────────────────────────────────
 const RENEW_MS        = 60_000;          // re-subscribe cadence CEILING (stable state)
@@ -144,11 +163,28 @@ const T = {
   PULLRESP: 'pubsub:pullresp',  // pull response — routed back toward the requester id
   ROOTBEACON: 'pubsub:rootbeacon', // soft-state root advertisement to the topic's neighborhood
   REPLICATE: 'pubsub:replicate', // singleton-root durability: root pushes cache+tombstones to its N nearest neighbours (warm backup roots)
+  METRICSON: 'pubsub:metricson', // demand-driven metrics: routed toward the topic id like SUB; marks the path + root so ANY root publishes snapshots while the lease is fresh
 };
 
+// ── Demand-driven metrics (any root, no special nodes) ───────────────────
+// Metrics are NOT a relay feature — any node that is root for a topic publishes
+// its snapshots WHEN and ONLY WHEN a metrics lease is active. A subscriber to
+// metricTopic(T) emits a METRICSON toward T (routed like a SUB); the root (and
+// every inheriting root) sets a renewable lease and, while fresh, publishes a
+// snapshot to metricTopic(T) each METRICS_PUB_MS. Path nodes cache the flag so a
+// second requester's METRICSON short-circuits (the root already knows). The lease
+// self-expires when the last metric subscriber stops renewing → metrics turn off,
+// no orphan load.
+const METRICS_LEASE_MS = 70_000;   // root keeps publishing this long after the last METRICSON (~= dropMs; renewed by the subscriber's refresh tick)
+const METRICS_PUB_MS   = 20_000;   // snapshot cadence at the root while the lease is fresh
+const METRICS_COALESCE_MS = 8_000; // a path node re-forwards METRICSON upstream at most this often (fan-in dedup; still keeps the root's lease alive)
+
 // ── id helpers (264-bit ids ⇄ 66-char hex) ──────────────────────────────
+// Address invariant: bigint internally, hex only on the JSON wire. idHex is the
+// egress (bigint → wire hex); idBig is the ingress gate, delegating to the kernel's
+// canonical asId() so every wire→internal id conversion is validated the same way.
 const idHex = (big) => big.toString(16).padStart(66, '0');
-const idBig = (hex) => (typeof hex === 'bigint' ? hex : BigInt('0x' + String(hex)));
+const idBig = asId;
 const lc    = (s) => String(s ?? '').toLowerCase();
 const isHexId = (s) => /^[0-9a-f]{1,66}$/.test(s);
 
@@ -172,6 +208,8 @@ function makeRole(topicId, isRoot) {
     replicas: new Map(),             // (when ROOT) backupHex -> { at }  nodes holding a warm copy of our cache
     backupOf: null,                  // (when BACKUP) hex of the root replicating to us; null if we're not a backup
     lastReplicaAt: 0,                // (when BACKUP) _now() of the last replica push from our root (staleness → presume root gone)
+    metricsOn: 0,                    // (when ROOT) lease expiry ts; while > now, this root publishes snapshots to metricTopic(T)
+    metricsLastPub: 0,               // _now() of the last metric snapshot we published (throttle to METRICS_PUB_MS)
   };
 }
 
@@ -238,6 +276,10 @@ export class AxonaManager {
     this._pullSeq         = 0;
     this._timer           = null;
     this._burstTimers     = new Set();  // cold-publish burst setTimeout handles (cleared on stop)
+    this.myMetricsRequests = new Map(); // dataTopicBig -> { lastSent }  topics THIS node wants metrics for (renewed like subscriptions)
+    this._metricsWanted   = new Map();  // dataTopicBig -> exp   soft flag on a path node (short-circuit duplicate METRICSON)
+    this._metricsFwdAt    = new Map();  // dataTopicBig -> ts    last upstream METRICSON forward (fan-in coalesce)
+    this._metricsPublisher = null;      // (dataTopicIdHex, snapshot) => Promise  set by the peer; publishes to metricTopic(T)
 
     this._registerHandlers();
   }
@@ -258,6 +300,7 @@ export class AxonaManager {
     on(T.PULL,     this._onPull);
     on(T.PULLRESP, this._onPullResp);
     on(T.ROOTBEACON, this._onRootBeacon);
+    on(T.METRICSON, this._onMetricsOn);
   }
 
   // ── XOR-distance helper (264-bit ids as bigints) ────────────────────────
@@ -294,7 +337,29 @@ export class AxonaManager {
       if (idBig(via[0]) === this.nodeId) return this.axonRoles.has(idBig(payload.topicId)) ? 'handle' : 'reroute';
       return meta.isTerminal ? 'reroute' : 'forward';      // waypoint dead; I'm just closest to it
     }
-    return meta.isTerminal ? 'handle' : 'forward';         // bare topic id → only the terminus handles
+    // Bare topic id → only the terminus handles. REGION RULE: a topic may only be
+    // rooted by a node IN ITS REGION. If I'm the routing terminus but out-of-region,
+    // the topic's region has no node — REFUSE rather than root it here (which would
+    // pull a foreign region's traffic into mine and hotspot my region). The handlers
+    // treat 'reject' as "drop, don't seat/store/root."
+    if (!meta.isTerminal) return 'forward';
+    return this._regionOk(idBig(payload.topicId)) ? 'handle' : 'reject';
+  }
+
+  // True iff a topic (or any id) shares this node's region byte (S2 prefix). The
+  // region byte is the high byte of every 264-bit id; only same-region nodes may
+  // form a topic's axon-tree infrastructure (root + child relays).
+  _sameRegion(idBigVal) {
+    try { return extractS2Prefix(idBigVal) === extractS2Prefix(this.nodeId); }
+    catch { return false; }
+  }
+
+  // The region GATE used by every enforcement site. When the region lock is off
+  // (default, pre-critical-mass) this is always true → an out-of-region node may
+  // root/relay/host any topic (nearest node wins, pre-4.13.0 behavior). When on,
+  // it collapses to the strict same-region check.
+  _regionOk(idBigVal) {
+    return !_regionLockEnforced || this._sameRegion(idBigVal);
   }
 
   // I am the root for a topic iff I am the routing terminus for its bare id.
@@ -303,13 +368,20 @@ export class AxonaManager {
   // itself forever.
   _maybePromoteRoot(role, payload, meta) {
     const viaEmpty = !(Array.isArray(payload.via) && payload.via.length);
-    if (viaEmpty && meta.isTerminal && !role.isRoot) { role.isRoot = true; this._upstream.delete(role.topicId); this._announceRoot(role.topicId); }
+    if (viaEmpty && meta.isTerminal && !role.isRoot) {
+      role.isRoot = true; this._upstream.delete(role.topicId); this._announceRoot(role.topicId);
+      // Inherit an active metrics lease: if a METRICSON passed through this node on
+      // its way to the (now-departed) old root, the new root resumes publishing.
+      const w = this._metricsWanted.get(role.topicId) || 0;
+      if (w > this._now()) role.metricsOn = w;
+    }
   }
 
   // ── SUBSCRIBE ────────────────────────────────────────────────────────
   _onSub(payload, meta) {
     const d = this._topicDecision(payload, meta);
     if (d === 'forward') return;
+    if (d === 'reject') return 'consumed';   // out-of-region terminus: topic's region has no node → don't root/seat/store here
     if (d === 'reroute') { this._reroute(T.SUB, payload); return 'consumed'; }
 
     const topicBig = idBig(payload.topicId);
@@ -345,6 +417,7 @@ export class AxonaManager {
   _onUnsub(payload, meta) {
     const d = this._topicDecision(payload, meta);
     if (d === 'forward') return;
+    if (d === 'reject') return 'consumed';   // out-of-region terminus: topic's region has no node → don't root/seat/store here
     if (d === 'reroute') { this._reroute(T.UNSUB, payload); return 'consumed'; }
     const role = this.axonRoles.get(idBig(payload.topicId));
     if (role) { const s = lc(payload.subscriberId); role.subscribers.delete(s); role.children.delete(s); }
@@ -399,8 +472,15 @@ export class AxonaManager {
   // ≥2 leaves. Returning false tells _accept to deepen (delegate to a child)
   // instead of seating the newcomer over capacity.
   _promoteChild(role) {
+    // REGION RULE: the tree's relay infrastructure must be IN-REGION. Only promote
+    // an in-region leaf to a child relay; foreign leaves stay as direct leaves of
+    // the root (they still receive, they just never relay for a region not theirs).
     const leaves = [];
-    for (const s of role.subscribers.keys()) if (!role.children.has(s)) leaves.push(s);
+    for (const s of role.subscribers.keys()) {
+      if (role.children.has(s)) continue;
+      if (!this._regionOk(idBig(s))) continue;   // out-of-region subscriber: never a relay child (when region lock on)
+      leaves.push(s);
+    }
     if (leaves.length < 2) return false;
     const leaf = leaves[0];
     role.children.add(leaf);
@@ -424,6 +504,10 @@ export class AxonaManager {
   _onAdopt(payload, meta) {
     if (meta.targetId !== this.nodeId) return;        // routed to me specifically
     const topicBig = idBig(payload.topicId);
+    // REGION RULE: never become a child relay for a topic outside my region (the
+    // tree infrastructure is region-homogeneous). A correct parent won't delegate
+    // here, but refuse defensively so a stale/foreign ADOPT can't spill the tree.
+    if (!this._regionOk(topicBig)) return 'consumed';
     let role = this.axonRoles.get(topicBig);
     if (!role) { role = makeRole(topicBig, false); this.axonRoles.set(topicBig, role);
                  this._log('info', 'relay-formed', { topic: idHex(topicBig).slice(0, 12) }); }
@@ -442,6 +526,7 @@ export class AxonaManager {
   async _onPub(payload, meta) {
     const d = this._topicDecision(payload, meta);
     if (d === 'forward') return;
+    if (d === 'reject') return 'consumed';   // out-of-region terminus: topic's region has no node → don't root/seat/store here
     if (d === 'reroute') { this._reroute(T.PUB, payload); return 'consumed'; }
 
     const topicBig = idBig(payload.topicId);
@@ -1308,6 +1393,55 @@ export class AxonaManager {
     this.pubsubResetTopicConsumption(topicId);
   }
 
+  // ── Demand-driven metrics ────────────────────────────────────────────
+  // The peer registers a publisher that turns (dataTopicIdHex, snapshot) into a
+  // publish to metricTopic(dataTopicId). Kept out of the kernel so the kernel
+  // never needs an author key — the snapshot is published like any other message.
+  setMetricsPublisher(fn) { this._metricsPublisher = (typeof fn === 'function') ? fn : null; }
+
+  // Request metrics for a DATA topic: start a renewable lease toward its root.
+  // Idempotent; renewed on the refresh tick. (The peer calls this when the app
+  // subscribes to metricTopic(dataTopicId).)
+  pubsubMetricsOn(dataTopicBig) {
+    if (!this.myMetricsRequests.has(dataTopicBig)) this.myMetricsRequests.set(dataTopicBig, { lastSent: 0 });
+    this._sendMetricsOn(dataTopicBig);
+    this.myMetricsRequests.get(dataTopicBig).lastSent = this._now();
+  }
+  // Stop wanting metrics for a topic (lease lapses at the root → it stops publishing).
+  pubsubMetricsOff(dataTopicBig) { this.myMetricsRequests.delete(dataTopicBig); }
+
+  // Route a METRICSON toward the data topic's root (lookup-assisted, like SUB).
+  _sendMetricsOn(dataTopicBig) {
+    const hint = this._rootHint_(dataTopicBig);
+    this._send(T.METRICSON, { topicId: idHex(dataTopicBig), via: hint ? [hint] : [], requesterId: idHex(this.nodeId) });
+  }
+
+  // METRICSON routes toward the topic like a SUB. At the root (terminal / via
+  // waypoint holding the role) it arms a renewable publish lease. On the path it
+  // caches the flag so an inheriting root picks it up on promotion and a second
+  // requester's METRICSON short-circuits (fan-in dedup), while still re-forwarding
+  // periodically so the root's lease stays alive.
+  _onMetricsOn(payload, meta) {
+    const topicBig = idBig(payload.topicId);
+    const now = this._now();
+    const d = this._topicDecision(payload, meta);
+    if (d === 'reroute') { this._reroute(T.METRICSON, payload); return 'consumed'; }
+    if (d === 'reject') return 'consumed';   // out-of-region terminus: no in-region root to arm a metrics lease on
+    if (d === 'handle') {
+      const role = this.axonRoles.get(topicBig) || this._becomeRoot(topicBig);
+      this._maybePromoteRoot(role, payload, meta);
+      role.metricsOn = now + METRICS_LEASE_MS;                 // arm/renew the publish lease
+      return 'consumed';
+    }
+    // forward: remember the flag (short-circuit + inheritance) and coalesce upstream.
+    const hadFresh = (this._metricsWanted.get(topicBig) || 0) > now;
+    this._metricsWanted.set(topicBig, now + METRICS_LEASE_MS);
+    const lastFwd = this._metricsFwdAt.get(topicBig) || 0;
+    if (hadFresh && now - lastFwd < METRICS_COALESCE_MS) return 'consumed';  // root already informed recently → drop
+    this._metricsFwdAt.set(topicBig, now);
+    return;   // falsy → kernel forwards toward the root
+  }
+
   pubsubResetTopicConsumption(topicId) {
     // "Consumed nothing" → seed the since-floor to 0 so a following subscribe
     // replays the FULL history (since:'all'). MUST NOT delete the entry: a
@@ -1321,6 +1455,11 @@ export class AxonaManager {
   }
 
   pubsubHost(topicId) {
+    // REGION RULE backstop (when enforced): a node hosts/roots only topics in its region.
+    if (!this._regionOk(topicId)) {
+      this._log('warn', 'host-refused-foreign-region', { topic: idHex(topicId).slice(0, 12) });
+      return;
+    }
     this._hostedTopics.add(topicId);
     // Participate so the node won't be torn down and can root the topic if closest.
     // Route the announce through _sendSubscribe (lookup-assisted → the true root, and
@@ -1425,6 +1564,7 @@ export class AxonaManager {
   async _onKill(payload, meta) {
     const d = this._topicDecision(payload, meta);
     if (d === 'forward') return;
+    if (d === 'reject') return 'consumed';   // out-of-region terminus: topic's region has no node → don't root/seat/store here
     if (d === 'reroute') { this._reroute(T.KILL, payload); return 'consumed'; }
     const topicBig = idBig(payload.topicId);
     const role = this.axonRoles.get(topicBig) || this._becomeRoot(topicBig);
@@ -1459,6 +1599,7 @@ export class AxonaManager {
   _onTouch(payload, meta) {
     const d = this._topicDecision(payload, meta);
     if (d === 'forward') return;
+    if (d === 'reject') return 'consumed';   // out-of-region terminus: topic's region has no node → don't root/seat/store here
     if (d === 'reroute') { this._reroute(T.TOUCH, payload); return 'consumed'; }
     return 'consumed';
   }
@@ -1484,6 +1625,7 @@ export class AxonaManager {
     }
     const d = this._topicDecision(payload, meta);
     if (d === 'forward') return;
+    if (d === 'reject') return 'consumed';   // out-of-region terminus: topic's region has no node → don't root/seat/store here
     if (d === 'reroute') { this._reroute(T.PULL, payload); return 'consumed'; }
     // Terminus (root/closest) fall-through: answer if we hold it, else a genuine null.
     const hit = role ? (payload.postHash ? role.cache.find(c => c.msgId === payload.postHash) : role.cache[role.cache.length - 1]) : null;
@@ -1549,7 +1691,7 @@ export class AxonaManager {
           this._unattachedSince.delete(t);
         } else {
           if (!this._unattachedSince.has(t)) this._unattachedSince.set(t, now);
-          if (now - this._unattachedSince.get(t) >= ROOT_CLAIM_MS && this._selfClosestReachable(t)) {
+          if (now - this._unattachedSince.get(t) >= ROOT_CLAIM_MS && this._regionOk(t) && this._selfClosestReachable(t)) {
             const role2 = this.axonRoles.get(t) || this._becomeRoot(t);
             role2.isRoot = true;
             this._upstream.delete(t);
@@ -1597,7 +1739,7 @@ export class AxonaManager {
       // are the closest reachable node, promote NOW with our full cache (gap-free
       // takeover). Otherwise drop the backup marker (a closer node should hold it).
       role.backupOf = null;
-      if (this._selfClosestReachable(t)) {
+      if (this._regionOk(t) && this._selfClosestReachable(t)) {   // in-region only when region lock on — never root a foreign region
         role.isRoot = true;
         this._announceRoot(t);
         this._log('info', 'backup-promoted-root', { topic: idHex(t).slice(0, 12) });
@@ -1623,6 +1765,27 @@ export class AxonaManager {
         else        this._send(T.PUB,  { topicId: idHex(tb), via: hint ? [hint] : [], json: p.json });
       }
     }
+
+    // 1d. Metrics (demand-driven, ANY root). (a) Renew our own metrics requests
+    //     toward the root so its lease stays alive; (b) if WE are a root with a
+    //     fresh lease, publish a snapshot to metricTopic(T) each METRICS_PUB_MS via
+    //     the peer's publisher hook; (c) expire stale path flags.
+    for (const [t, r] of this.myMetricsRequests) {
+      if (now - (r.lastSent || 0) >= METRICS_PUB_MS) { r.lastSent = now; this._sendMetricsOn(t); }
+    }
+    if (this._metricsPublisher) {
+      for (const [t, role] of this.axonRoles) {
+        if (!role.isRoot || role.metricsOn <= now) continue;
+        if (now - role.metricsLastPub < METRICS_PUB_MS) continue;
+        role.metricsLastPub = now;
+        const snap = { v: 1, topic: idHex(t), ts: now, by: idHex(this.nodeId),
+          current_count: role.cache.length, seq: role.seq,
+          subscribers: role.subscribers.size, bytes: role.cacheBytes };
+        try { const p = this._metricsPublisher(idHex(t), snap); if (p && typeof p.catch === 'function') p.catch(() => {}); }
+        catch { /* advisory — never let a metrics publish break the tick */ }
+      }
+    }
+    for (const [t, exp] of this._metricsWanted) if (exp <= now) this._metricsWanted.delete(t);
 
     // 2. Evict stale subscribers; expire cache + tombstones; tear down a role
     //    that is empty and not locally needed.
@@ -1653,7 +1816,11 @@ export class AxonaManager {
       const keyspacePinned = this._hostKeyspace && role.isRoot;
       // A BACKUP holds a deliberate warm copy of another root's history — never tear
       // it down for being subscriber-less, or the durability replica vanishes.
-      if (role.subscribers.size === 0 && !holdsHistory && !keyspacePinned && !role.backupOf && !this.mySubscriptions.has(t) && !this._hostedTopics.has(t)) {
+      // A root with a fresh metrics lease keeps publishing snapshots, so retain it
+      // even with zero subscribers/cache — the lease self-expires (soft state), and
+      // the role then tears down on a later tick like any other.
+      const metricsLeased = role.isRoot && role.metricsOn > now;
+      if (role.subscribers.size === 0 && !holdsHistory && !keyspacePinned && !role.backupOf && !metricsLeased && !this.mySubscriptions.has(t) && !this._hostedTopics.has(t)) {
         this.axonRoles.delete(t);
         this._upstream.delete(t);
       }

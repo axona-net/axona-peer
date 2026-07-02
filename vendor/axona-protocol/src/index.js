@@ -119,7 +119,7 @@ export { Synapse }      from './dht/Synapse.js';
 export { Subscription } from './dht/Subscription.js';
 
 // ── Pub/sub primitives ─────────────────────────────────────────────
-export { AxonaManager } from './pubsub/AxonaManager.js';
+export { AxonaManager, configureRegionLock, isRegionLockEnforced } from './pubsub/AxonaManager.js';
 export {
   resolveTopic,
   deriveTopicId,
@@ -220,6 +220,7 @@ export {
   toHex,
   fromHex,
   isHexId,
+  asId,        // canonical id coercion gate (wire/hex → validated BigInt)
   assembleId,
   extractS2Prefix,
   extractHash,

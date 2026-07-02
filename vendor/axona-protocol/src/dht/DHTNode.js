@@ -7,7 +7,7 @@
  * send/receive at the same interface without touching this class.
  */
 import { geoCellId }       from '../utils/s2.js';
-import { clz264, ID_BITS } from '../utils/hexid.js';
+import { clz264, ID_BITS, asId } from '../utils/hexid.js';
 
 /**
  * Number of bits used for the S2 geographic cell stored on every node.
@@ -24,7 +24,10 @@ export class DHTNode {
    * @param {number} opts.lng   - Geographic longitude (-180 … 180)
    */
   constructor({ id, lat, lng }) {
-    this.id = id;
+    // Address invariant: node ids are BigInt internally, always. Coerce at the
+    // one construction gate so no downstream code has to guess the type — a hex
+    // string (e.g. an identity's serialized `.id`) or a BigInt both land as BigInt.
+    this.id = asId(id);
     this.lat = lat;
     this.lng = lng;
     this.alive = true;

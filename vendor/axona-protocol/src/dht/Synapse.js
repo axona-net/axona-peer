@@ -5,6 +5,8 @@
  * object that tracks reliability (Weight), measured speed (Latency), and
  * an LTP lock (Inertia) that prevents premature decay of recently-used routes.
  */
+import { asId } from '../utils/hexid.js';
+
 export class Synapse {
   /**
    * @param {object} opts
@@ -13,7 +15,8 @@ export class Synapse {
    * @param {number} opts.stratum   - Number of matching G-ID prefix bits
    */
   constructor({ peerId, latencyMs, stratum }) {
-    this.peerId    = peerId;
+    this.peerId    = asId(peerId);   // address invariant: peer ids are BigInt internally
+
     this.weight    = 0.5;      // reliability score [0, 1]
     this.latency   = latencyMs; // EMA of round-trip latency (ms)
     this.inertia   = 0;         // epoch lock: immune to decay while simEpoch < inertia
