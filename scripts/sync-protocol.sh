@@ -52,7 +52,7 @@ for dir in contracts crypto dht identity persistence pow pubsub transport utils;
   fi
 done
 
-for f in index.js errors.js bridgeDirectory.js; do
+for f in index.js errors.js bridgeDirectory.js connect.js; do
   if [ -f "${PROTOCOL_SRC}/${f}" ]; then
     cp "${PROTOCOL_SRC}/${f}" "${VENDOR_DST}/${f}"
     echo "  ✓ ${f}"
