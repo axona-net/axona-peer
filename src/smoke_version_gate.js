@@ -18,6 +18,7 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 import { WebSocket } from 'ws';
+import { WIRE_VERSION } from '../vendor/axona-protocol/src/transport/handshake.js';
 
 const BRIDGE_PORT = 19085;
 const BRIDGE_URL  = `ws://localhost:${BRIDGE_PORT}`;
@@ -51,6 +52,10 @@ function startBridge(env = {}) {
       MIN_KERNEL_VERSION: '0.0.0',
       MIN_PEER_APP_VERSION: '0.0.0',
       HELLO_TIMEOUT_MS: '500',
+      // G-8: /healthz exposes gate config + counters only to a token-bearing
+      // operator; unauthenticated callers get liveness only. The smoke's
+      // healthz assertions need the full readout.
+      HEALTHZ_TOKEN: 'gate-smoke-token',
       ...env,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -90,11 +95,12 @@ function probe({ helloVersion /* undefined = skip */ }) {
     }
     ws.on('open', () => {
       if (helloVersion !== undefined) {
-        // wireVersion '2.0' clears the bridge's wire-major partition gate so
-        // this smoke exercises the VERSION floor in isolation (the real app
-        // sends WIRE_VERSION from the kernel). Without it the gate rejects on
-        // wire before version is ever checked.
-        ws.send(JSON.stringify({ type: 'client-hello', version: helloVersion, wireVersion: '2.0' }));
+        // Send the vendored kernel's WIRE_VERSION so the bridge's wire-major
+        // partition gate passes and this smoke exercises the VERSION floor in
+        // isolation. Kernel-tracked (a hardcoded '2.0' here went stale across
+        // two wire bumps and the bridge rejected every probe on wire before
+        // the version was ever consulted).
+        ws.send(JSON.stringify({ type: 'client-hello', version: helloVersion, wireVersion: WIRE_VERSION }));
       }
     });
     ws.on('message', (data) => {
@@ -114,9 +120,22 @@ function probe({ helloVersion /* undefined = skip */ }) {
   });
 }
 
+async function reap(child) {
+  if (!child || child.exitCode !== null || child.signalCode !== null) return;
+  const exited = new Promise((r) => child.once('exit', r));
+  try { child.kill('SIGTERM'); } catch {}
+  await Promise.race([exited, new Promise((r) => setTimeout(r, 1500))]);
+  if (child.exitCode === null && child.signalCode === null) {
+    try { child.kill('SIGKILL'); } catch {}
+    await exited;
+  }
+}
+
+let bridgeChild = null;
 async function main() {
   console.log('Version-gate smoke (client-hello required)');
   const { child, identityPath, ready } = startBridge();
+  bridgeChild = child;
   try { await waitForReady(ready); }
   catch (err) { child.kill('SIGKILL'); console.error('FAIL:', err.message); process.exit(2); }
 
@@ -148,7 +167,8 @@ async function main() {
       typeof silent.reason === 'string' && silent.reason.includes('not received'));
 
     // ── 5. /healthz reports gate config + admitted/pending counters ──
-    const health = await fetch(`http://localhost:${BRIDGE_PORT}/healthz`).then(r => r.json());
+    const health = await fetch(`http://localhost:${BRIDGE_PORT}/healthz`,
+      { headers: { 'x-healthz-token': 'gate-smoke-token' } }).then(r => r.json());
     check('healthz reports minPeerVersion',
       health.minPeerVersion === '0.14.0');
     check('healthz reports admitted/pending counters',
@@ -160,7 +180,7 @@ async function main() {
     check('garbage version closed with 4426', garbage.code === 4426);
 
   } finally {
-    child.kill('SIGTERM');
+    await reap(child);
     try { require('node:fs').unlinkSync(identityPath); } catch {}
   }
 
@@ -168,7 +188,8 @@ async function main() {
   process.exit(failed === 0 ? 0 : 1);
 }
 
-main().catch(err => {
+main().catch(async (err) => {
   console.error('smoke threw:', err);
+  await reap(bridgeChild);   // never leave the spawned bridge squatting on the port
   process.exit(2);
 });
