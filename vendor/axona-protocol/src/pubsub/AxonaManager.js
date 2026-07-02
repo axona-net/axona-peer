@@ -1416,6 +1416,20 @@ export class AxonaManager {
     this._send(T.METRICSON, { topicId: idHex(dataTopicBig), via: hint ? [hint] : [], requesterId: idHex(this.nodeId) });
   }
 
+  // Publish one metric snapshot for a rooted topic, throttled to METRICS_PUB_MS
+  // (callers may fire on any trigger — the tick, or a just-armed lease — and the
+  // throttle keeps the net cadence). Advisory: never throws.
+  _publishMetricSnapshot(topicBig, role, now) {
+    if (!this._metricsPublisher || !role.isRoot) return;
+    if (now - role.metricsLastPub < METRICS_PUB_MS) return;
+    role.metricsLastPub = now;
+    const snap = { v: 1, topic: idHex(topicBig), ts: now, by: idHex(this.nodeId),
+      current_count: role.cache.length, seq: role.seq,
+      subscribers: role.subscribers.size, bytes: role.cacheBytes };
+    try { const p = this._metricsPublisher(idHex(topicBig), snap); if (p && typeof p.catch === 'function') p.catch(() => {}); }
+    catch { /* advisory — never let a metrics publish break the caller */ }
+  }
+
   // METRICSON routes toward the topic like a SUB. At the root (terminal / via
   // waypoint holding the role) it arms a renewable publish lease. On the path it
   // caches the flag so an inheriting root picks it up on promotion and a second
@@ -1431,6 +1445,14 @@ export class AxonaManager {
       const role = this.axonRoles.get(topicBig) || this._becomeRoot(topicBig);
       this._maybePromoteRoot(role, payload, meta);
       role.metricsOn = now + METRICS_LEASE_MS;                 // arm/renew the publish lease
+      // Answer the demand NOW (v4.16.1): the first snapshot rides back at routing
+      // latency instead of waiting for the next 5 s refresh tick, so a subscriber
+      // that just turned metrics on hears a count roughly when its data-topic
+      // replay lands — the difference between "0 alerts" and "cache is near its
+      // rollover cap" must not wait on a poll cycle. The METRICS_PUB_MS throttle
+      // inside the helper keeps renewals from turning this into a per-METRICSON
+      // publish storm; the net cadence stays ~20 s.
+      this._publishMetricSnapshot(topicBig, role, now);
       return 'consumed';
     }
     // forward: remember the flag (short-circuit + inheritance) and coalesce upstream.
@@ -1775,14 +1797,8 @@ export class AxonaManager {
     }
     if (this._metricsPublisher) {
       for (const [t, role] of this.axonRoles) {
-        if (!role.isRoot || role.metricsOn <= now) continue;
-        if (now - role.metricsLastPub < METRICS_PUB_MS) continue;
-        role.metricsLastPub = now;
-        const snap = { v: 1, topic: idHex(t), ts: now, by: idHex(this.nodeId),
-          current_count: role.cache.length, seq: role.seq,
-          subscribers: role.subscribers.size, bytes: role.cacheBytes };
-        try { const p = this._metricsPublisher(idHex(t), snap); if (p && typeof p.catch === 'function') p.catch(() => {}); }
-        catch { /* advisory — never let a metrics publish break the tick */ }
+        if (role.metricsOn <= now) continue;
+        this._publishMetricSnapshot(t, role, now);
       }
     }
     for (const [t, exp] of this._metricsWanted) if (exp <= now) this._metricsWanted.delete(t);

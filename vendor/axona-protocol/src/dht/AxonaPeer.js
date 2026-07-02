@@ -2141,14 +2141,21 @@ export class AxonaPeer extends DHT {
    * One-shot read of a topic's latest metrics snapshot. Works for BOTH open and
    * owned data topics (their metric topic is open + advisory either way).
    *
-   * Mechanism (kernel v4.3.0): metrics are no longer scatter-gathered — the topic's
-   * root PUBLISHES a signed snapshot to metricTopic(dataId) every ~20s (the relay
-   * fleet runs this publisher). Under the v4.10.0 cohort model EVERY co-hosting root
-   * publishes its own snapshot, so this call collects them across a short window and
-   * AGGREGATES: `subscribers` is summed (each root reports its own subset),
-   * `current_count`/`seq`/`bytes` are maxed (they converge across the cohort via
-   * anti-entropy; max tolerates a lagging member). For a live dashboard, **prefer
-   * `sub(metricTopic(dataId), …)` directly** — this one-shot is a convenience.
+   * Mechanism: metrics are DEMAND-DRIVEN (v4.12.0) — subscribing to
+   * metricTopic(dataId), which this call does internally, routes a renewable
+   * METRICSON lease to the data topic's root(s); while leased, each rooting node
+   * publishes a signed snapshot every ~20s. Under the v4.10.0 cohort model EVERY
+   * co-hosting root publishes its own snapshot, so this call collects them across
+   * a short window and AGGREGATES: `subscribers` is summed (each root reports its
+   * own subset), `current_count`/`seq`/`bytes` are maxed (they converge across the
+   * cohort via anti-entropy; max tolerates a lagging member).
+   *
+   * TIMING: on a COLD topic (no recent watcher) the first snapshot arrives ~2-20s
+   * after demand turns on — beyond the default 1500ms window — so the first call
+   * returns stale:true unless a snapshot from a prior watcher is still in the 48h
+   * replay cache. Retry, pass a wider timeoutMs (25_000 spans one cadence), or —
+   * for a live dashboard — **prefer `sub(metricTopic(dataId), …)` directly**;
+   * this one-shot is a convenience.
    *
    * @param {string} topic
    * @param {object} [opts]
