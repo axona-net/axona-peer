@@ -143,8 +143,14 @@ const PENDING_PUB_MAX_TRIES = 6;         // cap re-sends so a never-confirmed pu
 // fresh shot at the true root as tables converge. Naturally disabled once warm (the
 // gate is low neighbour count), and the slow refreshTick retry still backstops after.
 const COLD_BURST_TRIES     = 5;          // extra fast re-sends on a cold publish
-const COLD_BURST_INTERVAL_MS = 200;      // spacing of the burst (≈1s total)
+const COLD_BURST_INTERVAL_MS = 200;      // spacing of the fast burst (≈1s total)
+const COLD_BURST_SLOW_TRIES    = 5;      // then a second, slower wave as tables keep warming
+const COLD_BURST_SLOW_INTERVAL_MS = 400; // 5 × 400ms ≈ 2s more coverage past the first second
 const COLD_PEER_THRESHOLD  = 8;          // "cold" = fewer than this many neighbours (not yet integrated)
+// First publish to a topic — even when WARM — is re-sent once this long after, so a
+// tree that formed microseconds before the send (a just-arrived subscriber, a root
+// that just rooted) still catches it. Cold publishers already re-send via the burst.
+const FIRST_PUBLISH_RESEND_MS = 200;
 const REPLAY_CHUNK_BYTES = 96 * 1024;    // byte budget per replay deliver batch
 const FUTURE_TOLERANCE_MS = 5 * 60 * 1000;   // §5 bad-clock rule: drop replayed stamps this far ahead
 
@@ -288,7 +294,8 @@ export class AxonaManager {
     this._pending         = new Map();  // pull corrId -> { resolve, timer }
     this._pullSeq         = 0;
     this._timer           = null;
-    this._burstTimers     = new Set();  // cold-publish burst setTimeout handles (cleared on stop)
+    this._burstTimers     = new Set();  // cold-publish burst + first-publish setTimeout handles (cleared on stop)
+    this._publishedTopics = new Set();  // topics this node has published to (for the first-publish re-send)
     this.myMetricsRequests = new Map(); // dataTopicBig -> { lastSent }  topics THIS node wants metrics for (renewed like subscriptions)
     this._metricsWanted   = new Map();  // dataTopicBig -> exp   soft flag on a path node (short-circuit duplicate METRICSON)
     this._metricsFwdAt    = new Map();  // dataTopicBig -> ts    last upstream METRICSON forward (fan-in coalesce)
@@ -1384,9 +1391,26 @@ export class AxonaManager {
     let pmsgId = null; try { pmsgId = JSON.parse(json)?.msgId ?? null; } catch { /* opaque body */ }
     if (pmsgId) this._pendingPub.set(pmsgId, { topicBig: topicId, json, at: this._now(), tries: 0 });
     this._send(T.PUB, { topicId: idHex(topicId), via: hint ? [hint] : [], json });
-    // Cold-publish burst: if we're not yet integrated, front-load a few fast re-sends
+    // Cold-publish burst: if we're not yet integrated, front-load a wave of re-sends
     // (see COLD_BURST_* above) — idempotent, and each send also integrates us.
-    if (pmsgId && this._isColdPublisher()) this._coldPublishBurst(topicId, pmsgId);
+    const cold = this._isColdPublisher();
+    if (pmsgId && cold) this._coldPublishBurst(topicId, pmsgId);
+    // First publish to a topic, even when WARM: re-send once after a short beat so a
+    // just-formed tree still catches it. Cold publishers already re-send via the
+    // burst, so this only covers the warm first-publish. Tracked per topic —
+    // subsequent publishes to the same topic go back to a single send.
+    if (pmsgId && !cold && !this._publishedTopics.has(topicId)) {
+      const h = setTimeout(() => {
+        this._burstTimers.delete(h);
+        const p = this._pendingPub?.get(pmsgId);
+        if (!p) return;                                 // already confirmed/expired
+        const hint2 = this._rootHint_(topicId);
+        this._send(T.PUB, { topicId: idHex(topicId), via: hint2 ? [hint2] : [], json: p.json });
+      }, FIRST_PUBLISH_RESEND_MS);
+      if (typeof h.unref === 'function') h.unref();
+      this._burstTimers.add(h);
+    }
+    if (pmsgId) this._publishedTopics.add(topicId);
     return meta.postHash || '';
   }
 
@@ -1404,16 +1428,22 @@ export class AxonaManager {
   // stops early the moment the publish is confirmed/expired (_pendingPub no longer
   // holds this msgId). Idempotent end-to-end: the root dedups by msgId.
   _coldPublishBurst(topicBig, msgId) {
+    const total = COLD_BURST_TRIES + COLD_BURST_SLOW_TRIES;
     let i = 0;
     const schedule = () => {
+      // Two phases: a fast wave (COLD_BURST_TRIES × 200ms ≈ 1s) front-loads re-sends
+      // while the table warms, then a slower wave (COLD_BURST_SLOW_TRIES × 400ms ≈ 2s
+      // more) keeps re-shooting at the true root as integration continues past the
+      // first second. Idempotent throughout (the root dedups by msgId).
+      const delay = (i < COLD_BURST_TRIES) ? COLD_BURST_INTERVAL_MS : COLD_BURST_SLOW_INTERVAL_MS;
       const h = setTimeout(() => {
         this._burstTimers.delete(h);
         const p = this._pendingPub?.get(msgId);
         if (!p) return;                                 // confirmed or aged out → done
         const hint = this._rootHint_(topicBig);
         this._send(T.PUB, { topicId: idHex(topicBig), via: hint ? [hint] : [], json: p.json });
-        if (++i < COLD_BURST_TRIES) schedule();
-      }, COLD_BURST_INTERVAL_MS);
+        if (++i < total) schedule();
+      }, delay);
       if (typeof h.unref === 'function') h.unref();
       this._burstTimers.add(h);
     };
