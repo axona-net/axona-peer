@@ -2434,10 +2434,15 @@ export class AxonaPeer extends DHT {
           meshBound = t.webrtc.boundPeers().length;
         }
       } catch { /* best-effort */ }
+      let signaling = null;
+      try {
+        if (typeof t.signalStats === 'function') signaling = t.signalStats();
+      } catch { /* best-effort */ }
       if (meshChannels !== null || boundCount !== null) {
         transport = {
           boundCount, meshChannels, meshOpen, meshBound,
           bridgeState: t.bridgeState ?? null,
+          signaling,   // W1: mesh-vs-bridge signaling split ({meshMsgs,bridgeMsgs,bridgeMsgFraction,...})
         };
         // Open data channels with materially fewer authenticated binds
         // ⇒ routing is not flowing despite a connected-looking mesh.

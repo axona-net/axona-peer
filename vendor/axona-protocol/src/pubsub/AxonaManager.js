@@ -1146,13 +1146,32 @@ export class AxonaManager {
         this._lookupInflight.add(topicBig);
         Promise.resolve()
           .then(resolveClosest)
-          .then(id => {
+          .then(async id => {
+            // findKClosest is LOCAL-ONLY (never probes the network). Local knowledge
+            // is region-bounded: a node in region A holds few/no synapses into
+            // region B, and the bridge — the universal connector — is skipped as a
+            // hop. So a foreign-region subscriber's local closest is often itself,
+            // and it wrongly SELF-ROOTS the topic → a second root disjoint from the
+            // publisher's → 0% cross-region delivery. Region is a PLACEMENT HINT,
+            // not a routing wall: before self-rooting, probe the network with the
+            // ITERATIVE lookup (which hops through the meshed relays and DOES cross
+            // regions) to find the TRUE globally-closest reachable node. Only pay
+            // this when about to self-root (rare — the real root, or a stranded
+            // foreign node); the fast local path is unchanged for everyone else.
+            const selfHex = lc(idHex(this.nodeId));
+            const localHex = (id != null) ? lc(idHex(idBig(id))) : null;
+            if ((localHex === null || localHex === selfHex) && typeof this.dht.lookup === 'function') {
+              try {
+                const r = await this.dht.lookup(topicBig);
+                if (r && Array.isArray(r.path) && r.path.length) id = r.path[r.path.length - 1];
+              } catch { /* keep the local result — greedy stays in effect */ }
+            }
             // Self-closest → leave the hint null so we route greedily toward the
             // bare topic id and become root as the terminus (don't via-pin to self).
             let hex = null;
             if (id != null) {
               const h = lc(idHex(idBig(id)));
-              if (h !== lc(idHex(this.nodeId))) hex = h;
+              if (h !== selfHex) hex = h;
             }
             this._rootHint.set(topicBig, { via: hex, at: this._now() });
             // Heal (subscribe): subscribed, not yet pinned (no deliver `from`

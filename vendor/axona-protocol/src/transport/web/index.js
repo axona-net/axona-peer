@@ -306,20 +306,29 @@ export function webTransport({
   // took ownership (will route through the mesh), else we fall back to the
   // bridge.  Pure bridge behaviour is preserved when meshRelay is off.
   let signalRelay = null;
+  // Signaling-path telemetry (W1): how often WebRTC signaling rides the mesh
+  // (peer-relayed, bridge untouched) vs falls back to the bridge. Message-level
+  // counts show load split; the distinct-peer sets approximate how many *links*
+  // were established each way (a healthy dense mesh should signal almost every
+  // post-bootstrap edge peer-to-peer, leaving the bridge only genuinely new
+  // joiners + NAT/ICE failures). Pure measurement — no behaviour change.
+  const signalStats = { meshMsgs: 0, bridgeMsgs: 0, dropMsgs: 0, meshPeers: new Set(), bridgePeers: new Set() };
   const mesh = new MeshManager({
     sendSignal: (toPeerId, payload) => {
       if (meshRelay && typeof signalRelay === 'function' && isHexId(toPeerId)) {
         let took = false;
         try { took = signalRelay(toPeerId, payload) === true; }
         catch (err) { log('signal-relay-threw', { to: toPeerId, err: err.message }); }
-        if (took) return;
+        if (took) { signalStats.meshMsgs++; signalStats.meshPeers.add(toPeerId); return; }
       }
       if (!socketOpen) {
+        signalStats.dropMsgs++;
         log('signal-drop-no-bridge', { to: toPeerId });
         return;
       }
       try {
         sendToBridge({ type: 'signal', to: toPeerId, payload });
+        signalStats.bridgeMsgs++; signalStats.bridgePeers.add(toPeerId);
       } catch (err) {
         log('signal-send-failed', { to: toPeerId, err: err.message });
       }
@@ -812,6 +821,17 @@ export function webTransport({
   // Advisory capability surface (forward-compat; functional gate is the flag).
   composite.capabilities = () => (meshRelay ? ['mesh-relay'] : []);
   composite.hasCapability = (cap) => composite.capabilities().includes(cap);
+  // Signaling-path telemetry (W1): snapshot of mesh-relayed vs bridge-fallback
+  // signaling. bridgeMsgFraction near 0 on a healthy mesh = the bridge is only
+  // carrying genuine new-joiner + NAT/ICE-failure signaling, as intended.
+  composite.signalStats = () => {
+    const m = signalStats.meshMsgs, b = signalStats.bridgeMsgs;
+    return {
+      meshMsgs: m, bridgeMsgs: b, dropMsgs: signalStats.dropMsgs,
+      meshPeers: signalStats.meshPeers.size, bridgePeers: signalStats.bridgePeers.size,
+      bridgeMsgFraction: (m + b) ? +(b / (m + b)).toFixed(3) : 0,
+    };
+  };
   Object.defineProperty(composite, 'socket',          { get() { return socket; } });
   Object.defineProperty(composite, 'bridgeReady',     { get() { return bridgeReady; } });
   // Display surface: hex (derived from BigInt).  External UI / log
