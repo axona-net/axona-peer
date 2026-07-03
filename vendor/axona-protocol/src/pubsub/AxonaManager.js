@@ -104,6 +104,19 @@ const ROOT_CLAIM_MS   = 6_000;           // unconfirmed-deferral window before s
 // recruited, farther ones retired). 0 disables.
 const ROOT_REPLICAS   = 2;
 const REPLICA_STALE_MS = 65_000;         // a backup whose root stopped replicating this long is presumed gone
+// DEPARTURE-TRIGGERED promotion (v4.17.0): a root that HOLDS cache re-replicates its
+// full state to its backups every tick (~5s heartbeat), so a backup of a *live* root
+// sees `lastReplicaAt` refresh continuously; only genuine packet loss lets it drift,
+// and REPLICA_STALE_MS (65s ≈ 13 missed heartbeats) tolerates that without splitting a
+// live-but-lossy root. But when the root has actually LEFT the mesh — it is no longer a
+// reachable neighbour — waiting 65s of silence needlessly strands the topic's history
+// for far longer than an interactive churn window (Howard's suite re-tests in ~20s). So
+// when the backup observes its root is GONE from the reachable set, promote after only
+// this short grace instead. Kept above one tick so a single transient synapse-reshuffle
+// (root momentarily absent, still alive) doesn't spuriously split the root; the
+// _selfClosestReachable gate + beacon-demote reconciliation make a rare over-promotion
+// self-healing regardless.
+const REPLICA_GONE_MS  = 8_000;          // root observably departed the mesh → promote after this (vs 65s of silence)
 // ≈1 renewFastMs cycle: long enough that a genuinely reachable multi-hop closer
 // root adopts us first (deliver-`from` pin), short enough that a cold topic roots
 // within a couple of seconds instead of stranding. (12s was measured too slow —
@@ -1281,6 +1294,21 @@ export class AxonaManager {
   // XOR than any of these, but if it never adopts us it is effectively unreachable;
   // when self beats every reachable neighbour, self is the best reachable root. Pure
   // local read — no network probe. Sim/fabric without neighbours() → trivially self.
+  // Is `hex` a currently-reachable node (a direct neighbour in the synaptome)?
+  // Used to distinguish a departed root (drop from the mesh → fast promotion) from
+  // a live-but-quiet one (kept as a passive backup for the full stale window).
+  // Conservative: with no neighbour introspection available, treat as reachable
+  // (fall back to the slow silence timer rather than risk splitting a live root).
+  _isReachableId(hex) {
+    if (typeof this.dht.neighbors !== 'function') return true;
+    let want; try { want = idBig(hex); } catch { return true; }
+    for (const n of (this.dht.neighbors() || [])) {
+      let nb; try { nb = idBig(n); } catch { continue; }
+      if (nb === want) return true;
+    }
+    return false;
+  }
+
   _selfClosestReachable(tBig) {
     const bridge = (typeof this.dht.bridgeId === 'function') ? this.dht.bridgeId() : null;
     let bestD = this.nodeId ^ tBig;
@@ -1383,6 +1411,15 @@ export class AxonaManager {
       since, lastRenewSent: this._now(), interval: this.renewFastMs,
       replayLatest: !!opts.replayLatest,
     });
+    // If this node already HOLDS the topic's cache (it is the root, or a
+    // cache-bearing relay), no wire replay can serve it: the outgoing SUB
+    // carries since=high-water (§6 — a holder never re-pulls history it already
+    // stores), and a root's own SUB self-loops without seating. Replay the local
+    // cache straight to the app against the app-level floor — without this, a
+    // since:'all' subscriber that happens to be the topic's root receives zero
+    // of the history it is itself storing. Idempotent (exactly-once app dedup).
+    const role = this.axonRoles.get(topicId);
+    if (role) this._replayLocal(role, since, !!opts.replayLatest);
     this._sendSubscribe(topicId);
   }
 
@@ -1756,7 +1793,14 @@ export class AxonaManager {
     this._replicateRoots();
     for (const [t, role] of this.axonRoles) {
       if (!role.backupOf) continue;
-      if (now - role.lastReplicaAt <= REPLICA_STALE_MS) continue;   // root still replicating → stay a passive standby
+      // Two staleness thresholds: a root still present in the mesh but quiet is
+      // tolerated for REPLICA_STALE_MS (transient-loss margin); a root that has
+      // DEPARTED the reachable set is presumed gone after only REPLICA_GONE_MS, so
+      // the topic's history is served again within an interactive churn window
+      // instead of ~65s later.
+      const rootGone = !this._isReachableId(role.backupOf);
+      const graceMs  = rootGone ? REPLICA_GONE_MS : REPLICA_STALE_MS;
+      if (now - role.lastReplicaAt <= graceMs) continue;   // root still replicating / recently seen → stay a passive standby
       // Root stopped replicating ⇒ presumed gone. Stop being a passive backup; if we
       // are the closest reachable node, promote NOW with our full cache (gap-free
       // takeover). Otherwise drop the backup marker (a closer node should hold it).
