@@ -103,20 +103,17 @@ const ROOT_CLAIM_MS   = 6_000;           // unconfirmed-deferral window before s
 // promotes it with no gap. Backups are re-evaluated each tick (closer newcomers
 // recruited, farther ones retired). 0 disables.
 const ROOT_REPLICAS   = 2;
-const REPLICA_STALE_MS = 65_000;         // a backup whose root stopped replicating this long is presumed gone
-// DEPARTURE-TRIGGERED promotion (v4.17.0): a root that HOLDS cache re-replicates its
-// full state to its backups every tick (~5s heartbeat), so a backup of a *live* root
-// sees `lastReplicaAt` refresh continuously; only genuine packet loss lets it drift,
-// and REPLICA_STALE_MS (65s ≈ 13 missed heartbeats) tolerates that without splitting a
-// live-but-lossy root. But when the root has actually LEFT the mesh — it is no longer a
-// reachable neighbour — waiting 65s of silence needlessly strands the topic's history
-// for far longer than an interactive churn window (Howard's suite re-tests in ~20s). So
-// when the backup observes its root is GONE from the reachable set, promote after only
-// this short grace instead. Kept above one tick so a single transient synapse-reshuffle
-// (root momentarily absent, still alive) doesn't spuriously split the root; the
-// _selfClosestReachable gate + beacon-demote reconciliation make a rare over-promotion
-// self-healing regardless.
-const REPLICA_GONE_MS  = 15_000;         // root observably departed the mesh → promote after this (raised 8s→15s: at 8s a transiently-unreachable root got a backup promoted over it → split root → dropped pubs/kills; vs 65s of pure silence)
+// A backup is a subscribing CHILD RELAY that also prefetches the root's full cache
+// (see _onReplicate + the _backupTopics subscribe loop in refreshTick). Promotion is
+// NOT a bespoke, local-only decision anymore (that split roots when two backups
+// couldn't see each other): a backup renews its subscribe every tick, so on root
+// churn the SAME probe-protected machinery every subscriber/host uses — _rootHint_'s
+// iterative lookup() → single globally-closest terminus — elects exactly ONE new root
+// (the closest self-roots; the rest re-home under it), gap-free from the warm cache.
+// This constant only bounds set growth: a backup whose root stopped replicating to it
+// this long (root departed & we've since re-homed/promoted, or the root retired us) is
+// dropped from _backupTopics as cleanup — never used to trigger promotion.
+const BACKUP_EVICT_MS = 60_000;
 // ≈1 renewFastMs cycle: long enough that a genuinely reachable multi-hop closer
 // root adopts us first (deliver-`from` pin), short enough that a cold topic roots
 // within a couple of seconds instead of stranding. (12s was measured too slow —
@@ -276,6 +273,7 @@ export class AxonaManager {
     this.axonRoles       = new Map();   // topicIdBig -> Role  (topics I host: root or relay)
     this.mySubscriptions = new Map();   // topicIdBig -> { since, lastRenewSent }
     this._hostedTopics   = new Set();   // topicIdBig hosted without app consumption
+    this._backupTopics   = new Set();   // topicIdBig I hold a warm replica for → subscribe like a child relay (single-root election)
     this._lastSeenTsByTopic = new Map();// topicIdBig -> ts  (AxonaPeer seeds `since` here)
 
     // Internal.
@@ -811,11 +809,14 @@ export class AxonaManager {
     }
   }
 
-  // Receive a replica push: become (or refresh) a passive BACKUP for this topic —
-  // hold the full cache + tombstones without claiming root or fanning to subscribers
-  // while the root keeps replicating. Verifies each message (don't-trust) via the
-  // normal stamped-ingest. On root churn this cache is what makes instant takeover
-  // gap-free (see the stale-promote in refreshTick + _onSub-terminal promotion).
+  // Receive a replica push: become (or refresh) a BACKUP for this topic — hold the
+  // full cache + tombstones (don't-trust: each message re-verified via stamped-ingest)
+  // AND join _backupTopics so refreshTick subscribes us toward the topic like an
+  // ordinary child relay. While the root lives our SUB routes to it and we sit as a
+  // warm child; when it churns the normal probe-protected subscribe machinery elects
+  // ONE new root (the closest self-roots, we re-home under it) — no bespoke local-only
+  // promotion to split. The prefetched cache makes whichever backup wins take over
+  // gap-free (it already holds the history a since:'all' joiner will ask for).
   async _onReplicate(payload, meta) {
     if (meta.targetId !== this.nodeId) return;          // routed to me as the backup
     if (!this._rootReplicas) return 'consumed';         // replication disabled on this node
@@ -828,6 +829,7 @@ export class AxonaManager {
     if (role.isRoot) return 'consumed';                 // I'm already (a closer) root — ignore a backup push
     role.backupOf = from;
     role.lastReplicaAt = this._now();
+    this._backupTopics.add(topicBig);                   // participate as a subscribing child relay (single-root election)
     this._applyDels(role, topicBig, payload.dels);   // tombstones FIRST → a killed body in the same push is suppressed
     for (const m of (Array.isArray(payload.msgs) ? payload.msgs : [])) {
       if (m && typeof m.json === 'string' && Number.isFinite(m.publishTs)) await this._ingestStamped(role, m);
@@ -1654,6 +1656,7 @@ export class AxonaManager {
     this.axonRoles.clear();
     this.mySubscriptions.clear();
     this._hostedTopics.clear();
+    this._backupTopics.clear();
     this._lastSeenTsByTopic.clear();
     this._upstream.clear();
     this._rootHint.clear();
@@ -1838,27 +1841,33 @@ export class AxonaManager {
         this._sendSubscribe(t);
       }
     }
-    // 1b-rep. Singleton-root replication (warm backup roots) + backup promotion.
+    // 1b-rep. Singleton-root replication (warm backup roots) — push each root's full
+    //         cache to its ROOT_REPLICAS nearest neighbours so a successor is always
+    //         warm.
     this._replicateRoots();
-    for (const [t, role] of this.axonRoles) {
-      if (!role.backupOf) continue;
-      // Two staleness thresholds: a root still present in the mesh but quiet is
-      // tolerated for REPLICA_STALE_MS (transient-loss margin); a root that has
-      // DEPARTED the reachable set is presumed gone after only REPLICA_GONE_MS, so
-      // the topic's history is served again within an interactive churn window
-      // instead of ~65s later.
-      const rootGone = !this._isReachableId(role.backupOf);
-      const graceMs  = rootGone ? REPLICA_GONE_MS : REPLICA_STALE_MS;
-      if (now - role.lastReplicaAt <= graceMs) continue;   // root still replicating / recently seen → stay a passive standby
-      // Root stopped replicating ⇒ presumed gone. Stop being a passive backup; if we
-      // are the closest reachable node, promote NOW with our full cache (gap-free
-      // takeover). Otherwise drop the backup marker (a closer node should hold it).
-      role.backupOf = null;
-      if (this._regionOk(t) && this._selfClosestReachable(t)) {   // in-region only when region lock on — never root a foreign region
-        role.isRoot = true;
-        this._announceRoot(t);
-        this._log('info', 'backup-promoted-root', { topic: idHex(t).slice(0, 12) });
+    // 1b-bak. Backups are subscribing CHILD RELAYS. Renew each backup's subscribe
+    //         every tick so root election runs through the SAME probe-protected path
+    //         as any subscriber/host (_rootHint_'s iterative lookup → one globally-
+    //         closest terminus), instead of the old bespoke local-only _selfClosest
+    //         promotion that split when two backups couldn't see each other. While the
+    //         root lives the SUB routes to it (we sit as a warm child); when it churns
+    //         the closest backup self-roots via the _onSub terminal and the rest
+    //         re-home under it — a single root, gap-free from the prefetched cache.
+    for (const t of this._backupTopics) {
+      const role = this.axonRoles.get(t);
+      if (!role) { this._backupTopics.delete(t); continue; }
+      if (role.isRoot) continue;                       // won the election — a root doesn't subscribe to itself
+      // Cleanup ONLY when we're a redundant spare — never when we might need to promote:
+      // we've re-homed as a child under a LIVE root (upstream set to a reachable node
+      // that isn't us) and the root stopped replicating to us for a while. A backup
+      // whose root vanished and hasn't re-homed stays subscribed so it can win the
+      // election (that path must never be pruned, or a split-brain topic gets NO root).
+      const up = this._upstream.get(t);
+      const rehomed = Array.isArray(up) && up.length > 0 && up[0] !== lc(idHex(this.nodeId)) && this._isReachableId(up[0]);
+      if (rehomed && role.subscribers.size === 0 && (now - (role.lastReplicaAt || 0)) > BACKUP_EVICT_MS) {
+        this._backupTopics.delete(t); role.backupOf = null; continue;
       }
+      this._sendSubscribe(t);
     }
 
     // 1c. Persistent publish/kill retry (reliability under packet loss). A routed
@@ -1929,7 +1938,7 @@ export class AxonaManager {
       // even with zero subscribers/cache — the lease self-expires (soft state), and
       // the role then tears down on a later tick like any other.
       const metricsLeased = role.isRoot && role.metricsOn > now;
-      if (role.subscribers.size === 0 && !holdsHistory && !keyspacePinned && !role.backupOf && !metricsLeased && !this.mySubscriptions.has(t) && !this._hostedTopics.has(t)) {
+      if (role.subscribers.size === 0 && !holdsHistory && !keyspacePinned && !role.backupOf && !this._backupTopics.has(t) && !metricsLeased && !this.mySubscriptions.has(t) && !this._hostedTopics.has(t)) {
         this.axonRoles.delete(t);
         this._upstream.delete(t);
       }
