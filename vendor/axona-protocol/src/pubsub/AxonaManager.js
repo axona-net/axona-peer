@@ -387,12 +387,56 @@ export class AxonaManager {
   _maybePromoteRoot(role, payload, meta) {
     const viaEmpty = !(Array.isArray(payload.via) && payload.via.length);
     if (viaEmpty && meta.isTerminal && !role.isRoot) {
+      if (this._liveCloserRoot(role.topicId)) return;   // a closer live root is beaconing — don't contest it
       role.isRoot = true; this._upstream.delete(role.topicId); this._announceRoot(role.topicId);
       // Inherit an active metrics lease: if a METRICSON passed through this node on
       // its way to the (now-departed) old root, the new root resumes publishing.
       const w = this._metricsWanted.get(role.topicId) || 0;
       if (w > this._now()) role.metricsOn = w;
     }
+  }
+
+  // A live root beacon naming a STRICTLY closer node than self means this node
+  // must not (re)take the topic's root — stranded terminal traffic defers to that
+  // root instead. This breaks the flap loop observed on the prod relay backbone:
+  // a near-miss relay was beacon-demoted every ~20s but re-rooted on the next
+  // stranded SUB (only PUB carried the last-mile correction), so two same-region
+  // relays traded the root forever and subscribers/publishers split across the
+  // variants. `requireReachable` (the default) additionally demands the beaconed
+  // root be a DIRECT, authenticated neighbour — when a root dies its channel
+  // drops and the gate opens instantly, so backup promotion on churn is never
+  // stalled by a stale beacon (the ≤TTL corpse window). The PUB last-mile
+  // correction keeps its original TTL-only semantics (requireReachable:false): a
+  // publish is one self-healing message, and that looser gate is what fixed
+  // cold-publish discovery.
+  _liveCloserRoot(topicBig, { requireReachable = true } = {}) {
+    const b = this._rootBeacons.get(topicBig);
+    if (!b || this._now() >= b.exp) return null;
+    if (b.root === lc(idHex(this.nodeId))) return null;
+    let rb; try { rb = idBig(b.root); } catch { return null; }
+    if ((rb ^ topicBig) >= (this.nodeId ^ topicBig)) return null;   // never defer to a farther node
+    if (this._isReachableId(b.root)) return b.root;                 // channel-verified live neighbour
+    // Loose branch (PUB/KILL): a live root re-beacons every BEACON_MS, so a
+    // beacon heard very recently is strong liveness evidence even for a
+    // non-neighbour root. A DEAD root's beacon goes silent — without this
+    // freshness cut a stranded publish ping-pongs toward the corpse until the
+    // full beacon TTL (the pre-4.19 latent loop, reproduced in
+    // smoke_root_reconcile phase 4).
+    if (!requireReachable && (this._now() - b.at) < BEACON_MS * 1.5) return b.root;
+    return null;
+  }
+
+  // Defer a stranded terminal message to the beaconed root: demote any spurious
+  // root claim I hold (and re-home under the true root so my subtree keeps
+  // receiving), then forward the payload via-pinned to it.
+  _deferToRoot(topicBig, type, payload, rootHex) {
+    const spurious = this.axonRoles.get(topicBig);
+    if (spurious && spurious.isRoot) {
+      spurious.isRoot = false;
+      this._upstream.set(topicBig, [rootHex]);
+      this._sendSubscribe(topicBig);                 // root must ADOPT us or our subtree starves
+    }
+    this._send(type, { ...payload, via: [rootHex] });
   }
 
   // ── SUBSCRIBE ────────────────────────────────────────────────────────
@@ -403,6 +447,17 @@ export class AxonaManager {
     if (d === 'reroute') { this._reroute(T.SUB, payload); return 'consumed'; }
 
     const topicBig = idBig(payload.topicId);
+    // Root-beacon last-mile correction (SUB). A stranded subscribe must not
+    // (re)root a near-miss node while a strictly-closer live NEIGHBOUR root is
+    // beaconing — defer the seat to that root. Without this only PUB carried the
+    // correction, and every stranded/renewing SUB re-rooted the just-demoted
+    // relay → the ~20s root flap between same-region relays (split trees, 0%
+    // fresh-subscriber delivery on prod). A node that already relays the topic
+    // (non-root role with a live upstream) still seats subscribers below.
+    if (!this.axonRoles.has(topicBig)) {
+      const closer = this._liveCloserRoot(topicBig);
+      if (closer) { this._deferToRoot(topicBig, T.SUB, payload, closer); return 'consumed'; }
+    }
     let role = this.axonRoles.get(topicBig) || this._becomeRoot(topicBig);
     this._maybePromoteRoot(role, payload, meta);
 
@@ -557,14 +612,8 @@ export class AxonaManager {
     // a node that wrongly became root also emits poisoning "root=me" beacons, so a
     // peer can arrive here via-pinned to me — the correction must still re-home it.
     {
-      const b = this._rootBeacons.get(topicBig);
-      const meHex = lc(idHex(this.nodeId));
-      if (b && this._now() < b.exp && b.root !== meHex && (idBig(b.root) ^ topicBig) < (this.nodeId ^ topicBig)) {
-        const spurious = this.axonRoles.get(topicBig);
-        if (spurious && spurious.isRoot) spurious.isRoot = false;       // demote: a closer root exists
-        this._send(T.PUB, { topicId: payload.topicId, via: [b.root], json: payload.json });
-        return 'consumed';
-      }
+      const closer = this._liveCloserRoot(topicBig, { requireReachable: false });
+      if (closer) { this._deferToRoot(topicBig, T.PUB, payload, closer); return 'consumed'; }
     }
     let role = this.axonRoles.get(topicBig) || this._becomeRoot(topicBig);
     this._maybePromoteRoot(role, payload, meta);
@@ -685,6 +734,16 @@ export class AxonaManager {
     this._applyDels(role, topicBig, payload.dels);   // inherit the heir's tombstones, not just its bodies
     for (const m of (Array.isArray(payload.msgs) ? payload.msgs : [])) {
       if (m && typeof m.json === 'string' && Number.isFinite(m.publishTs)) await this._ingestStamped(role, m);
+    }
+    // The handoff made us root so the history is safe — but if a strictly-closer
+    // live root is beaconing (the leaver picked us while a better heir exists),
+    // don't hold a competing claim: demote to a subscribing child and push the
+    // inherited history up (the SUB carries our hw → the root PULLUPs it).
+    const closer = this._liveCloserRoot(topicBig);
+    if (closer && role.isRoot) {
+      role.isRoot = false;
+      this._upstream.set(topicBig, [closer]);
+      this._sendSubscribe(topicBig);
     }
     return 'consumed';
   }
@@ -1084,6 +1143,33 @@ export class AxonaManager {
     this._log('info', 'root-formed', { topic: idHex(topicBig).slice(0, 12) });
     this._announceRoot(topicBig);
     return role;
+  }
+
+  // ── introspection (consumed by AxonaPeer.health()) ───────────────────
+  // These were dropped in the v3.12 clean break, which left health().axonRoles
+  // permanently empty — every relay reported roles=0 while actually rooting
+  // topics, which masked the prod root-split for a full diagnosis cycle.
+  // Observability surfaces must fail loudly or exist; these exist again.
+  inspectRoles() {
+    const out = [];
+    for (const r of this.axonRoles.values()) {
+      out.push({
+        topicId: idHex(r.topicId),
+        isRoot: !!r.isRoot,
+        children: [...r.children],
+        subscribers: r.subscribers.size,
+        replayCacheSize: r.cache.length,
+      });
+    }
+    return out;
+  }
+
+  inspectHosting() {
+    return {
+      topics: [...this._hostedTopics].map((t) => idHex(t)),
+      subscriptions: this.mySubscriptions.size,
+      backups: this._backupTopics.size,
+    };
   }
 
   // Emit a root beacon IMMEDIATELY on becoming root, so a brand-new topic's
@@ -1530,6 +1616,12 @@ export class AxonaManager {
     if (d === 'reroute') { this._reroute(T.METRICSON, payload); return 'consumed'; }
     if (d === 'reject') return 'consumed';   // out-of-region terminus: no in-region root to arm a metrics lease on
     if (d === 'handle') {
+      // Root-beacon last-mile correction (METRICSON): a metrics lease must arm
+      // the TRUE root, not mint a competing one at a near-miss node.
+      if (!this.axonRoles.has(topicBig)) {
+        const closer = this._liveCloserRoot(topicBig);
+        if (closer) { this._deferToRoot(topicBig, T.METRICSON, payload, closer); return 'consumed'; }
+      }
       const role = this.axonRoles.get(topicBig) || this._becomeRoot(topicBig);
       this._maybePromoteRoot(role, payload, meta);
       role.metricsOn = now + METRICS_LEASE_MS;                 // arm/renew the publish lease
@@ -1678,6 +1770,13 @@ export class AxonaManager {
     if (d === 'reject') return 'consumed';   // out-of-region terminus: topic's region has no node → don't root/seat/store here
     if (d === 'reroute') { this._reroute(T.KILL, payload); return 'consumed'; }
     const topicBig = idBig(payload.topicId);
+    // Root-beacon last-mile correction (KILL) — same one-shot semantics as PUB:
+    // a kill landing on a near-miss node must reach the true root, not mint a
+    // competing root that the rest of the tree never consults.
+    if (!this.axonRoles.has(topicBig)) {
+      const closer = this._liveCloserRoot(topicBig, { requireReachable: false });
+      if (closer) { this._deferToRoot(topicBig, T.KILL, payload, closer); return 'consumed'; }
+    }
     const role = this.axonRoles.get(topicBig) || this._becomeRoot(topicBig);
     const kill = payload.kill;
     const target = kill?.msgId;
