@@ -162,6 +162,21 @@ const BEACON_FANOUT   = 6;               // K closest neighbors per layer (fan-o
 const BEACON_LAYERS   = 2;               // recursive forward depth
 const BEACON_SEEN_MS  = 60_000;          // flood-dedup retention
 
+// Root self-verification (v4.19.1). Beacon-gated reconciliation is reach-limited:
+// a spurious root minted by a stranded SUB on a FRESH topic (no beacon anywhere
+// yet) can sit outside the true root's beacon basin (fanout^layers) and never
+// hear the demotion — its via-pinned subscribers are then permanently orphaned
+// (observed on prod: binary 0-of-N subscribers inside an otherwise-perfect
+// tree). So every root verifies its own claim with the SAME iterative
+// closest-node lookup subscribers use: once shortly after forming (the
+// fresh-topic race window), then periodically. Finding a strictly-closer live
+// node ⇒ seed a VERIFIED root pointer + demote + re-home + push cache up.
+// Batched per tick so a many-rooted relay doesn't storm lookups; each lookup is
+// fired non-blocking (NEVER awaited in the tick — the 4.18.1 lesson).
+const ROOT_VERIFY_FIRST_MS = 6_000;      // first verify after root-formed
+const ROOT_VERIFY_MS       = 45_000;     // steady-state re-verify cadence
+const ROOT_VERIFY_BATCH    = 3;          // max verify lookups launched per tick
+
 // ── Wire message types (all ROUTED) ─────────────────────────────────────
 const T = {
   SUB:      'pubsub:sub',       // subscribe — routed toward topic id (or a via waypoint)
@@ -389,6 +404,7 @@ export class AxonaManager {
     if (viaEmpty && meta.isTerminal && !role.isRoot) {
       if (this._liveCloserRoot(role.topicId)) return;   // a closer live root is beaconing — don't contest it
       role.isRoot = true; this._upstream.delete(role.topicId); this._announceRoot(role.topicId);
+      role.formedAt = this._now(); role.lastVerify = 0;  // promoted claims get an early self-verify too
       // Inherit an active metrics lease: if a METRICSON passed through this node on
       // its way to the (now-departed) old root, the new root resumes publishing.
       const w = this._metricsWanted.get(role.topicId) || 0;
@@ -415,6 +431,7 @@ export class AxonaManager {
     if (b.root === lc(idHex(this.nodeId))) return null;
     let rb; try { rb = idBig(b.root); } catch { return null; }
     if ((rb ^ topicBig) >= (this.nodeId ^ topicBig)) return null;   // never defer to a farther node
+    if (b.verified) return b.root;    // root self-verification found it via iterative lookup — network-confirmed
     if (this._isReachableId(b.root)) return b.root;                 // channel-verified live neighbour
     // Loose branch (PUB/KILL): a live root re-beacons every BEACON_MS, so a
     // beacon heard very recently is strong liveness evidence even for a
@@ -1139,10 +1156,54 @@ export class AxonaManager {
 
   _becomeRoot(topicBig) {
     const role = makeRole(topicBig, true);
+    role.formedAt = this._now(); role.lastVerify = 0;
     this.axonRoles.set(topicBig, role);
     this._log('info', 'root-formed', { topic: idHex(topicBig).slice(0, 12) });
     this._announceRoot(topicBig);
     return role;
+  }
+
+  // Root self-verification (see the ROOT_VERIFY_* constants). Launch up to
+  // BATCH iterative lookups per tick, NON-BLOCKING, for roots due a check. A
+  // strictly-closer live node ⇒ this claim is spurious (or was overtaken):
+  // seed a VERIFIED root pointer (honored by the promotion gates even where no
+  // beacon reaches), demote to a subscribing child, and re-home — the SUB
+  // carries our cache high-water so the true root PULLUPs anything only we
+  // hold, and our seated subscribers keep receiving through us as a relay.
+  _verifyRoots(now) {
+    if (typeof this.dht.lookup !== 'function') return;
+    if (!this._verifyInflight) this._verifyInflight = new Set();
+    let launched = 0;
+    for (const [t, role] of this.axonRoles) {
+      if (launched >= ROOT_VERIFY_BATCH) break;
+      if (!role.isRoot || this._verifyInflight.has(t)) continue;
+      const due = role.lastVerify
+        ? (now - role.lastVerify >= ROOT_VERIFY_MS)
+        : (now - (role.formedAt || 0) >= ROOT_VERIFY_FIRST_MS);
+      if (!due) continue;
+      role.lastVerify = now; launched++;
+      this._verifyInflight.add(t);
+      Promise.resolve()
+        .then(() => this.dht.lookup(t))
+        .then((r) => {
+          this._verifyInflight.delete(t);
+          const id = (r && Array.isArray(r.path) && r.path.length) ? r.path[r.path.length - 1] : null;
+          if (id == null) return;
+          let cBig; try { cBig = idBig(id); } catch { return; }
+          if (cBig === this.nodeId) return;                       // confirmed: I am the terminus
+          if ((cBig ^ t) >= (this.nodeId ^ t)) return;            // not strictly closer → keep the claim
+          if (_regionLockEnforced && extractS2Prefix(cBig) !== extractS2Prefix(t)) return;
+          const live = this.axonRoles.get(t);
+          if (!live || !live.isRoot) return;                      // already demoted meanwhile
+          const hex = lc(idHex(cBig));
+          this._rootBeacons.set(t, { root: hex, at: this._now(), exp: this._now() + 2 * ROOT_VERIFY_MS, verified: true });
+          live.isRoot = false;
+          this._upstream.set(t, [hex]);
+          this._sendSubscribe(t);
+          this._log('info', 'root-verify-demote', { topic: idHex(t).slice(0, 12), to: hex.slice(0, 10) });
+        })
+        .catch(() => this._verifyInflight.delete(t));
+    }
   }
 
   // ── introspection (consumed by AxonaPeer.health()) ───────────────────
@@ -2047,6 +2108,7 @@ export class AxonaManager {
     //    neighbors (last-mile convergence aid). Throttled to BEACON_MS; expire the
     //    inbound pointer + flood-dedup caches by their TTLs.
     if (now - this._lastBeaconAt >= BEACON_MS) { this._lastBeaconAt = now; this._emitRootBeacons(); }
+    this._verifyRoots(now);   // root self-verification (non-blocking lookups; batched)
     for (const [t, b] of this._rootBeacons) if (b.exp <= now) this._rootBeacons.delete(t);
     for (const [id, exp] of this._beaconSeen) if (exp <= now) this._beaconSeen.delete(id);
   }
