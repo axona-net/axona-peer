@@ -474,6 +474,18 @@ export class AxonaManager {
     if (!this.axonRoles.has(topicBig)) {
       const closer = this._liveCloserRoot(topicBig);
       if (closer) { this._deferToRoot(topicBig, T.SUB, payload, closer); return 'consumed'; }
+      // Alone-in-the-dark guard (v4.19.2). A freshly-joined node subscribes
+      // before its mesh has formed: with zero non-bridge neighbours its SUB
+      // never leaves the node, terminates at self, and (no beacons heard yet)
+      // it minted itself "root" — observed live as EVERY joining subscriber
+      // creating a transient root for the topic, splitting the tree until
+      // reconciliation caught up (which under churn load it often didn't
+      // inside the delivery window). A node that can't reach anyone has no
+      // business electing itself: hold the seat; mySubscriptions is already
+      // set, so the renewFastMs renewal re-runs the election once meshed.
+      // Publish-side is deliberately NOT gated — a genuinely solo node still
+      // roots on its own publish and serves its local subscriber.
+      if (idBig(lc(payload.subscriberId)) === this.nodeId && this._meshBare()) return 'consumed';
     }
     let role = this.axonRoles.get(topicBig) || this._becomeRoot(topicBig);
     this._maybePromoteRoot(role, payload, meta);
@@ -1482,6 +1494,21 @@ export class AxonaManager {
       if (nb === want) return true;
     }
     return false;
+  }
+
+  // True iff this node has NO non-bridge neighbours — it can't route to anyone,
+  // so any "terminal at self" verdict is an artifact of isolation, not of
+  // closeness. Used by the alone-in-the-dark guard in _onSub. When the
+  // transport doesn't expose neighbours, assume meshed (never block).
+  _meshBare() {
+    if (typeof this.dht.neighbors !== 'function') return false;
+    let bridge = null;
+    try { const b = (typeof this.dht.bridgeId === 'function') ? this.dht.bridgeId() : null; bridge = (b != null) ? idBig(b) : null; } catch { /* */ }
+    for (const n of (this.dht.neighbors() || [])) {
+      let nb; try { nb = idBig(n); } catch { continue; }
+      if (bridge === null || nb !== bridge) return false;   // any routable non-bridge neighbour → meshed
+    }
+    return true;
   }
 
   _selfClosestReachable(tBig) {
