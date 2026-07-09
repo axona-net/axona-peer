@@ -204,7 +204,41 @@ export function webTransport({
 
   function openSocket() {
     if (socket) return;
-    socket = new WSImpl(bridgeUrl);
+    try {
+      socket = new WSImpl(bridgeUrl);
+    } catch (err) {
+      // Synchronous construction failure (bad state, resource exhaustion):
+      // treat like a failed attempt and keep the backoff chain alive.
+      socket = null;
+      log('bridge-socket-create-failed', { err: String(err?.message || err).slice(0, 120) });
+      setBridgeState('disconnected');
+      scheduleReconnect();
+      return;
+    }
+    const sock = socket;
+    // A failed HTTP upgrade — e.g. a proxy answering 502 while the bridge
+    // container is still booting — surfaces as an 'error' EVENT, not a close.
+    // In Node's `ws` an unlistened 'error' THROWS out of the emitter; that
+    // escaped here as an uncaughtException, aborted before 'close' could fire,
+    // and left `socket` non-null — so scheduleReconnect never ran and every
+    // prod relay wedged in state=connecting after a bridge-only restart
+    // (2026-07-09). Listening is the fix: ws then proceeds to its normal
+    // 'close', which drives the backoff chain. The delayed fallback below
+    // covers any implementation that fires 'error' without a 'close' for a
+    // never-opened socket (guards make it a no-op when close did arrive).
+    socket.addEventListener('error', (ev) => {
+      const msg = ev?.message || ev?.error?.message || 'socket error';
+      log('bridge-socket-error', { err: String(msg).slice(0, 120) });
+      if (!socketOpen) {
+        setTimeout(() => {
+          if (socket === sock && !socketOpen && !stopped) {
+            socket = null;
+            setBridgeState('disconnected');
+            scheduleReconnect();
+          }
+        }, 1000);
+      }
+    });
     socket.addEventListener('open', () => {
       socketOpen = true;
       log('bridge-socket-open', { bridgeUrl });
