@@ -230,13 +230,14 @@ export function webTransport({
       const msg = ev?.message || ev?.error?.message || 'socket error';
       log('bridge-socket-error', { err: String(msg).slice(0, 120) });
       if (!socketOpen) {
-        setTimeout(() => {
+        const fb = setTimeout(() => {
           if (socket === sock && !socketOpen && !stopped) {
             socket = null;
             setBridgeState('disconnected');
             scheduleReconnect();
           }
         }, 1000);
+        if (typeof fb?.unref === 'function') fb.unref();   // never hold the process open
       }
     });
     socket.addEventListener('open', () => {

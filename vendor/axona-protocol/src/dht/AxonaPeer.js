@@ -759,6 +759,15 @@ export class AxonaPeer extends DHT {
       clearInterval(this._maintainTimer);
       this._maintainTimer = null;
     }
+    // Retire the pub/sub machinery on the abrupt path too — a stopped peer
+    // must not keep ticking, retrying pendings, or verifying roots (see the
+    // matching teardown in leave() step 2c for the field incident).
+    if (this._axonaManager) {
+      try { this._axonaManager.stop?.(); } catch { /* */ }
+      try { this._axonaManager._pendingPub?.clear?.(); } catch { /* */ }
+      try { this._axonaManager._pendingKill?.clear?.(); } catch { /* */ }
+      try { this._axonaManager._verifyInflight?.clear?.(); } catch { /* */ }
+    }
     this._started = false;
   }
 
@@ -1017,8 +1026,33 @@ export class AxonaPeer extends DHT {
   async leave({ drain = true, notify = true, timeoutMs = 5000 } = {}) {
     if (!this._started) return;
     const selfId = this._nodeIdHex();
+    // NOTE: deliberately REF'd (no unref). These sleeps are actively-awaited
+    // steps of leave() itself — if they were unref'd and leave() is the
+    // process's last activity, the event loop empties and Node exits MID-LEAVE
+    // (caught by smoke_leave_teardown). They're bounded, so they can't hold
+    // the process past their own resolution.
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    const am = this._axonaManager;
 
-    // (1) notify peers (fire-and-forget, bounded by drain window).
+    // (1) drain FIRST, while the transport is still fully alive: wait for
+    // in-flight publishes/kills to CONFIRM (the pendingPub implicit-ack
+    // machinery), bounded by timeoutMs. Replaces the old fixed pause — which
+    // was capped at 50ms (`Math.min(timeoutMs, 50)`), silently defeating the
+    // caller's timeout — and drains on EVIDENCE, not time: the moment the
+    // retry maps are empty we move on, so a confirmed publish leaves at once
+    // and an unconfirmed one gets the full window it asked for. Field report
+    // (alert-bot, 2026-07-10): publish→leave with unconfirmed pendings
+    // previously required long app-side sleeps to behave.
+    if (drain && timeoutMs > 0 && am) {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline
+             && ((am._pendingPub?.size ?? 0) > 0 || (am._pendingKill?.size ?? 0) > 0)) {
+        await sleep(100);
+      }
+    }
+
+    // (2) notify peers — parallel and time-bounded (the old serial await
+    // chain paid one WAN round-trip per peer and delayed the departure).
     // Resolve the transport the same way the routing path does: prefer
     // the constructor-supplied transport, else node.transport.  Hosts
     // like the bridge wire their transport onto node.transport (not the
@@ -1028,31 +1062,47 @@ export class AxonaPeer extends DHT {
     const announceVia = this._transport ?? this._node?.transport;
     if (notify && announceVia && typeof announceVia.notify === 'function') {
       // peers() returns hex (display); convert to BigInt for the
-      // transport contract.  The wire `from` field stays hex.
+      // transport contract.  The wire `from` field stays hex.  Use the
+      // transport's notify directly (not peer.notify) so we don't tunnel
+      // through 'axona:direct'; this is a transport-level signal.
       const peers = this.peers();
-      for (const peerHex of peers) {
-        // Use the transport's notify directly (not peer.notify) so we
-        // don't tunnel through 'axona:direct'; this is a transport-
-        // level signal, not an application message.
-        try {
-          await announceVia.notify(fromHex(peerHex), 'peer-leaving', { from: selfId });
-        } catch { /* swallow — best-effort */ }
-      }
+      await Promise.race([
+        Promise.allSettled(peers.map((peerHex) =>
+          Promise.resolve()
+            .then(() => announceVia.notify(fromHex(peerHex), 'peer-leaving', { from: selfId }))
+            .catch(() => { /* best-effort */ }))),
+        sleep(Math.min(timeoutMs, 2000)),
+      ]);
     }
 
-    // (1b) graceful-leave cache handoff: push any topic we ROOT to its heir
+    // (2b) graceful-leave cache handoff: push any topic we ROOT to its heir
     // (next-closest live node) while the transport is still up, so the topic's
     // history survives our departure (since:'all' replay keeps working for
-    // subscribers that re-home or join after we go). Best-effort; bounded by the
-    // drain window below. Must run BEFORE we tear down the transport/listeners.
-    try { await this._axonaManager?.pubsubLeaveHandoff?.(); } catch { /* best-effort */ }
+    // subscribers that re-home or join after we go). Best-effort and now
+    // genuinely TIME-BOUNDED: the handoff awaits a network lookup per rooted
+    // topic, so on a slow or dying mesh it could previously hold leave() open
+    // indefinitely (the old comment claimed "bounded by the drain window" but
+    // nothing raced it). Must run BEFORE we tear down transport/listeners.
+    try {
+      await Promise.race([
+        this._axonaManager?.pubsubLeaveHandoff?.(),
+        sleep(Math.min(timeoutMs, 3000)),
+      ]);
+    } catch { /* best-effort */ }
 
-    // (2) optional drain — pause for in-flight publishes / pulls
-    if (drain && timeoutMs > 0) {
-      // Without a per-publish ack stream we can only bound by time.
-      // Apps that want stronger guarantees should await their own
-      // pub() promises before calling leave().
-      await new Promise(r => setTimeout(r, Math.min(timeoutMs, 50)));
+    // (2c) retire the pub/sub machinery — tick, retries, verifies, beacons.
+    // A departed peer must go SILENT. Previously nothing ever called
+    // am.stop(): the refreshTick interval kept firing after leave(),
+    // re-sending every unconfirmed publish and re-running iterative lookups
+    // against a dead or dying transport until the pending TTLs burned off
+    // (~30-40s) — observed in the field as a 100%-CPU tail after leave() on a
+    // WAN mesh, reproduced locally as pendingPub retries surviving leave.
+    // Stop the machinery, then clear the retry state so nothing re-arms it.
+    if (am) {
+      try { am.stop?.(); } catch { /* */ }
+      try { am._pendingPub?.clear?.(); } catch { /* */ }
+      try { am._pendingKill?.clear?.(); } catch { /* */ }
+      try { am._verifyInflight?.clear?.(); } catch { /* */ }
     }
 
     // (3) force-flush persistence (P4)
