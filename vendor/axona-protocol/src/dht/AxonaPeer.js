@@ -387,6 +387,7 @@ export class AxonaPeer extends DHT {
           node.connections?.delete(dead);
           (node._deadPeers ??= new Set()).add(dead);
           this._axonaManager?.invalidateKClosestCache?.();
+          this._axonaManager?.pubsubPeerDied?.(toHex(dead));   // purge ghost root beacons
           this._emitLog?.('info', 'peer-died-evicted', { peer: toHex(dead) });
           this._scheduleMaintain();   // a lost peer may have been a near-quota successor → refill
 
@@ -1084,9 +1085,14 @@ export class AxonaPeer extends DHT {
     // indefinitely (the old comment claimed "bounded by the drain window" but
     // nothing raced it). Must run BEFORE we tear down transport/listeners.
     try {
+      // Full timeoutMs, not a smaller slice: the handoff is the LAST copy of
+      // every topic this node roots (field case: a burst publisher left
+      // holding 25 roots — topics past a tighter cutoff died with it). The
+      // handoff itself is parallelized (bounded concurrency), so the bound is
+      // a safety net, not the expected path.
       await Promise.race([
         this._axonaManager?.pubsubLeaveHandoff?.(),
-        sleep(Math.min(timeoutMs, 3000)),
+        sleep(timeoutMs),
       ]);
     } catch { /* best-effort */ }
 

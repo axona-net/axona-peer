@@ -740,6 +740,13 @@ export class AxonaManager {
     if (role.cacheIds.has(m.msgId)) return;                              // already have it
     if (this._tombstoned(role, m.msgId, m.json)) return;                 // killed → don't resurrect via replay-up
     this._cachePush(role, { msgId: m.msgId, publishTs: m.publishTs, json: m.json, seq: m.seq });
+    // Seeing our own msgId arrive via ANY stamped path (cohort replicate,
+    // replay-up, handoff) is proof it landed on a durable holder — confirm the
+    // pending so the retry machinery (and leave()'s evidence-based drain)
+    // doesn't keep waiting on a publish that already made it. A true ack is
+    // impossible by design (a PUB carries no return address — publisher
+    // location privacy), so echoes are the only confirmation signal.
+    this._confirmPending(role.topicId, m.msgId);
     if (m.publishTs > role.lastTs) role.lastTs = m.publishTs;            // continue stamping above recovered history
     if (Number.isFinite(m.seq) && m.seq > role.seq) role.seq = m.seq;   // recover dense counter → a new root continues it
     this._fanout(role, { json: m.json, publishTs: m.publishTs, msgId: m.msgId, seq: m.seq }, null);
@@ -764,12 +771,22 @@ export class AxonaManager {
     for (const m of (Array.isArray(payload.msgs) ? payload.msgs : [])) {
       if (m && typeof m.json === 'string' && Number.isFinite(m.publishTs)) await this._ingestStamped(role, m);
     }
+    // The sender is DEPARTING: its root beacon for this topic is a ghost the
+    // moment the handoff arrives. Purge it, or the defer gates (here and on
+    // every later stranded SUB) would keep pointing the topic at a corpse —
+    // observed as heirs adopting the history and immediately demoting back
+    // toward the leaver, undoing the handoff entirely.
+    const leaver = typeof payload.from === 'string' ? lc(payload.from) : null;
+    if (leaver && this._rootBeacons.get(topicBig)?.root === leaver) {
+      this._rootBeacons.delete(topicBig);
+    }
     // The handoff made us root so the history is safe — but if a strictly-closer
     // live root is beaconing (the leaver picked us while a better heir exists),
     // don't hold a competing claim: demote to a subscribing child and push the
     // inherited history up (the SUB carries our hw → the root PULLUPs it).
+    // Never defer back to the leaver itself.
     const closer = this._liveCloserRoot(topicBig);
-    if (closer && role.isRoot) {
+    if (closer && closer !== leaver && role.isRoot) {
       role.isRoot = false;
       this._upstream.set(topicBig, [closer]);
       this._sendSubscribe(topicBig);
@@ -782,21 +799,52 @@ export class AxonaManager {
   // live node) so the history isn't lost when we go. Best-effort; never throws.
   async pubsubLeaveHandoff() {
     if (typeof this.dht.findKClosest !== 'function') return;
+    // PARALLEL with bounded concurrency. This used to be one topic at a time —
+    // one iterative network lookup each — so a burst publisher that had rooted
+    // a few dozen fresh topics (field case: an alert bot left holding 25 roots)
+    // could not finish inside leave()'s time bound, and every topic past the
+    // cutoff died with the departing node (its subscribers replayed nothing).
+    // Eight lookups in flight turns 25 sequential round-trips into ~3 rounds.
+    const jobs = [];
     for (const [t, role] of this.axonRoles) {
       if (!role.isRoot || !role.cache.length) continue;
-      let heir = null;
-      try {
-        const arr = await this.dht.findKClosest(t, 3);
-        for (const id of (Array.isArray(arr) ? arr : [])) {
-          const b = idBig(id);
-          if (b !== this.nodeId) { heir = b; break; }   // closest node that isn't us
-        }
-      } catch { /* no heir resolvable → nothing we can do */ }
-      if (heir === null) continue;
-      const msgs = role.cache.map(c => ({ json: c.json, publishTs: c.publishTs, msgId: c.msgId, seq: c.seq }));
-      const dels = this._activeDels(role);
-      try { this._route(heir, T.HANDOFF, { topicId: idHex(t), msgs, dels }); } catch { /* best-effort */ }
+      jobs.push([t, role]);
     }
+    let i = 0;
+    const worker = async () => {
+      while (i < jobs.length) {
+        const [t, role] = jobs[i++];
+        let heir = null;
+        try {
+          const arr = await this.dht.findKClosest(t, 3);
+          for (const id of (Array.isArray(arr) ? arr : [])) {
+            const b = idBig(id);
+            if (b !== this.nodeId) { heir = b; break; }   // closest node that isn't us
+          }
+        } catch { /* fall through to the iterative probe */ }
+        // findKClosest is LOCAL-only; a leaver with a thin table (fresh burst
+        // publisher) can see nobody but itself even though the network is
+        // populated. Mirror _rootHint_'s self-closest escape: probe with the
+        // ITERATIVE lookup before giving up on the topic's history.
+        if (heir === null && typeof this.dht.lookup === 'function') {
+          try {
+            const r = await this.dht.lookup(t);
+            const id = (r && Array.isArray(r.path) && r.path.length) ? r.path[r.path.length - 1] : null;
+            if (id != null) { const b = idBig(id); if (b !== this.nodeId) heir = b; }
+          } catch { /* no heir resolvable → nothing we can do */ }
+        }
+        if (heir === null) continue;
+        const msgs = role.cache.map(c => ({ json: c.json, publishTs: c.publishTs, msgId: c.msgId, seq: c.seq }));
+        const dels = this._activeDels(role);
+        // `from` names the DEPARTING root so the heir can (a) purge our stale
+        // root beacon and (b) never defer its new claim back to us — without
+        // it, the heir adopted the history and then immediately demoted toward
+        // our still-fresh beacon, undoing the handoff (reproduced: a fresh
+        // subscriber replayed 0 after a burst publisher left).
+        try { this._route(heir, T.HANDOFF, { topicId: idHex(t), msgs, dels, from: idHex(this.nodeId) }); } catch { /* best-effort */ }
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(8, jobs.length) }, worker));
   }
 
   // ── singleton-root replication (warm backup roots) ───────────────────
@@ -1145,6 +1193,18 @@ export class AxonaManager {
     if (!msgId) return;                                // pending maps are keyed by msgId (globally unique)
     this._pendingPub?.delete(msgId);
     this._pendingKill?.delete(msgId);
+  }
+
+  // A peer died (channel closed / evicted): every root beacon naming it is now
+  // a ghost. Purge them so the defer gates (SUB/PUB/promotion) stop steering
+  // topics at a corpse — otherwise, until the 50s TTL, stranded traffic keeps
+  // deferring to a node that can never serve, and promotions stay suppressed.
+  pubsubPeerDied(deadHex) {
+    if (typeof deadHex !== 'string') return;
+    const dead = lc(deadHex);
+    for (const [t, b] of this._rootBeacons) {
+      if (b?.root === dead) this._rootBeacons.delete(t);
+    }
   }
 
   // A target message arriving (publish / replay / fan-out) for which we hold a
