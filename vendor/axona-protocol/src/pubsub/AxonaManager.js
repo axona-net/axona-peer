@@ -1855,8 +1855,6 @@ export class AxonaManager {
       this._send(T.PULL, { topicId: idHex(topicId), via: hint ? [hint] : [], corrId, postHash: postHash || null, requesterId: idHex(this.nodeId) });
     });
   }
-  requestMetrics() { return Promise.resolve({ accumulated: [] }); }   // TODO(Phase 4)
-
   // Enumerate the topics THIS node currently roots, each with a locally-computed
   // metric snapshot. The producer side of the derived-metric-topic convention: an
   // infrastructure root walks this on a timer and republishes each to metricTopic(T).
@@ -1890,7 +1888,6 @@ export class AxonaManager {
 
   onPubsubDelivery(cb) { this._deliveryCallback = cb; }
   setLogSink(fn) { this._logSink = (typeof fn === 'function') ? fn : null; }
-  invalidateKClosestCache() { /* no K-closest cache in the routed model — no-op */ }
 
   resetState() {
     this.axonRoles.clear();
@@ -2075,18 +2072,6 @@ export class AxonaManager {
       // root it held history → the root never issued PULLUP and the cache stayed
       // stranded below an empty root (lost on the original root's departure).
       this._sendSubscribe(t);
-    }
-    // 1b. Cache-bearing-root re-announce (history-recovery durability) — A/B GATED OFF.
-    // Generalising the hosted re-announce to ANY cache-bearing root measured BELOW
-    // the deploy gate (Howard 25/30, regressing the kill/since:'all' recovery —
-    // hypothesis: multiple cache-bearing roots dueling per tick). Disabled pending a
-    // controlled A/B + a safer design (transient-non-host roots only, or rate-limited).
-    if (this._reannounceCacheRoots) {
-      for (const [t, role] of this.axonRoles) {
-        if (!role.isRoot || role.cache.length === 0) continue;     // only roots holding history
-        if (this._hostedTopics.has(t) || this.mySubscriptions.has(t)) continue;  // already re-announced above
-        this._sendSubscribe(t);
-      }
     }
     // 1b-rep. Singleton-root replication (warm backup roots) — push each root's full
     //         cache to its ROOT_REPLICAS nearest neighbours so a successor is always

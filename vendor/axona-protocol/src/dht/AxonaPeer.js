@@ -350,15 +350,6 @@ export class AxonaPeer extends DHT {
             console.warn('AxonaPeer.onPeerBound: admission failed', err);
           }
         }
-        // The synaptome just changed — drop any cached K-closest set so
-        // the next pub/sub recomputes the topic's axon set against the
-        // newly-wider mesh.  Without this the relay set a peer chose
-        // while the mesh was sparse stays frozen, and publishes from
-        // peers that joined later route to axons this peer never
-        // registered at (the cross-app delivery asymmetry).  refreshTick
-        // also flushes on its 10 s cadence; this makes convergence
-        // immediate on each new binding.
-        this._axonaManager?.invalidateKClosestCache?.();
       });
     }
 
@@ -386,7 +377,6 @@ export class AxonaPeer extends DHT {
           node.incomingSynapses?.delete(dead);
           node.connections?.delete(dead);
           (node._deadPeers ??= new Set()).add(dead);
-          this._axonaManager?.invalidateKClosestCache?.();
           this._axonaManager?.pubsubPeerDied?.(toHex(dead));   // purge ghost root beacons
           this._emitLog?.('info', 'peer-died-evicted', { peer: toHex(dead) });
           this._scheduleMaintain();   // a lost peer may have been a near-quota successor → refill
@@ -569,7 +559,6 @@ export class AxonaPeer extends DHT {
         try { node.transport?.closeConnection?.(leaving); } catch { /* dying channel */ }
         this._emitLog?.('info', 'peer-leaving', { from: toHex(leaving) });
         // Re-anchor now rather than waiting for the 10 s refreshTick.
-        this._axonaManager?.invalidateKClosestCache?.();
         Promise.resolve(this._axonaManager?.refreshTick?.()).catch(() => {});
       } catch { /* best-effort resilience path */ }
     });
@@ -940,9 +929,6 @@ export class AxonaPeer extends DHT {
       );
       for (const r of settled) if (r.status === 'fulfilled' && r.value !== false) opened++;
     }
-    // Our synaptome just widened (via the bind flow on each open) — drop any
-    // stale K-closest cache so the next pub/sub recomputes against it.
-    this._axonaManager?.invalidateKClosestCache?.();
     return opened;
   }
 
@@ -989,7 +975,6 @@ export class AxonaPeer extends DHT {
         try { await this._considerCandidate(id, 'maintain'); } catch { /* verified-connect is best-effort */ }
       }
       if (attempted) {
-        this._axonaManager?.invalidateKClosestCache?.();
         this._emitLog?.('info', 'synaptome-refill', { near: cfg.kNear, attempted });
       }
       return attempted;
@@ -2850,18 +2835,8 @@ export class AxonaPeer extends DHT {
       return 'consumed';
     });
 
-    // Wire `pickRelayPeer` so sub-axon recruitment uses BATCH ADOPTION
-    // (pick a relay XOR-closest to the new subscriber from the whole
-    // synaptome, hand off a batch) instead of the fallback that promotes
-    // an existing child one subscriber at a time.  Without it the axon
-    // tree degenerates into a deep near-linear chain as a topic grows
-    // (measured in dht-sim: depth ~21 at 600 subscribers vs ~4 with batch
-    // adoption) — a latency/fragility scaling problem.  `shouldRecruitSubAxon`
-    // keeps its default (recruit past `maxDirectSubs`).
     const am = new AxonaManager({
       dht,
-      pickRelayPeer: (role, subscriberId, forwarderId) =>
-        this._pickRelayPeer(role, subscriberId, forwarderId),
       ...(this._rootReplicas != null ? { rootReplicas: this._rootReplicas } : {}),
     });
     // ARM the periodic refreshTick (kernel v4.9.1). Earlier this was deliberately
@@ -3933,41 +3908,6 @@ export class AxonaPeer extends DHT {
       if (bestDist === null || d < bestDist) { bestDist = d; best = childId; }
     }
     return best;
-  }
-
-  /**
-   * Pick an external synaptome peer (not yet a child) to become a new
-   * sub-axon — XOR-closest to the new subscriber's id.  All IDs BigInt.
-   */
-  _pickRelayPeer(role, subscriberId, forwarderId) {
-    const node = this._node;
-    if (!node?.alive) return null;
-    const selfBig = (typeof node.id === 'bigint') ? node.id : fromHex(node.id);
-    const dead    = node._deadPeers || new Set();
-    const bridgeId = node.transport?.bridgeNodeIdBig ?? null;   // never recruit the bridge as a relay axon
-
-    const considered = new Map();
-    for (const syn of node.synaptome.values()) {
-      const peerId = syn.peerId;
-      if (dead.has(peerId)) continue;
-      if (peerId === selfBig)       continue;
-      if (bridgeId !== null && peerId === bridgeId) continue;   // signaling infra, not a relay/root → would black-hole the subtree
-      if (peerId === forwarderId)   continue;
-      if (peerId === subscriberId)  continue;
-      if (role.children.has(peerId)) continue;
-      if (considered.has(peerId))    continue;
-      considered.set(peerId, { peerId, distToSub: peerId ^ subscriberId });
-    }
-    if (considered.size === 0) return null;
-
-    let bestId = null, bestDist = null;
-    for (const [id, rec] of considered) {
-      if (bestDist === null || rec.distToSub < bestDist) {
-        bestDist = rec.distToSub;
-        bestId   = id;
-      }
-    }
-    return bestId;
   }
 
   /**
