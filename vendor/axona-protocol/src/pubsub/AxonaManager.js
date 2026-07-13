@@ -49,6 +49,7 @@ import { verifyEnvelope, checkFreshness } from './envelope.js';
 import { verifyKill }                     from './kill.js';
 import { deriveTopicIdBig }               from './post.js';
 import { extractS2Prefix, asId }          from '../utils/hexid.js';
+import { RootClaim, makeRole }            from './rootClaim.js';
 
 // ── Inbound caps (D-1: bound attacker-controlled payloads) ──────────────
 // Re-exported unchanged — AxonaPeer and std/chunk import these as the
@@ -219,30 +220,8 @@ const idBig = asId;
 const lc    = (s) => String(s ?? '').toLowerCase();
 const isHexId = (s) => /^[0-9a-f]{1,66}$/.test(s);
 
-/** A relay's per-topic state (root or non-root child relay). */
-function makeRole(topicId, isRoot) {
-  return {
-    topicId,                         // bigint
-    isRoot,                          // closest-to-topic node → true; delegated child → false
-    subscribers: new Map(),          // subHex -> { since, lastRenewed }
-    children: new Set(),             // subHex of subscribers that are themselves child relays
-    cache: [],                       // [{ msgId, publishTs, json, bytes }] asc by publishTs
-    cacheIds: new Set(),             // msgId set for O(1) dedup (root-stamp + relay re-fan)
-    cacheBytes: 0,
-    lastTs: 0,                       // highest stamp emitted (monotonic; root authority)
-    seq: 0,                          // DENSE per-topic counter (root authority): ++ per emitted
-                                     // message AND kill, so subscribers detect GAPS (env.seq jumps
-                                     // ⇒ a message was missed). Distinct from the time-floored
-                                     // publishTs (which is monotonic but sparse). Recovered to the
-                                     // max seen seq on replay-up/handoff so a new root continues densely.
-    tombstones: new Map(),           // msgId -> { exp, killTs, signer, seq }  (kill; thin)
-    replicas: new Map(),             // (when ROOT) backupHex -> { at }  nodes holding a warm copy of our cache
-    backupOf: null,                  // (when BACKUP) hex of the root replicating to us; null if we're not a backup
-    lastReplicaAt: 0,                // (when BACKUP) _now() of the last replica push from our root (staleness → presume root gone)
-    metricsOn: 0,                    // (when ROOT) lease expiry ts; while > now, this root publishes snapshots to metricTopic(T)
-    metricsLastPub: 0,               // _now() of the last metric snapshot we published (throttle to METRICS_PUB_MS)
-  };
-}
+// Role shape (makeRole) lives in rootClaim.js — the role's `isRoot` field is
+// the state-machine's state, and EVERY flip of it goes through RootClaim.
 
 export class AxonaManager {
   /**
@@ -313,6 +292,10 @@ export class AxonaManager {
     this._metricsWanted   = new Map();  // dataTopicBig -> exp   soft flag on a path node (short-circuit duplicate METRICSON)
     this._metricsFwdAt    = new Map();  // dataTopicBig -> ts    last upstream METRICSON forward (fan-in coalesce)
     this._metricsPublisher = null;      // (dataTopicIdHex, snapshot) => Promise  set by the peer; publishes to metricTopic(T)
+
+    // The root-claim state machine: every isRoot transition + its guards
+    // (claim / defer / demote / handoff decision table) live in rootClaim.js.
+    this._rootClaim = new RootClaim(this, { beaconMs: BEACON_MS });
 
     this._registerHandlers();
   }
@@ -398,61 +381,21 @@ export class AxonaManager {
   // I am the root for a topic iff I am the routing terminus for its bare id.
   // A non-root relay that becomes the closest node (e.g. after the old root dies)
   // is promoted here — without this it would reroute bare-topic publishes to
-  // itself forever.
+  // itself forever. Rules + defer gate live in the state machine.
   _maybePromoteRoot(role, payload, meta) {
-    const viaEmpty = !(Array.isArray(payload.via) && payload.via.length);
-    if (viaEmpty && meta.isTerminal && !role.isRoot) {
-      if (this._liveCloserRoot(role.topicId)) return;   // a closer live root is beaconing — don't contest it
-      role.isRoot = true; this._upstream.delete(role.topicId); this._announceRoot(role.topicId);
-      role.formedAt = this._now(); role.lastVerify = 0;  // promoted claims get an early self-verify too
-      // Inherit an active metrics lease: if a METRICSON passed through this node on
-      // its way to the (now-departed) old root, the new root resumes publishing.
-      const w = this._metricsWanted.get(role.topicId) || 0;
-      if (w > this._now()) role.metricsOn = w;
-    }
+    this._rootClaim.promote(role, payload, meta);
   }
 
-  // A live root beacon naming a STRICTLY closer node than self means this node
-  // must not (re)take the topic's root — stranded terminal traffic defers to that
-  // root instead. This breaks the flap loop observed on the prod relay backbone:
-  // a near-miss relay was beacon-demoted every ~20s but re-rooted on the next
-  // stranded SUB (only PUB carried the last-mile correction), so two same-region
-  // relays traded the root forever and subscribers/publishers split across the
-  // variants. `requireReachable` (the default) additionally demands the beaconed
-  // root be a DIRECT, authenticated neighbour — when a root dies its channel
-  // drops and the gate opens instantly, so backup promotion on churn is never
-  // stalled by a stale beacon (the ≤TTL corpse window). The PUB last-mile
-  // correction keeps its original TTL-only semantics (requireReachable:false): a
-  // publish is one self-healing message, and that looser gate is what fixed
-  // cold-publish discovery.
-  _liveCloserRoot(topicBig, { requireReachable = true } = {}) {
-    const b = this._rootBeacons.get(topicBig);
-    if (!b || this._now() >= b.exp) return null;
-    if (b.root === lc(idHex(this.nodeId))) return null;
-    let rb; try { rb = idBig(b.root); } catch { return null; }
-    if ((rb ^ topicBig) >= (this.nodeId ^ topicBig)) return null;   // never defer to a farther node
-    if (b.verified) return b.root;    // root self-verification found it via iterative lookup — network-confirmed
-    if (this._isReachableId(b.root)) return b.root;                 // channel-verified live neighbour
-    // Loose branch (PUB/KILL): a live root re-beacons every BEACON_MS, so a
-    // beacon heard very recently is strong liveness evidence even for a
-    // non-neighbour root. A DEAD root's beacon goes silent — without this
-    // freshness cut a stranded publish ping-pongs toward the corpse until the
-    // full beacon TTL (the pre-4.19 latent loop, reproduced in
-    // smoke_root_reconcile phase 4).
-    if (!requireReachable && (this._now() - b.at) < BEACON_MS * 1.5) return b.root;
-    return null;
+  // Strictly-closer live-root defer gate — the decision table in rootClaim.js.
+  _liveCloserRoot(topicBig, opts) {
+    return this._rootClaim.liveCloserRoot(topicBig, opts);
   }
 
   // Defer a stranded terminal message to the beaconed root: demote any spurious
   // root claim I hold (and re-home under the true root so my subtree keeps
   // receiving), then forward the payload via-pinned to it.
   _deferToRoot(topicBig, type, payload, rootHex) {
-    const spurious = this.axonRoles.get(topicBig);
-    if (spurious && spurious.isRoot) {
-      spurious.isRoot = false;
-      this._upstream.set(topicBig, [rootHex]);
-      this._sendSubscribe(topicBig);                 // root must ADOPT us or our subtree starves
-    }
+    this._rootClaim.demote(topicBig, rootHex, 'defer-terminal');
     this._send(type, { ...payload, via: [rootHex] });
   }
 
@@ -485,9 +428,9 @@ export class AxonaManager {
       // set, so the renewFastMs renewal re-runs the election once meshed.
       // Publish-side is deliberately NOT gated — a genuinely solo node still
       // roots on its own publish and serves its local subscriber.
-      if (idBig(lc(payload.subscriberId)) === this.nodeId && this._meshBare()) return 'consumed';
+      if (idBig(lc(payload.subscriberId)) === this.nodeId && this._rootClaim.meshBare()) return 'consumed';
     }
-    let role = this.axonRoles.get(topicBig) || this._becomeRoot(topicBig);
+    let role = this.axonRoles.get(topicBig) || this._becomeRoot(topicBig, 'sub-terminal');
     this._maybePromoteRoot(role, payload, meta);
 
     const subHex = lc(payload.subscriberId);
@@ -610,11 +553,7 @@ export class AxonaManager {
     // tree infrastructure is region-homogeneous). A correct parent won't delegate
     // here, but refuse defensively so a stale/foreign ADOPT can't spill the tree.
     if (!this._regionOk(topicBig)) return 'consumed';
-    let role = this.axonRoles.get(topicBig);
-    if (!role) { role = makeRole(topicBig, false); this.axonRoles.set(topicBig, role);
-                 this._log('info', 'relay-formed', { topic: idHex(topicBig).slice(0, 12) }); }
-    role.isRoot = false;
-    this._upstream.set(topicBig, [lc(payload.parent)]);
+    const role = this._rootClaim.adoptChild(topicBig, lc(payload.parent));
     for (const s of (Array.isArray(payload.subs) ? payload.subs : [])) {
       const sh = lc(s.subscriberId);
       if (isHexId(sh) && idBig(sh) !== this.nodeId) this._accept(role, sh, s.since);
@@ -644,7 +583,7 @@ export class AxonaManager {
       const closer = this._liveCloserRoot(topicBig, { requireReachable: false });
       if (closer) { this._deferToRoot(topicBig, T.PUB, payload, closer); return 'consumed'; }
     }
-    let role = this.axonRoles.get(topicBig) || this._becomeRoot(topicBig);
+    let role = this.axonRoles.get(topicBig) || this._becomeRoot(topicBig, 'pub-terminal');
     this._maybePromoteRoot(role, payload, meta);
     // Only the root (the topic terminus) stamps. A non-root relay can only reach
     // here for a via-routed publish (a security waypoint) — pop the via and
@@ -766,31 +705,16 @@ export class AxonaManager {
     const topicBig = idBig(payload.topicId);
     // Adopt as a root: _becomeRoot makes the role (isRoot) if we don't have one,
     // so we serve the inherited history; routing/beacons reconcile root-ness.
-    const role = this.axonRoles.get(topicBig) || this._becomeRoot(topicBig);
+    const role = this.axonRoles.get(topicBig) || this._becomeRoot(topicBig, 'handoff-heir');
     this._applyDels(role, topicBig, payload.dels);   // inherit the heir's tombstones, not just its bodies
     for (const m of (Array.isArray(payload.msgs) ? payload.msgs : [])) {
       if (m && typeof m.json === 'string' && Number.isFinite(m.publishTs)) await this._ingestStamped(role, m);
     }
-    // The sender is DEPARTING: its root beacon for this topic is a ghost the
-    // moment the handoff arrives. Purge it, or the defer gates (here and on
-    // every later stranded SUB) would keep pointing the topic at a corpse —
-    // observed as heirs adopting the history and immediately demoting back
-    // toward the leaver, undoing the handoff entirely.
+    // Departure rules — purge the leaver's ghost beacon, never defer back to
+    // the leaver, yield only to a strictly-closer live root — live in the
+    // state machine (rootClaim.handoffArrived).
     const leaver = typeof payload.from === 'string' ? lc(payload.from) : null;
-    if (leaver && this._rootBeacons.get(topicBig)?.root === leaver) {
-      this._rootBeacons.delete(topicBig);
-    }
-    // The handoff made us root so the history is safe — but if a strictly-closer
-    // live root is beaconing (the leaver picked us while a better heir exists),
-    // don't hold a competing claim: demote to a subscribing child and push the
-    // inherited history up (the SUB carries our hw → the root PULLUPs it).
-    // Never defer back to the leaver itself.
-    const closer = this._liveCloserRoot(topicBig);
-    if (closer && closer !== leaver && role.isRoot) {
-      role.isRoot = false;
-      this._upstream.set(topicBig, [closer]);
-      this._sendSubscribe(topicBig);
-    }
+    this._rootClaim.handoffArrived(topicBig, leaver);
     return 'consumed';
   }
 
@@ -1226,13 +1150,8 @@ export class AxonaManager {
     return true;                                                       // signer-less tombstone (defensive) → suppress
   }
 
-  _becomeRoot(topicBig) {
-    const role = makeRole(topicBig, true);
-    role.formedAt = this._now(); role.lastVerify = 0;
-    this.axonRoles.set(topicBig, role);
-    this._log('info', 'root-formed', { topic: idHex(topicBig).slice(0, 12) });
-    this._announceRoot(topicBig);
-    return role;
+  _becomeRoot(topicBig, why = 'terminal') {
+    return this._rootClaim.become(topicBig, why);
   }
 
   // Root self-verification (see the ROOT_VERIFY_* constants). Launch up to
@@ -1269,9 +1188,7 @@ export class AxonaManager {
           if (!live || !live.isRoot) return;                      // already demoted meanwhile
           const hex = lc(idHex(cBig));
           this._rootBeacons.set(t, { root: hex, at: this._now(), exp: this._now() + 2 * ROOT_VERIFY_MS, verified: true });
-          live.isRoot = false;
-          this._upstream.set(t, [hex]);
-          this._sendSubscribe(t);
+          this._rootClaim.demote(t, hex, 'verify-closer');
           this._log('info', 'root-verify-demote', { topic: idHex(t).slice(0, 12), to: hex.slice(0, 10) });
         })
         .catch(() => this._verifyInflight.delete(t));
@@ -1486,25 +1403,12 @@ export class AxonaManager {
       if (mine != null && (rootBig ^ tBig) > (mine ^ tBig)) continue;       // verify-don't-trust
       this._rootBeacons.set(tBig, { root: lc(payload.root), at: now, exp: now + BEACON_TTL_MS });
       // If I'd wrongly become this topic's root but the beacon proves a strictly
-      // closer root exists, demote NOW and renew toward it — so I stop claiming
-      // the topic and stop emitting poisoning "root=me" beacons.
+      // closer root exists, yield NOW — rootClaim.demote demotes, re-homes, and
+      // sends the confirming subscribe (the new root must ADOPT us or our
+      // subtree starves) — so I stop claiming the topic and stop emitting
+      // poisoning "root=me" beacons.
       if ((rootBig ^ tBig) < (this.nodeId ^ tBig)) {
-        const role = this.axonRoles.get(tBig);
-        if (role && role.isRoot && rootBig !== this.nodeId) {
-          role.isRoot = false;
-          this._upstream.set(tBig, [lc(payload.root)]);
-          // Pinning upstream is not enough: the new root must REGISTER us as a
-          // downstream child or it can't fan deliveries back down to us (and our
-          // subtree). Every other _upstream write is paired with a confirming
-          // subscribe-k (_onAdopt → _sendSubscribe; deliver-`from` is self-proving)
-          // — this beacon-demotion path was the lone exception, leaving a
-          // one-sided link: we renew toward the root, but the root never adopts
-          // us, so _fanout (over role.subscribers) skips our branch entirely.
-          // Symptom: chained sub→relay→root delivers 0 to the relay's subtree
-          // while the root caches the message (root subs=0, cache>0). Emit the
-          // subscribe-k now so the new root seats us and the tree fans down.
-          this._sendSubscribe(tBig);
-        }
+        this._rootClaim.demote(tBig, lc(payload.root), 'beacon-closer');
       }
     }
     if (payload.layer > 1 && typeof this.dht.neighbors === 'function') {
@@ -1535,12 +1439,6 @@ export class AxonaManager {
     return best;
   }
 
-  // True iff `self` is XOR-closest to `tBig` among the nodes we can ACTUALLY reach
-  // (self + direct, authenticated neighbours), excluding the bridge (signaling infra,
-  // never a topic root). The iterative findKClosest hint may name a node closer in
-  // XOR than any of these, but if it never adopts us it is effectively unreachable;
-  // when self beats every reachable neighbour, self is the best reachable root. Pure
-  // local read — no network probe. Sim/fabric without neighbours() → trivially self.
   // Is `hex` a currently-reachable node (a direct neighbour in the synaptome)?
   // Used to distinguish a departed root (drop from the mesh → fast promotion) from
   // a live-but-quiet one (kept as a passive backup for the full stale window).
@@ -1554,34 +1452,6 @@ export class AxonaManager {
       if (nb === want) return true;
     }
     return false;
-  }
-
-  // True iff this node has NO non-bridge neighbours — it can't route to anyone,
-  // so any "terminal at self" verdict is an artifact of isolation, not of
-  // closeness. Used by the alone-in-the-dark guard in _onSub. When the
-  // transport doesn't expose neighbours, assume meshed (never block).
-  _meshBare() {
-    if (typeof this.dht.neighbors !== 'function') return false;
-    let bridge = null;
-    try { const b = (typeof this.dht.bridgeId === 'function') ? this.dht.bridgeId() : null; bridge = (b != null) ? idBig(b) : null; } catch { /* */ }
-    for (const n of (this.dht.neighbors() || [])) {
-      let nb; try { nb = idBig(n); } catch { continue; }
-      if (bridge === null || nb !== bridge) return false;   // any routable non-bridge neighbour → meshed
-    }
-    return true;
-  }
-
-  _selfClosestReachable(tBig) {
-    const bridge = (typeof this.dht.bridgeId === 'function') ? this.dht.bridgeId() : null;
-    let bestD = this.nodeId ^ tBig;
-    if (typeof this.dht.neighbors === 'function') {
-      for (const n of (this.dht.neighbors() || [])) {
-        let nb; try { nb = idBig(n); } catch { continue; }
-        if (nb === this.nodeId || (bridge != null && nb === bridge)) continue;
-        if ((nb ^ tBig) < bestD) return false;     // a reachable neighbour is closer → route to it
-      }
-    }
-    return true;
   }
 
   // Subscribe — always sent SYNCHRONOUSLY and immediately (fast path, never blocked
@@ -1770,7 +1640,7 @@ export class AxonaManager {
         const closer = this._liveCloserRoot(topicBig);
         if (closer) { this._deferToRoot(topicBig, T.METRICSON, payload, closer); return 'consumed'; }
       }
-      const role = this.axonRoles.get(topicBig) || this._becomeRoot(topicBig);
+      const role = this.axonRoles.get(topicBig) || this._becomeRoot(topicBig, 'metricson-terminal');
       this._maybePromoteRoot(role, payload, meta);
       role.metricsOn = now + METRICS_LEASE_MS;                 // arm/renew the publish lease
       // Answer the demand NOW (v4.16.1): the first snapshot rides back at routing
@@ -1922,7 +1792,7 @@ export class AxonaManager {
       const closer = this._liveCloserRoot(topicBig, { requireReachable: false });
       if (closer) { this._deferToRoot(topicBig, T.KILL, payload, closer); return 'consumed'; }
     }
-    const role = this.axonRoles.get(topicBig) || this._becomeRoot(topicBig);
+    const role = this.axonRoles.get(topicBig) || this._becomeRoot(topicBig, 'kill-terminal');
     const kill = payload.kill;
     const target = kill?.msgId;
     if (!target) return 'consumed';
@@ -2046,13 +1916,8 @@ export class AxonaManager {
           this._unattachedSince.delete(t);
         } else {
           if (!this._unattachedSince.has(t)) this._unattachedSince.set(t, now);
-          if (now - this._unattachedSince.get(t) >= ROOT_CLAIM_MS && this._regionOk(t) && this._selfClosestReachable(t)) {
-            const role2 = this.axonRoles.get(t) || this._becomeRoot(t);
-            role2.isRoot = true;
-            this._upstream.delete(t);
-            this._rootHint.delete(t);          // stop deferring to the unreachable hint
-            this._unattachedSince.delete(t);
-            this._log('info', 'root-claimed-reachable', { topic: idHex(t).slice(0, 12) });
+          if (now - this._unattachedSince.get(t) >= ROOT_CLAIM_MS && this._regionOk(t) && this._rootClaim.selfClosestReachable(t)) {
+            this._rootClaim.claimReachable(t);
             continue;                          // we are root now — no upstream to renew toward
           }
         }
