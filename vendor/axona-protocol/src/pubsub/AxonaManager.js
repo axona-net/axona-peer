@@ -1119,15 +1119,33 @@ export class AxonaManager {
     this._pendingKill?.delete(msgId);
   }
 
-  // A peer died (channel closed / evicted): every root beacon naming it is now
-  // a ghost. Purge them so the defer gates (SUB/PUB/promotion) stop steering
-  // topics at a corpse — otherwise, until the 50s TTL, stranded traffic keeps
-  // deferring to a node that can never serve, and promotions stay suppressed.
+  // A peer died (channel closed / evicted) or announced its departure: every
+  // root beacon naming it is now a ghost. Purge them so the defer gates
+  // (SUB/PUB/promotion) stop steering topics at a corpse — otherwise, until
+  // the 50s TTL, stranded traffic keeps deferring to a node that can never
+  // serve, and promotions stay suppressed.
+  //
+  // The dead peer can't be anyone's UPSTREAM either. A pin on a corpse is not
+  // a blackhole — the next renewal routed toward it is popped at the live
+  // terminal ('reroute') and re-seats at the true root, which re-pins us via
+  // the deliver `from` — but while pinned, `attached` stays true, so an app
+  // subscriber's adaptive renewal can sit at the backed-off ceiling (up to
+  // RENEW_MS = 60s of staleness) before that healing renewal fires, and the
+  // reachable-root fallback stays gated off. Drop the pin NOW and reset the
+  // renewal clock so the very next tick re-homes unpinned (external review
+  // finding, validated 2026-07-13).
   pubsubPeerDied(deadHex) {
     if (typeof deadHex !== 'string') return;
     const dead = lc(deadHex);
     for (const [t, b] of this._rootBeacons) {
       if (b?.root === dead) this._rootBeacons.delete(t);
+    }
+    for (const [t, up] of this._upstream) {
+      if (Array.isArray(up) && up[0] === dead) {
+        this._upstream.delete(t);
+        const s = this.mySubscriptions.get(t);
+        if (s) { s.interval = this.renewFastMs; s.lastRenewSent = 0; }
+      }
     }
   }
 

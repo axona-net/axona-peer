@@ -558,6 +558,12 @@ export class AxonaPeer extends DHT {
         node.connections?.delete(leaving);
         try { node.transport?.closeConnection?.(leaving); } catch { /* dying channel */ }
         this._emitLog?.('info', 'peer-leaving', { from: toHex(leaving) });
+        // A departing peer is as gone as a dead one for pub/sub state: sweep
+        // its ghost beacons AND any upstream pins on it BEFORE the immediate
+        // tick below, so the re-anchor renews unpinned instead of toward the
+        // leaver (its HANDOFF, which arrives after this notify, re-purges
+        // idempotently).
+        this._axonaManager?.pubsubPeerDied?.(toHex(leaving));
         // Re-anchor now rather than waiting for the 10 s refreshTick.
         Promise.resolve(this._axonaManager?.refreshTick?.()).catch(() => {});
       } catch { /* best-effort resilience path */ }
