@@ -111,12 +111,21 @@ export const wireHandlersMethods = {
       if (this.mySubscriptions.has(topicBig)) this._replayLocal(role, since, !!payload.latest);
       return 'consumed';
     }
-    // Durability (§6 stamped-replay-up): if this subscriber holds newer stamped
-    // history than I do — e.g. I am a fresh root after the old one died, or a
-    // displaced root reattaching — ask it to replay its cache UP to me.
+    // Durability (§6 stamped-replay-up): if this subscriber holds stamped
+    // history I lack, ask it to replay its cache UP to me. Two detectable shapes:
+    //  · NEWER (hw above mine) — I am a fresh root after the old one died, or a
+    //    displaced root reattaching → pull the delta above my hw.
+    //  · OLDER (lw below mine) — the post-transition split: a demoted ex-root /
+    //    heir re-homing under me holds the PRE-transition half, which sits
+    //    entirely below my hw and is invisible to the hw rule (the cold-attach
+    //    "exactly half the timeline" replay class) → pull its FULL range
+    //    (sinceHw:0; ingest dedups by msgId, tombstones suppress killed bodies).
+    //    Self-quenching: once unioned my lw ≤ its lw and the rule stops firing.
     const myHw = this._highWater(role);
     if (Number.isFinite(payload.hw) && payload.hw > myHw) {
       this._route(idBig(subHex), T.PULLUP, { topicId: idHex(topicBig), sinceHw: myHw, parentId: idHex(this.nodeId) });
+    } else if (Number.isFinite(payload.lw) && payload.lw > 0 && role.cache.length && payload.lw < this._lowWater(role)) {
+      this._route(idBig(subHex), T.PULLUP, { topicId: idHex(topicBig), sinceHw: 0, parentId: idHex(this.nodeId) });
     }
     this._accept(role, subHex, since, !!payload.latest);
     return 'consumed';
@@ -391,14 +400,29 @@ export const wireHandlersMethods = {
   // gap-free (it already holds the history a since:'all' joiner will ask for).
   async _onReplicate(payload, meta) {
     if (meta.targetId !== this.nodeId) return;          // routed to me as the backup
-    if (!this._rootReplicas) return 'consumed';         // replication disabled on this node
     let topicBig; try { topicBig = idBig(payload.topicId); } catch { return 'consumed'; }
+    const mine = this.axonRoles.get(topicBig);
+    if (mine?.isRoot) {
+      // UNION-INGEST at a root — the cohort anti-entropy contract _replicateRole
+      // documents ("co-hosting roots converge to the union of cache+tombstones").
+      // This used to be dropped, so two roots straddling a transition never
+      // merged and the pushing ex-root's half stayed stranded (a fresh
+      // since:'all' subscriber on the surviving root replayed exactly half the
+      // timeline). No backup bookkeeping here — we keep our claim; every body
+      // re-verifies through _ingestStamped (dedup, tombstone-suppress,
+      // fanout + app delivery heal attached subscribers in place).
+      this._applyDels(mine, topicBig, payload.dels);
+      for (const m of (Array.isArray(payload.msgs) ? payload.msgs : [])) {
+        if (m && typeof m.json === 'string' && Number.isFinite(m.publishTs)) await this._ingestStamped(mine, m);
+      }
+      return 'consumed';
+    }
+    if (!this._rootReplicas) return 'consumed';         // backup duty disabled on this node
     let from = null;
     if (payload.from && isHexId(lc(payload.from))) from = lc(payload.from);
     else if (meta.fromId != null) { try { from = lc(idHex(idBig(meta.fromId))); } catch { /* */ } }
     let role = this.axonRoles.get(topicBig);
     if (!role) { role = makeRole(topicBig, false); this.axonRoles.set(topicBig, role); }
-    if (role.isRoot) return 'consumed';                 // I'm already (a closer) root — ignore a backup push
     role.backupOf = from;
     role.lastReplicaAt = this._now();
     this._backupTopics.add(topicBig);                   // participate as a subscribing child relay (single-root election)

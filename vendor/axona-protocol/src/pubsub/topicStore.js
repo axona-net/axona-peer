@@ -48,6 +48,15 @@ export const topicStoreMethods = {
     return Math.max(role.lastTs || 0, role.cache.length ? role.cache[role.cache.length - 1].publishTs : 0);
   },
 
+  // My cache low-water = the OLDEST stamp I hold; 0 when empty. Advertised on
+  // SUB beside hw so a root can see a child holding strictly-OLDER history —
+  // the post-transition split half that sits below the root's hw and is
+  // invisible to the hw rule (the cold-attach "exactly half the timeline"
+  // replay class).
+  _lowWater(role) {
+    return role.cache.length ? role.cache[0].publishTs : 0;
+  },
+
   // A target message arriving (publish / replay / fan-out) for which we hold a
   // tombstone: SUPPRESS it iff the kill was authorized by the message's own author
   // — this is where a PROVISIONAL kill (accepted before we held the target) is

@@ -256,6 +256,7 @@ export class AxonaManager {
       topicId: idHex(topicBig), via, subscriberId: idHex(this.nodeId),
       since: this._sinceFor(topicBig),
       hw: role ? this._highWater(role) : 0,   // a cache-bearing relay advertises its history (§6)
+      lw: role ? this._lowWater(role) : 0,    // …and its OLDEST stamp, so a root missing the pre-transition half pulls it
       latest,
     });
     // One-shot: 'latest' delivers the current value once at subscribe, not on
