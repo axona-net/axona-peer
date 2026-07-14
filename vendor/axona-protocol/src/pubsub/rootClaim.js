@@ -51,6 +51,9 @@ export function makeRole(topicId, isRoot) {
                                      // publishTs (which is monotonic but sparse). Recovered to the
                                      // max seen seq on replay-up/handoff so a new root continues densely.
     tombstones: new Map(),           // msgId -> { exp, killTs, signer, seq }  (kill; thin)
+    pulledLw: new Map(),             // subHex -> lowest lw already PULLUP'd from that child (4.22.1:
+                                     // a refused pull — e.g. the child's oldest is tombstoned here —
+                                     // must not re-fire on every renewal; re-arm only if lw DECREASES)
     replicas: new Map(),             // (when ROOT) backupHex -> { at }  nodes holding a warm copy of our cache
     backupOf: null,                  // (when BACKUP) hex of the root replicating to us; null if we're not a backup
     lastReplicaAt: 0,                // (when BACKUP) _now() of the last replica push from our root (staleness → presume root gone)

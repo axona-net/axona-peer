@@ -120,12 +120,23 @@ export const wireHandlersMethods = {
     //    entirely below my hw and is invisible to the hw rule (the cold-attach
     //    "exactly half the timeline" replay class) → pull its FULL range
     //    (sinceHw:0; ingest dedups by msgId, tombstones suppress killed bodies).
-    //    Self-quenching: once unioned my lw ≤ its lw and the rule stops firing.
+    //    ONE-SHOT per (child, lw) — when the union succeeds my lw drops to the
+    //    child's and the condition quenches naturally, but when the pull is
+    //    REFUSED (the child's oldest is tombstoned here, or beyond my retention
+    //    window) the condition would hold forever and re-fire a full-cache
+    //    replay-up on EVERY renewal (the 4.22.0 testnet relay storm: flapping
+    //    roots, zero-delivery runs, leave() drains pinned at timeout). Remember
+    //    the lw already pulled per child; re-arm only if its lw DECREASES
+    //    (a deeper split — genuinely new history).
     const myHw = this._highWater(role);
     if (Number.isFinite(payload.hw) && payload.hw > myHw) {
       this._route(idBig(subHex), T.PULLUP, { topicId: idHex(topicBig), sinceHw: myHw, parentId: idHex(this.nodeId) });
     } else if (Number.isFinite(payload.lw) && payload.lw > 0 && role.cache.length && payload.lw < this._lowWater(role)) {
-      this._route(idBig(subHex), T.PULLUP, { topicId: idHex(topicBig), sinceHw: 0, parentId: idHex(this.nodeId) });
+      const prev = role.pulledLw.get(subHex);
+      if (prev === undefined || payload.lw < prev) {
+        role.pulledLw.set(subHex, payload.lw);
+        this._route(idBig(subHex), T.PULLUP, { topicId: idHex(topicBig), sinceHw: 0, parentId: idHex(this.nodeId) });
+      }
     }
     this._accept(role, subHex, since, !!payload.latest);
     return 'consumed';
@@ -137,7 +148,7 @@ export const wireHandlersMethods = {
     if (d === 'reject') return 'consumed';   // out-of-region terminus: topic's region has no node → don't root/seat/store here
     if (d === 'reroute') { this._reroute(T.UNSUB, payload); return 'consumed'; }
     const role = this.axonRoles.get(idBig(payload.topicId));
-    if (role) { const s = lc(payload.subscriberId); role.subscribers.delete(s); role.children.delete(s); }
+    if (role) { const s = lc(payload.subscriberId); role.subscribers.delete(s); role.children.delete(s); role.pulledLw?.delete(s); }
     return 'consumed';
   },
 

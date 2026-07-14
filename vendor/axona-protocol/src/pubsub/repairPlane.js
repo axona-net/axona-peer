@@ -141,7 +141,7 @@ export const repairPlaneMethods = {
     //    that is empty and not locally needed.
     for (const [t, role] of this.axonRoles) {
       for (const [subHex, sub] of role.subscribers) {
-        if (now - sub.lastRenewed > this.dropMs) { role.subscribers.delete(subHex); role.children.delete(subHex); }
+        if (now - sub.lastRenewed > this.dropMs) { role.subscribers.delete(subHex); role.children.delete(subHex); role.pulledLw?.delete(subHex); }
       }
       for (const [msgId, t] of role.tombstones) if ((t?.exp ?? 0) <= now) role.tombstones.delete(msgId);
       this._expireCache(role, now);
