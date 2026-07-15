@@ -21,8 +21,14 @@
 
 import { geoCellId, geoCellCenter, isValidCellId, S2_CELL_COUNT } from './s2.js';
 
-/** Single region name for every code, indexed by code [0,192). */
-export const REGION_NAMES = Object.freeze([
+/**
+ * Raw per-cell legacy names, indexed by code [0,192). These are NO LONGER the
+ * public region names (see MAJORS / REGION_NAMES below) — they are retained
+ * only as (a) the curation reference for the fold map and (b) hidden INPUT
+ * ALIASES so every old name ('useast', 'pakistn', 'pac_68', …) still resolves
+ * to its canonical region. Never shown to users.
+ */
+const LEGACY_CELL_NAMES = Object.freeze([
   'rio',  // 0x00
   'atl_01',  // 0x01
   'atl_02',  // 0x02
@@ -217,12 +223,139 @@ export const REGION_NAMES = Object.freeze([
   'pac_bf',  // 0xbf
 ]);
 
-/** name (lowercase) → canonical (lowest) code. Built once. */
+// ─────────────────────────────────────────────────────────────────────────────
+// Canonical regions — the fold map + neutral animal names.
+//
+// Two human-facing fixes to the raw 192-cell grid (curated + validated by
+// scripts/gen-canonical-regions.mjs; MAJORS is the single hand-maintained
+// source of truth — everything else is derived below):
+//
+//   1. HOTSPOTS. ~108 cells are open ocean or sparsely-populated (micro-islands,
+//      ice caps). A topic minted with such a region byte has no local node
+//      population, so its K-closest set collapses onto whichever real region is
+//      nearest in ID space — a hotspot. FIX: every non-major cell FOLDS onto the
+//      nearest MAJOR (populous) cell, so the topic spreads across a real region's
+//      whole keyspace instead of piling on a boundary. Folding happens at MINT
+//      time (node identity + topic derivation), so no folded code is ever a live
+//      region byte after this change; pre-existing ids stay valid and routable.
+//
+//   2. POLITICS. Country names on border-spanning cells are inflammatory (the
+//      0x2c cell — NW India + E Pakistan — was named 'pakistn'). FIX: each MAJOR
+//      is named for a NEUTRAL animal in the cell, never a national symbol where
+//      the cell straddles a border (chinkara not markhor, gaur not tiger, …).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * MAJOR regions: `code → neutral animal name`. A cell is major iff it appears
+ * here. Everything else folds to its nearest major (great-circle between cell
+ * centers, with FOLD_OVERRIDES below for hand-tuned cases). Curation: full,
+ * easy-to-spell common animal names /^[a-z0-9]{2,16}$/, unique, and never a
+ * national animal/bird of a country the cell straddles a border with.
+ */
+export const MAJORS = Object.freeze({
+  0x07: 'macaw',      0x0c: 'canary',     0x0d: 'lynx',       0x0e: 'fennec',
+  0x0f: 'chimpanzee', 0x10: 'hornbill',   0x11: 'oryx',       0x12: 'addax',
+  0x13: 'gecko',      0x14: 'ibis',       0x15: 'jerboa',     0x16: 'gelada',
+  0x17: 'gorilla',    0x18: 'zebra',      0x19: 'sable',      0x1a: 'bonobo',
+  0x1b: 'roan',       0x1c: 'meerkat',    0x1e: 'kudu',       0x20: 'lemur',
+  0x26: 'dodo',       0x27: 'fossa',      0x28: 'dikdik',     0x2a: 'gazelle',
+  0x2b: 'urial',      0x2c: 'chinkara',   0x2d: 'kiang',      0x2e: 'gaur',
+  0x30: 'tapir',      0x31: 'gibbon',     0x32: 'takin',      0x33: 'panda',
+  0x34: 'egret',      0x35: 'goral',      0x36: 'tarsier',    0x37: 'orangutan',
+  0x38: 'cuscus',     0x39: 'komodo',     0x3a: 'colugo',     0x3e: 'quokka',
+  0x3f: 'dingo',      0x40: 'leopard',    0x41: 'brownbear',  0x42: 'saiga',
+  0x43: 'ermine',     0x44: 'reindeer',   0x46: 'moose',      0x47: 'boar',
+  0x48: 'badger',     0x4c: 'caribou',    0x4d: 'loon',       0x52: 'elk',
+  0x53: 'cougar',     0x56: 'puffin',     0x59: 'salmon',     0x5b: 'wolverine',
+  0x5c: 'muskdeer',   0x5d: 'argali',     0x5e: 'sika',       0x5f: 'tanuki',
+  0x60: 'serow',      0x6c: 'seaturtle',  0x78: 'kiwi',       0x7d: 'cassowary',
+  0x7e: 'wombat',     0x7f: 'koala',      0x80: 'grizzly',    0x81: 'coyote',
+  0x84: 'iguana',     0x86: 'armadillo',  0x87: 'bison',      0x88: 'alligator',
+  0x89: 'eagle',      0x8c: 'toucan',     0x8d: 'anteater',   0x8e: 'ocelot',
+  0x8f: 'coati',      0x91: 'llama',      0x92: 'jaguar',     0x93: 'capybara',
+  0x94: 'rhea',       0x95: 'puma',       0x96: 'guanaco',    0xaa: 'penguin',
+});
+
+const MAJOR_CODES = Object.freeze(Object.keys(MAJORS).map(Number));
+
+/**
+ * Hand-tuned fold targets that override the nearest-major default. Greenland's
+ * two cells (west 0x4e, north/east 0x4f) both fold to caribou (Quebec) rather
+ * than split east→reindeer / west→caribou across the Atlantic.
+ */
+const FOLD_OVERRIDES = Object.freeze({ 0x4e: 0x4c, 0x4f: 0x4c });
+
+/** Great-circle distance (km) between two {lat,lng}. */
+function _greatCircle(a, b) {
+  const R = 6371, rad = (d) => (d * Math.PI) / 180;
+  const dLat = rad(b.lat - a.lat), dLng = rad(b.lng - a.lng);
+  const s = Math.sin(dLat / 2) ** 2 +
+    Math.cos(rad(a.lat)) * Math.cos(rad(b.lat)) * Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(s));
+}
+
+/**
+ * CANONICAL_CODE[code] = the major code this cell folds to. Majors map to
+ * themselves. Computed once at load (192×84 great-circle ops, deterministic).
+ */
+const CANONICAL_CODE = Object.freeze((() => {
+  const out = new Array(S2_CELL_COUNT);
+  const centers = Array.from({ length: S2_CELL_COUNT }, (_, c) => geoCellCenter(c));
+  for (let c = 0; c < S2_CELL_COUNT; c++) {
+    if (MAJORS[c] !== undefined) { out[c] = c; continue; }
+    if (FOLD_OVERRIDES[c] !== undefined) { out[c] = FOLD_OVERRIDES[c]; continue; }
+    let best = MAJOR_CODES[0], bestD = Infinity;
+    for (const m of MAJOR_CODES) {
+      const d = _greatCircle(centers[c], centers[m]);
+      if (d < bestD) { bestD = d; best = m; }
+    }
+    out[c] = best;
+  }
+  return out;
+})());
+
+/**
+ * Fold any region (name or code) to its canonical major code. Idempotent.
+ * A node minted anywhere in open ocean, and a topic anchored at a folded cell,
+ * both resolve here to a real, populated region — no hotspots.
+ * @param {string|number} nameOrCode
+ * @returns {number|null}  canonical major code, or null if unresolvable
+ */
+export function canonicalRegion(nameOrCode) {
+  const code = _rawResolve(nameOrCode);
+  return code === null ? null : CANONICAL_CODE[code];
+}
+
+/**
+ * Public region name for every code [0,192): the animal of the cell's canonical
+ * major. Every cell in a major's fold-basin displays that major's name.
+ */
+export const REGION_NAMES = Object.freeze(
+  Array.from({ length: S2_CELL_COUNT }, (_, c) => MAJORS[CANONICAL_CODE[c]]));
+
+/** name (lowercase) → CANONICAL code. Animal names first (authoritative), then
+ *  every legacy cell name as a hidden alias (skipping any that collide). */
 const NAME_TO_CODE = (() => {
   const m = new Map();
-  REGION_NAMES.forEach((name, code) => { if (!m.has(name)) m.set(name, code); });
+  for (const c of MAJOR_CODES) m.set(MAJORS[c], c);            // animal → itself
+  LEGACY_CELL_NAMES.forEach((name, code) => {                 // legacy → canonical
+    if (!m.has(name)) m.set(name, CANONICAL_CODE[code]);
+  });
   return m;
 })();
+
+/** Raw resolve: name/hex/decimal → code, WITHOUT folding. Internal. */
+function _rawResolve(token) {
+  if (typeof token === 'number') return isValidCellId(token) ? token : null;
+  if (typeof token !== 'string') return null;
+  const t = token.trim();
+  const byName = NAME_TO_CODE.get(t.toLowerCase());
+  if (byName !== undefined) return byName;
+  const n = /^0x[0-9a-f]+$/i.test(t) ? parseInt(t, 16)
+          : /^\d+$/.test(t)          ? parseInt(t, 10)
+          : NaN;
+  return isValidCellId(n) ? n : null;
+}
 
 /**
  * The single region name for a code.
@@ -256,22 +389,16 @@ export function regionCode(name) {
 }
 
 /**
- * Resolve a region token — a NAME or a numeric code — to its 8-bit code.
- * Accepts 'useast', 'USEAST', '0x89', '137', or 137. A multi-cell name resolves
- * to its canonical (lowest) code.
+ * Resolve a region token — a NAME (animal or legacy) or a numeric code — to its
+ * CANONICAL 8-bit region code. Accepts 'osprey', 'useast', 'pakistn', 'pac_68',
+ * '0x89', '137', or 137. Any ocean / sparse cell folds to its nearest major, so
+ * the returned code is always a real, populated region. This is the mint
+ * chokepoint used by topic derivation.
  * @param {string|number} token
  * @returns {number|null}
  */
 export function resolveRegion(token) {
-  if (typeof token === 'number') return isValidCellId(token) ? token : null;
-  if (typeof token !== 'string') return null;
-  const t = token.trim();
-  const byName = regionCode(t);
-  if (byName !== null) return byName;
-  const n = /^0x[0-9a-f]+$/i.test(t) ? parseInt(t, 16)
-          : /^\d+$/.test(t)          ? parseInt(t, 10)
-          : NaN;
-  return isValidCellId(n) ? n : null;
+  return canonicalRegion(token);
 }
 
 /**
@@ -295,22 +422,22 @@ export function regionCenter(nameOrCode) {
   return code === null ? null : geoCellCenter(code);
 }
 
-// Open-ocean cells follow the "<oce3>_<hex>" convention (pac_68, atl_0a, …);
-// everything else is a populated/land (or inhabited-island) region. A topic
-// must live where nodes actually are, so placement is restricted to these.
-const OCEAN_NAME_RE = /^(pac|atl|ind|sou|arc)_[0-9a-f]{2}$/;
+/**
+ * CANONICAL_REGIONS — the 84 major `{ code, name }` regions a topic can actually
+ * live in (every ocean / sparse cell folds into one of these). This is the list
+ * a UI region-picker should show. Sorted by code.
+ */
+export const CANONICAL_REGIONS = Object.freeze(
+  MAJOR_CODES.slice().sort((a, b) => a - b).map((code) => ({ code, name: MAJORS[code] })));
 
 /**
- * Populated regions — `{ code, name }` for every non-open-ocean cell. A
- * convenience list of real, inhabited cells (e.g. for a region picker in a UI).
- * A topic's region must be a real cell; when an app omits the region, the kernel
- * defaults it to the publisher's own node region (the top byte of its node ID),
- * never to a value derived from the author key.
+ * @deprecated alias for {@link CANONICAL_REGIONS}. Prior builds exposed one
+ * entry per non-ocean cell; after the canonical fold there is exactly one entry
+ * per major region. A topic's region must be a canonical region; when an app
+ * omits it, the kernel defaults to the publisher's own node region (the top byte
+ * of its node ID), never a value derived from the author key.
  */
-export const POPULATED_REGIONS = Object.freeze(
-  REGION_NAMES.map((name, code) => ({ code, name }))
-    .filter((r) => !OCEAN_NAME_RE.test(r.name)),
-);
+export const POPULATED_REGIONS = CANONICAL_REGIONS;
 
 if (REGION_NAMES.length !== S2_CELL_COUNT) {
   throw new Error(

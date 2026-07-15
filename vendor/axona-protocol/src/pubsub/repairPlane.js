@@ -17,6 +17,8 @@ import {
   FUTURE_TOLERANCE_MS, BEACON_MS, BEACON_TTL_MS, BEACON_SEEN_MS,
   ROOT_VERIFY_FIRST_MS, ROOT_VERIFY_MS, ROOT_VERIFY_BATCH, METRICS_LEASE_MS,
   METRICS_PUB_MS, METRICS_COALESCE_MS,
+  EMPTY_ROOT_PROBE_DELAY_MS, EMPTY_ROOT_PROBE_MAX, EMPTY_ROOT_PROBE_INTERVAL_MS,
+  EMPTY_ROOT_PROBE_FANOUT, HANDOFF_ACK_MS, HANDOFF_TRIES,
 } from './constants.js';
 import { idHex, idBig, lc, isHexId } from './ids.js';
 
@@ -77,6 +79,7 @@ export const repairPlaneMethods = {
     //         cache to its ROOT_REPLICAS nearest neighbours so a successor is always
     //         warm.
     this._replicateRoots();
+    this._emptyRootProbeSweep(now);   // v4.24.0: empty self-roots re-pull the cohort (bounded)
     // 1b-bak. Backups are subscribing CHILD RELAYS. Renew each backup's subscribe
     //         every tick so root election runs through the SAME probe-protected path
     //         as any subscriber/host (_rootHint_'s iterative lookup → one globally-
@@ -203,6 +206,85 @@ export const repairPlaneMethods = {
       if (!role.isRoot) continue;
       this._replicateRole(t, role, bridge, now).catch(() => {});   // async (findKClosest); fire-and-forget
     }
+  },
+
+  // Empty-self-root re-probe sweep (v4.24.0): a root STILL empty at renewal
+  // time re-pulls the cohort (a holder may have joined/recovered since the
+  // birth probe), bounded by EMPTY_ROOT_PROBE_MAX and rate-limited. Its own
+  // sweep — deliberately NOT inside _replicateRoots, which no-ops when
+  // replication is disabled (rootReplicas: 0) and would silently disable the
+  // pull with it. Fire-and-forget — never await an iterative lookup inside
+  // the tick (the 4.18.1 lesson).
+  _emptyRootProbeSweep(now) {
+    for (const [t, role] of this.axonRoles) {
+      if (!role.isRoot || role.cache.length) continue;
+      if (role.probeTries >= EMPTY_ROOT_PROBE_MAX) continue;
+      if (now - role.probeAt < EMPTY_ROOT_PROBE_INTERVAL_MS) continue;
+      this._emptyRootProbe(t).catch(() => {});
+    }
+  },
+
+  // ── empty-self-root cohort pull (v4.24.0 — the alert-bot read-miss fix) ──
+  // Field-captured mechanism: a cold subscriber's SUB terminates at itself →
+  // it becomes the topic's root with an EMPTY cache while a live holder
+  // (ex-root / backup / host) still has the history. Nothing tells the holder
+  // about the new closer root, so the empty state is STICKY (82% of Howard's
+  // misses; unrecovered at 600s). The new root PULLS instead of waiting to be
+  // found: PULLUP(sinceHw:0) to the K-closest cohort plus the nodes on its own
+  // iterative lookup path (the runner-up closest is usually the prior root).
+  // Holders answer via the existing REPLAYUP → verified union-ingest (B-4
+  // re-verify, msgId dedup, tombstone suppression), so the pull is idempotent
+  // and needs no new wire verb. Quenches: probe only while empty, at most
+  // EMPTY_ROOT_PROBE_MAX times.
+  _scheduleEmptyRootProbe(topicBig) {
+    const h = setTimeout(() => {
+      this._burstTimers.delete(h);
+      this._emptyRootProbe(topicBig).catch(() => {});
+    }, EMPTY_ROOT_PROBE_DELAY_MS);
+    if (typeof h.unref === 'function') h.unref();
+    this._burstTimers.add(h);
+  },
+
+  async _emptyRootProbe(topicBig) {
+    const pre = this.axonRoles.get(topicBig);
+    if (!pre || !pre.isRoot || pre.cache.length) return;      // filled meanwhile / demoted / gone
+    if (pre.probeTries >= EMPTY_ROOT_PROBE_MAX) return;
+    pre.probeTries++; pre.probeAt = this._now();
+    // Candidates — two complementary views, both excluding self:
+    //  · local findKClosest: cheap, but a cold node's thin table may know nobody
+    //  · iterative lookup PATH: the traversal's hops; its tail is the closest
+    //    node the network routed through before us = the likely prior holder
+    const cand = new Set();
+    if (typeof this.dht.findKClosest === 'function') {
+      try {
+        for (const id of (await this.dht.findKClosest(topicBig, EMPTY_ROOT_PROBE_FANOUT + 1)) || []) {
+          let b; try { b = idBig(id); } catch { continue; }
+          if (b !== this.nodeId) cand.add(b);
+        }
+      } catch { /* thin table — the lookup path below still applies */ }
+    }
+    if (typeof this.dht.lookup === 'function') {
+      try {
+        const r = await this.dht.lookup(topicBig);
+        for (const id of (r && Array.isArray(r.path) ? r.path : [])) {
+          let b; try { b = idBig(id); } catch { continue; }
+          if (b !== this.nodeId) cand.add(b);
+        }
+      } catch { /* best-effort */ }
+    }
+    // Re-check after the awaits: a REPLAYUP/HANDOFF may have landed meanwhile.
+    const role = this.axonRoles.get(topicBig);
+    if (!role || !role.isRoot || role.cache.length || !cand.size) return;
+    let n = 0;
+    for (const b of cand) {
+      if (n >= EMPTY_ROOT_PROBE_FANOUT) break;
+      try {
+        this._route(b, T.PULLUP, { topicId: idHex(topicBig), sinceHw: 0, parentId: idHex(this.nodeId) });
+        n++;
+      } catch { /* best-effort */ }
+    }
+    if (n) this._log('info', 'empty-root-probe',
+      { topic: idHex(topicBig).slice(0, 12), fanout: n, tries: role.probeTries });
   },
 
   // Replicate a root's full cache+tombstones to its K-closest COHORT — the set a
@@ -340,52 +422,84 @@ export const repairPlaneMethods = {
   // live node) so the history isn't lost when we go. Best-effort; never throws.
   async pubsubLeaveHandoff() {
     if (typeof this.dht.findKClosest !== 'function') return;
-    // PARALLEL with bounded concurrency. This used to be one topic at a time —
-    // one iterative network lookup each — so a burst publisher that had rooted
-    // a few dozen fresh topics (field case: an alert bot left holding 25 roots)
-    // could not finish inside leave()'s time bound, and every topic past the
-    // cutoff died with the departing node (its subscribers replayed nothing).
-    // Eight lookups in flight turns 25 sequential round-trips into ~3 rounds.
+    const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+    this._handoffAcked = new Set();
+
+    // Phase A — resolve heirs, PARALLEL with bounded concurrency. This used to
+    // be one topic at a time — one iterative network lookup each — so a burst
+    // publisher that had rooted a few dozen fresh topics (field case: an alert
+    // bot left holding 25 roots) could not finish inside leave()'s time bound,
+    // and every topic past the cutoff died with the departing node. Eight
+    // lookups in flight turns 25 sequential round-trips into ~3 rounds.
     const jobs = [];
     for (const [t, role] of this.axonRoles) {
       if (!role.isRoot || !role.cache.length) continue;
-      jobs.push([t, role]);
+      jobs.push({ t, role, heir: null, key: lc(idHex(t)) });
     }
     let i = 0;
-    const worker = async () => {
+    const resolver = async () => {
       while (i < jobs.length) {
-        const [t, role] = jobs[i++];
-        let heir = null;
+        const job = jobs[i++];
         try {
-          const arr = await this.dht.findKClosest(t, 3);
+          const arr = await this.dht.findKClosest(job.t, 3);
           for (const id of (Array.isArray(arr) ? arr : [])) {
             const b = idBig(id);
-            if (b !== this.nodeId) { heir = b; break; }   // closest node that isn't us
+            if (b !== this.nodeId) { job.heir = b; break; }   // closest node that isn't us
           }
         } catch { /* fall through to the iterative probe */ }
         // findKClosest is LOCAL-only; a leaver with a thin table (fresh burst
         // publisher) can see nobody but itself even though the network is
         // populated. Mirror _rootHint_'s self-closest escape: probe with the
         // ITERATIVE lookup before giving up on the topic's history.
-        if (heir === null && typeof this.dht.lookup === 'function') {
+        if (job.heir === null && typeof this.dht.lookup === 'function') {
           try {
-            const r = await this.dht.lookup(t);
+            const r = await this.dht.lookup(job.t);
             const id = (r && Array.isArray(r.path) && r.path.length) ? r.path[r.path.length - 1] : null;
-            if (id != null) { const b = idBig(id); if (b !== this.nodeId) heir = b; }
-          } catch { /* no heir resolvable → nothing we can do */ }
+            if (id != null) { const b = idBig(id); if (b !== this.nodeId) job.heir = b; }
+          } catch { /* no heir resolvable → the cohort spray below still fires */ }
         }
-        if (heir === null) continue;
-        const msgs = role.cache.map(c => ({ json: c.json, publishTs: c.publishTs, msgId: c.msgId, seq: c.seq }));
-        const dels = this._activeDels(role);
-        // `from` names the DEPARTING root so the heir can (a) purge our stale
-        // root beacon and (b) never defer its new claim back to us — without
-        // it, the heir adopted the history and then immediately demoted toward
-        // our still-fresh beacon, undoing the handoff (reproduced: a fresh
-        // subscriber replayed 0 after a burst publisher left).
-        try { this._route(heir, T.HANDOFF, { topicId: idHex(t), msgs, dels, from: idHex(this.nodeId) }); } catch { /* best-effort */ }
       }
     };
-    await Promise.all(Array.from({ length: Math.min(8, jobs.length) }, worker));
+    await Promise.all(Array.from({ length: Math.min(8, jobs.length) }, resolver));
+
+    // Phase B — CONFIRMED handoff (v4.24.0), batch-phased. The old single
+    // fire-and-forget _route silently transferred nothing whenever delivery
+    // failed or no heir was resolvable (diagnosis: gone=40/40 at leaveMs≈11ms —
+    // a confirmation failure, not a window failure). Send a whole ROUND to
+    // every unacked heir, then wait ONE shared ack window (early-exit as acks
+    // land), then retry the stragglers — total added latency is bounded by
+    // ~HANDOFF_TRIES×HANDOFF_ACK_MS regardless of topic count, preserving the
+    // parallelism that phase A bought.
+    //
+    // `from` names the DEPARTING root so the heir can (a) purge our stale root
+    // beacon and (b) never defer its new claim back to us — without it, the
+    // heir adopted the history and then immediately demoted toward our
+    // still-fresh beacon, undoing the handoff.
+    const sendable = jobs.filter(j => j.heir !== null);
+    const unacked = () => sendable.filter(j => !this._handoffAcked.has(j.key));
+    for (let round = 0; round < HANDOFF_TRIES && unacked().length; round++) {
+      for (const j of unacked()) {
+        const msgs = j.role.cache.map(c => ({ json: c.json, publishTs: c.publishTs, msgId: c.msgId, seq: c.seq }));
+        const dels = this._activeDels(j.role);
+        try { this._route(j.heir, T.HANDOFF, { topicId: idHex(j.t), msgs, dels, from: idHex(this.nodeId) }); } catch { /* best-effort */ }
+      }
+      const deadline = Date.now() + HANDOFF_ACK_MS;
+      while (Date.now() < deadline && unacked().length) await sleep(25);
+    }
+
+    // Phase C — durability fallback: any topic still unacked (including the
+    // heirless) gets its cache+tombstones sprayed to the K-closest cohort as
+    // REPLICATE — idempotent (backups store it, co-hosting roots union-ingest
+    // it), so SOMETHING durable holds the history even when the heir path fails.
+    const leftovers = jobs.filter(j => !this._handoffAcked.has(j.key));
+    if (leftovers.length) {
+      const bridge = (typeof this.dht.bridgeId === 'function') ? this.dht.bridgeId() : null;
+      await Promise.all(leftovers.map((j) => {
+        this._log('warn', 'handoff-unacked',
+          { topic: idHex(j.t).slice(0, 12), heir: j.heir === null ? 'none' : idHex(j.heir).slice(0, 10) });
+        return this._replicateRole(j.t, j.role, bridge, this._now()).catch(() => {});
+      }));
+    }
   },
 
   // ── lifecycle: renewal + eviction + TTL sweep ────────────────────────

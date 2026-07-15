@@ -33,6 +33,7 @@ export const wireHandlersMethods = {
     on(T.DELIVER,  this._onDeliver);
     on(T.ADOPT,    this._onAdopt);
     on(T.PULLUP,   this._onPullUp);
+    on(T.HANDOFFACK, this._onHandoffAck);
     on(T.REPLAYUP, this._onReplayUp);
     on(T.HANDOFF,  this._onHandoff);
     on(T.REPLICATE, this._onReplicate);
@@ -398,6 +399,20 @@ export const wireHandlersMethods = {
     // state machine (rootClaim.handoffArrived).
     const leaver = typeof payload.from === 'string' ? lc(payload.from) : null;
     this._rootClaim.handoffArrived(topicBig, leaver);
+    // Confirm receipt (v4.24.0): the leaver retries / cohort-sprays topics it
+    // never hears an ack for — the old fire-and-forget silently dropped the
+    // topic's last copy whenever this HANDOFF didn't land.
+    if (leaver && isHexId(leaver)) {
+      try { this._route(idBig(leaver), T.HANDOFFACK, { topicId: payload.topicId }); } catch { /* best-effort */ }
+    }
+    return 'consumed';
+  },
+
+  // Leaver side of the confirmed handoff: mark the topic acked so the
+  // pubsubLeaveHandoff retry loop stops and skips the cohort-spray fallback.
+  _onHandoffAck(payload, meta) {
+    if (meta.targetId !== this.nodeId) return;
+    if (typeof payload.topicId === 'string') this._handoffAcked?.add(lc(payload.topicId));
     return 'consumed';
   },
 

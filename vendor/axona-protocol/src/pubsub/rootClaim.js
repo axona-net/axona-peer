@@ -54,6 +54,8 @@ export function makeRole(topicId, isRoot) {
     pulledLw: new Map(),             // subHex -> lowest lw already PULLUP'd from that child (4.22.1:
                                      // a refused pull — e.g. the child's oldest is tombstoned here —
                                      // must not re-fire on every renewal; re-arm only if lw DECREASES)
+    probeTries: 0,                   // empty-self-root cohort pulls fired (v4.24.0; quenches at EMPTY_ROOT_PROBE_MAX)
+    probeAt: 0,                      // _now() of the last cohort pull (rate-limits the refreshTick re-probe)
     replicas: new Map(),             // (when ROOT) backupHex -> { at }  nodes holding a warm copy of our cache
     backupOf: null,                  // (when BACKUP) hex of the root replicating to us; null if we're not a backup
     lastReplicaAt: 0,                // (when BACKUP) _now() of the last replica push from our root (staleness → presume root gone)
@@ -154,6 +156,12 @@ export class RootClaim {
     m._log('info', 'root-formed', { topic: idHex(topicBig).slice(0, 12) });
     m._log('info', 'root-transition', { topic: idHex(topicBig).slice(0, 12), isRoot: true, why, born: true });
     m._announceRoot(topicBig);
+    // Empty-self-root cohort pull (v4.24.0): a root born with no history must
+    // PULL from whoever holds it — nothing reliably tells the holder about a
+    // new closer root (the alert-bot read-miss mechanism: reader isRoot,
+    // cacheSize:0, sticky). Delayed: a pub-terminal root's own publish fills
+    // the cache before the probe fires, so a genuinely-fresh topic stays quiet.
+    m._scheduleEmptyRootProbe?.(topicBig);
     return role;
   }
 

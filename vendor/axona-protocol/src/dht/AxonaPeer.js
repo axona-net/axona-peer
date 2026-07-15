@@ -1037,8 +1037,24 @@ export class AxonaPeer extends DHT {
     // previously required long app-side sleeps to behave.
     if (drain && timeoutMs > 0 && am) {
       const deadline = Date.now() + timeoutMs;
-      while (Date.now() < deadline
-             && ((am._pendingPub?.size ?? 0) > 0 || (am._pendingKill?.size ?? 0) > 0)) {
+      // Drain on EVIDENCE: while confirmations are still arriving (the pending
+      // set is SHRINKING) keep waiting, up to the full window. But a non-root,
+      // non-subscribed publisher never locally observes its own msgIds, so its
+      // pending set only clears on the ~30-40s retry TTL — for that publisher
+      // the set stalls immediately and waiting the full window is pure dead time
+      // (field: alert-bot, ~90 topics published then leave, pinned leaveMs at
+      // ~5040ms). So ALSO exit once the set stops shrinking for STALL_MS: no
+      // progress means no confirmation is coming and the first sends have had
+      // time to land. Any confirmation still in flight resets the stall clock,
+      // so a genuinely-draining publisher is unaffected.
+      const STALL_MS = 1500;
+      const pending = () => (am._pendingPub?.size ?? 0) + (am._pendingKill?.size ?? 0);
+      let prev = Infinity, lastProgressAt = Date.now();
+      while (Date.now() < deadline) {
+        const size = pending();
+        if (size === 0) break;                                   // fully confirmed → leave at once
+        if (size < prev) { prev = size; lastProgressAt = Date.now(); }   // progress → reset stall clock
+        else if (Date.now() - lastProgressAt >= STALL_MS) break;  // no confirmations coming → stop waiting
         await sleep(100);
       }
     }

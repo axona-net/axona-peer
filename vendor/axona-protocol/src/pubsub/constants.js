@@ -165,4 +165,30 @@ export const T = {
   ROOTBEACON: 'pubsub:rootbeacon', // soft-state root advertisement to the topic's neighborhood
   REPLICATE: 'pubsub:replicate', // singleton-root durability: root pushes cache+tombstones to its N nearest neighbours (warm backup roots)
   METRICSON: 'pubsub:metricson', // demand-driven metrics: routed toward the topic id like SUB; marks the path + root so ANY root publishes snapshots while the lease is fresh
+  HANDOFFACK: 'pubsub:handoffack', // heir confirms a HANDOFF landed (v4.24.0) — the leaver retries / cohort-sprays unacked topics instead of silently dropping the last copy
 };
+
+// ── Empty-self-root cohort pull (v4.24.0 — the alert-bot read-miss fix) ──────
+// A cold subscriber whose SUB terminates at itself becomes the topic's root with
+// an EMPTY cache while a live holder (ex-root / backup / host) still has the
+// history — and nothing tells the holder about the new closer root, so the
+// state is STICKY (field: 82% of misses, unrecovered at 600s). The new root
+// therefore PULLS: probe the K-closest cohort + the nodes on its own iterative
+// lookup path (the runner-up closest is usually the prior root) with a
+// PULLUP(sinceHw:0); any holder replays via the existing REPLAYUP → verified
+// union-ingest. Delayed so a pub-terminal root (whose own publish fills the
+// cache immediately) never probes; bounded tries so a genuinely-fresh topic
+// quenches after finding nobody.
+export const EMPTY_ROOT_PROBE_DELAY_MS    = 800;    // wait before first probe (skip if cache filled)
+export const EMPTY_ROOT_PROBE_MAX         = 3;      // total probes per role while empty
+export const EMPTY_ROOT_PROBE_INTERVAL_MS = 5_000;  // min gap between probes (via refreshTick)
+export const EMPTY_ROOT_PROBE_FANOUT      = 4;      // candidates contacted per probe
+
+// ── Leave-handoff confirmation (v4.24.0) ─────────────────────────────────────
+// The graceful-leave HANDOFF was fire-and-forget: a failed heir delivery
+// silently transferred nothing (diagnosis: gone=40/40 with leaveMs≈11ms — a
+// CONFIRMATION failure, not a window failure). The leaver now waits briefly for
+// HANDOFFACK, retries once, and finally sprays the cache to the K-closest
+// cohort as REPLICATE (idempotent; backups store it, roots union-ingest it).
+export const HANDOFF_ACK_MS  = 700;   // per-attempt ack wait
+export const HANDOFF_TRIES   = 2;     // sends before falling back to cohort spray

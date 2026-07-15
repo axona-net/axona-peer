@@ -10,6 +10,7 @@
 // =====================================================================
 
 import { geoCellId }        from '../utils/s2.js';
+import { canonicalRegion }  from '../utils/region-names.js';
 import { assembleId, toHex, HASH_MASK } from '../utils/hexid.js';
 
 /**
@@ -24,7 +25,9 @@ export async function computeNodeIdBigInt(pubkeyBytes, lat, lng) {
   if (!(pubkeyBytes instanceof Uint8Array) || pubkeyBytes.length !== 32) {
     throw new TypeError('computeNodeIdBigInt: pubkeyBytes must be 32-byte Uint8Array');
   }
-  const s2Prefix = geoCellId(lat, lng, 8);
+  // Fold the raw cell to its canonical major so a node in open ocean / a sparse
+  // cell claims a real, populated region — never a hotspot-prone empty cell.
+  const s2Prefix = canonicalRegion(geoCellId(lat, lng, 8));
   const buf      = await crypto.subtle.digest('SHA-256', pubkeyBytes);
   const hashHex  = bytesToHex(new Uint8Array(buf));
   // Mask to the active hash width: full 256 bits in production, truncated in a
