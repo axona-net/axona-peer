@@ -51,14 +51,21 @@ export function makeRole(topicId, isRoot) {
                                      // publishTs (which is monotonic but sparse). Recovered to the
                                      // max seen seq on replay-up/handoff so a new root continues densely.
     tombstones: new Map(),           // msgId -> { exp, killTs, signer, seq }  (kill; thin)
-    pulledLw: new Map(),             // subHex -> lowest lw already PULLUP'd from that child (4.22.1:
+    // The per-topic CONVERGENCE LEDGER (v4.25.0, Phase 6): every guard the data
+    // plane keeps about "what have I already exchanged, with whom" lives here —
+    // one place, engine semantics (per-pair memory + quench), the seed of the
+    // Phase-8 sync engine. Fields were previously scattered as five role-level
+    // properties; the 4.22.0 lw-pull storm lived in exactly this kind of guard.
+    sync: {
+      sig: '',                       // (when ROOT) state signature at the last FULL replica push (4.24.1 delta gate)
+      lastFullAt: 0,                 // (when ROOT) _now() of the last FULL push (backstop re-arms at ROOT_REPLICATE_FULL_MS)
+      probeTries: 0,                 // empty-self-root cohort pulls fired (4.24.0; quenches at EMPTY_ROOT_PROBE_MAX)
+      probeAt: 0,                    // _now() of the last cohort pull (rate-limits the refreshTick re-probe)
+      pulledLw: new Map(),           // subHex -> lowest lw already PULLUP'd from that child (4.22.1:
                                      // a refused pull — e.g. the child's oldest is tombstoned here —
                                      // must not re-fire on every renewal; re-arm only if lw DECREASES)
-    probeTries: 0,                   // empty-self-root cohort pulls fired (v4.24.0; quenches at EMPTY_ROOT_PROBE_MAX)
-    probeAt: 0,                      // _now() of the last cohort pull (rate-limits the refreshTick re-probe)
+    },
     replicas: new Map(),             // (when ROOT) backupHex -> { at }  nodes holding a warm copy of our cache
-    replSig: '',                     // (when ROOT) state signature at the last FULL replica push (v4.24.1 delta gate)
-    replLastFull: 0,                 // (when ROOT) _now() of the last FULL push (anti-entropy backstop re-arms at ROOT_REPLICATE_FULL_MS)
     backupOf: null,                  // (when BACKUP) hex of the root replicating to us; null if we're not a backup
     lastReplicaAt: 0,                // (when BACKUP) _now() of the last replica push from our root (staleness → presume root gone)
     metricsOn: 0,                    // (when ROOT) lease expiry ts; while > now, this root publishes snapshots to metricTopic(T)

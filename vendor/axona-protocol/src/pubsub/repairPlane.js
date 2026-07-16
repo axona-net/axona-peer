@@ -145,7 +145,7 @@ export const repairPlaneMethods = {
     //    that is empty and not locally needed.
     for (const [t, role] of this.axonRoles) {
       for (const [subHex, sub] of role.subscribers) {
-        if (now - sub.lastRenewed > this.dropMs) { role.subscribers.delete(subHex); role.children.delete(subHex); role.pulledLw?.delete(subHex); }
+        if (now - sub.lastRenewed > this.dropMs) { role.subscribers.delete(subHex); role.children.delete(subHex); role.sync.pulledLw.delete(subHex); }
       }
       for (const [msgId, t] of role.tombstones) if ((t?.exp ?? 0) <= now) role.tombstones.delete(msgId);
       this._expireCache(role, now);
@@ -219,8 +219,8 @@ export const repairPlaneMethods = {
   _emptyRootProbeSweep(now) {
     for (const [t, role] of this.axonRoles) {
       if (!role.isRoot || role.cache.length) continue;
-      if (role.probeTries >= EMPTY_ROOT_PROBE_MAX) continue;
-      if (now - role.probeAt < EMPTY_ROOT_PROBE_INTERVAL_MS) continue;
+      if (role.sync.probeTries >= EMPTY_ROOT_PROBE_MAX) continue;
+      if (now - role.sync.probeAt < EMPTY_ROOT_PROBE_INTERVAL_MS) continue;
       this._emptyRootProbe(t).catch(() => {});
     }
   },
@@ -249,8 +249,8 @@ export const repairPlaneMethods = {
   async _emptyRootProbe(topicBig) {
     const pre = this.axonRoles.get(topicBig);
     if (!pre || !pre.isRoot || pre.cache.length) return;      // filled meanwhile / demoted / gone
-    if (pre.probeTries >= EMPTY_ROOT_PROBE_MAX) return;
-    pre.probeTries++; pre.probeAt = this._now();
+    if (pre.sync.probeTries >= EMPTY_ROOT_PROBE_MAX) return;
+    pre.sync.probeTries++; pre.sync.probeAt = this._now();
     // Candidates — two complementary views, both excluding self:
     //  · local findKClosest: cheap, but a cold node's thin table may know nobody
     //  · iterative lookup PATH: the traversal's hops; its tail is the closest
@@ -285,7 +285,7 @@ export const repairPlaneMethods = {
       } catch { /* best-effort */ }
     }
     if (n) this._log('info', 'empty-root-probe',
-      { topic: idHex(topicBig).slice(0, 12), fanout: n, tries: role.probeTries });
+      { topic: idHex(topicBig).slice(0, 12), fanout: n, tries: role.sync.probeTries });
   },
 
   // Replicate a root's full cache+tombstones to its K-closest COHORT — the set a
@@ -328,16 +328,16 @@ export const repairPlaneMethods = {
     // cheap and captures every convergence-relevant change (count, high-water,
     // tombstones); any union-ingest bumps it and re-arms one full push.
     const sig = `${role.cache.length}:${this._highWater(role)}:${role.tombstones.size}`;
-    const full = sig !== role.replSig
+    const full = sig !== role.sync.sig
       || want.some((hex) => !role.replicas.has(hex))
-      || (now - (role.replLastFull || 0)) >= ROOT_REPLICATE_FULL_MS;
+      || (now - (role.sync.lastFullAt || 0)) >= ROOT_REPLICATE_FULL_MS;
     const msgs = full ? role.cache.map(c => ({ json: c.json, publishTs: c.publishTs, msgId: c.msgId, seq: c.seq })) : [];
     const dels = full ? this._activeDels(role) : [];
     for (const hex of want) {
       try { this._route(idBig(hex), T.REPLICATE, { topicId: idHex(t), from: idHex(this.nodeId), msgs, dels }); } catch { /* best-effort */ }
       role.replicas.set(hex, { at: now });
     }
-    if (full) { role.replSig = sig; role.replLastFull = now; }
+    if (full) { role.sync.sig = sig; role.sync.lastFullAt = now; }
   },
 
   _nearestReachable(tBig, n, bridge) {
@@ -352,31 +352,45 @@ export const repairPlaneMethods = {
     return cand.slice(0, n).map(b => lc(idHex(b)));
   },
 
-  // Re-send the SAME pending envelope a few times over the first ~second. Each tick
-  // re-resolves the root hint (the background lookup that nudges integration) and
-  // stops early the moment the publish is confirmed/expired (_pendingPub no longer
-  // holds this msgId). Idempotent end-to-end: the root dedups by msgId.
-  _coldPublishBurst(topicBig, msgId) {
-    const total = COLD_BURST_TRIES + COLD_BURST_SLOW_TRIES;
+  // ── The EARLY-RESEND PUMP (v4.25.0, Phase 6 consolidation) ──────────────
+  // One implementation for every sub-tick publish re-send. Before this there
+  // were two mechanisms with identical quench and idempotence but separate
+  // timer plumbing: the cold-publish burst and the warm first-publish resend.
+  // A publish now registers ONE plan (a list of inter-send gaps, chosen by
+  // _earlyResendPlan at pubsubPublish) and this pump walks it with a single
+  // chained timer, re-resolving the root hint each step (the background
+  // lookup that nudges integration) and stopping the moment the pending entry
+  // vanishes (confirmed by observation, I-9, or aged out). The tick's coarse
+  // retry (refreshTick 1c) is the third leg of the same policy: same map,
+  // same quench, tries/TTL bounded there. Idempotent end-to-end: roots dedup
+  // by msgId.
+  _earlyResendPlan(cold, firstPublish) {
+    if (cold) return [
+      // fast wave (~1s) while the table warms, then a slower wave (~2s more)
+      // keeps re-shooting at the true root as integration continues
+      ...Array(COLD_BURST_TRIES).fill(COLD_BURST_INTERVAL_MS),
+      ...Array(COLD_BURST_SLOW_TRIES).fill(COLD_BURST_SLOW_INTERVAL_MS),
+    ];
+    if (firstPublish) return [FIRST_PUBLISH_RESEND_MS];  // catch a tree formed microseconds before
+    return [];
+  },
+
+  _earlyResendPump(topicBig, msgId, gaps) {
     let i = 0;
-    const schedule = () => {
-      // Two phases: a fast wave (COLD_BURST_TRIES × 200ms ≈ 1s) front-loads re-sends
-      // while the table warms, then a slower wave (COLD_BURST_SLOW_TRIES × 400ms ≈ 2s
-      // more) keeps re-shooting at the true root as integration continues past the
-      // first second. Idempotent throughout (the root dedups by msgId).
-      const delay = (i < COLD_BURST_TRIES) ? COLD_BURST_INTERVAL_MS : COLD_BURST_SLOW_INTERVAL_MS;
+    const step = () => {
+      if (i >= gaps.length) return;
       const h = setTimeout(() => {
         this._burstTimers.delete(h);
         const p = this._pendingPub?.get(msgId);
-        if (!p) return;                                 // confirmed or aged out → done
+        if (!p) return;                                 // confirmed or aged out → quench
         const hint = this._rootHint_(topicBig);
         this._send(T.PUB, { topicId: idHex(topicBig), via: hint ? [hint] : [], json: p.json });
-        if (++i < total) schedule();
-      }, delay);
+        i++; step();
+      }, gaps[i]);
       if (typeof h.unref === 'function') h.unref();
       this._burstTimers.add(h);
     };
-    schedule();
+    step();
   },
 
   // "Cold" = this node hasn't accreted enough neighbours to route reliably to an

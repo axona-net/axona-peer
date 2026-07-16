@@ -133,9 +133,9 @@ export const wireHandlersMethods = {
     if (Number.isFinite(payload.hw) && payload.hw > myHw) {
       this._route(idBig(subHex), T.PULLUP, { topicId: idHex(topicBig), sinceHw: myHw, parentId: idHex(this.nodeId) });
     } else if (Number.isFinite(payload.lw) && payload.lw > 0 && role.cache.length && payload.lw < this._lowWater(role)) {
-      const prev = role.pulledLw.get(subHex);
+      const prev = role.sync.pulledLw.get(subHex);
       if (prev === undefined || payload.lw < prev) {
-        role.pulledLw.set(subHex, payload.lw);
+        role.sync.pulledLw.set(subHex, payload.lw);
         this._route(idBig(subHex), T.PULLUP, { topicId: idHex(topicBig), sinceHw: 0, parentId: idHex(this.nodeId) });
       }
     }
@@ -149,7 +149,7 @@ export const wireHandlersMethods = {
     if (d === 'reject') return 'consumed';   // out-of-region terminus: topic's region has no node → don't root/seat/store here
     if (d === 'reroute') { this._reroute(T.UNSUB, payload); return 'consumed'; }
     const role = this.axonRoles.get(idBig(payload.topicId));
-    if (role) { const s = lc(payload.subscriberId); role.subscribers.delete(s); role.children.delete(s); role.pulledLw?.delete(s); }
+    if (role) { const s = lc(payload.subscriberId); role.subscribers.delete(s); role.children.delete(s); role.sync.pulledLw.delete(s); }
     return 'consumed';
   },
 

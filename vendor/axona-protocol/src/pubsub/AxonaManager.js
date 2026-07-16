@@ -282,26 +282,16 @@ export class AxonaManager {
     let pmsgId = null; try { pmsgId = JSON.parse(json)?.msgId ?? null; } catch { /* opaque body */ }
     if (pmsgId) this._pendingPub.set(pmsgId, { topicBig: topicId, json, at: this._now(), tries: 0 });
     this._send(T.PUB, { topicId: idHex(topicId), via: hint ? [hint] : [], json });
-    // Cold-publish burst: if we're not yet integrated, front-load a wave of re-sends
-    // (see COLD_BURST_* above) — idempotent, and each send also integrates us.
-    const cold = this._isColdPublisher();
-    if (pmsgId && cold) this._coldPublishBurst(topicId, pmsgId);
-    // First publish to a topic, even when WARM: re-send once after a short beat so a
-    // just-formed tree still catches it. Cold publishers already re-send via the
-    // burst, so this only covers the warm first-publish. Tracked per topic —
-    // subsequent publishes to the same topic go back to a single send.
-    if (pmsgId && !cold && !this._publishedTopics.has(topicId)) {
-      const h = setTimeout(() => {
-        this._burstTimers.delete(h);
-        const p = this._pendingPub?.get(pmsgId);
-        if (!p) return;                                 // already confirmed/expired
-        const hint2 = this._rootHint_(topicId);
-        this._send(T.PUB, { topicId: idHex(topicId), via: hint2 ? [hint2] : [], json: p.json });
-      }, FIRST_PUBLISH_RESEND_MS);
-      if (typeof h.unref === 'function') h.unref();
-      this._burstTimers.add(h);
+    // Early re-sends — ONE plan, ONE pump (v4.25.0, Phase 6): a cold publisher
+    // (not yet integrated) front-loads burst waves while its table warms; a WARM
+    // first publish to a topic gets one quick re-send so a just-formed tree still
+    // catches it; subsequent warm publishes go back to a single send. Same quench
+    // as the tick retry: the pending entry vanishing on observation (I-9).
+    if (pmsgId) {
+      const gaps = this._earlyResendPlan(this._isColdPublisher(), !this._publishedTopics.has(topicId));
+      if (gaps.length) this._earlyResendPump(topicId, pmsgId, gaps);
+      this._publishedTopics.add(topicId);
     }
-    if (pmsgId) this._publishedTopics.add(topicId);
     return meta.postHash || '';
   }
 
