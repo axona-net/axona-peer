@@ -101,7 +101,7 @@ export const repairPlaneMethods = {
       const up = this._upstream.get(t);
       const rehomed = Array.isArray(up) && up.length > 0 && up[0] !== lc(idHex(this.nodeId)) && this._isReachableId(up[0]);
       if (rehomed && role.subscribers.size === 0 && (now - (role.lastReplicaAt || 0)) > BACKUP_EVICT_MS) {
-        this._backupTopics.delete(t); role.backupOf = null; continue;
+        this._rootClaim.retireBackup(t, role, 'rehomed-idle'); continue;
       }
       this._sendSubscribe(t);
     }

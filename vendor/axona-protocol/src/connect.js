@@ -94,6 +94,26 @@ export async function connect({
   //    this module stays importable in sim/server contexts.
   if (!transport) {
     if (!bridge) throw new TypeError("connect: pass { bridge: 'wss://…' } (or inject a transport)");
+    // Node has no WebRTC globals; the mesh reads globalThis.RTCPeerConnection
+    // at CONNECTION time, so without this the failure surfaced as a
+    // ReferenceError thrown inside the bridge's first relayed signal — which
+    // callers experienced as connect() "hanging at transport.start" (field
+    // incident, 2026-07-16). Polyfill up front from node-datachannel (the
+    // same stack the relay fleet runs), or fail HERE with instructions.
+    if (typeof globalThis.RTCPeerConnection === 'undefined' &&
+        typeof process !== 'undefined' && process.versions?.node) {
+      try {
+        const ndc = await import('node-datachannel/polyfill');
+        globalThis.RTCPeerConnection    ??= ndc.RTCPeerConnection;
+        globalThis.RTCSessionDescription ??= ndc.RTCSessionDescription;
+        globalThis.RTCIceCandidate       ??= ndc.RTCIceCandidate;
+      } catch {
+        throw new TypeError(
+          "connect: Node needs a WebRTC implementation for the peer mesh — " +
+          "run `npm install node-datachannel`, or set " +
+          "globalThis.RTCPeerConnection yourself before calling connect()");
+      }
+    }
     const { webTransport } = await import('./transport/web/index.js');
     transport = webTransport({ bridgeUrl: bridge, identity: nodeIdentity, ...web });
   }

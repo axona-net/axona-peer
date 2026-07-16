@@ -46,7 +46,7 @@
 // =====================================================================
 
 import { extractS2Prefix }   from '../utils/hexid.js';
-import { RootClaim }          from './rootClaim.js';
+import { RootClaim, roleNature } from './rootClaim.js';
 import { idHex, idBig, lc, isHexId } from './ids.js';
 import { isRegionLockEnforced as _regionLock,
          T, RENEW_MS, RENEW_FAST_MS, DROP_MS, ROOT_REPLICAS, CACHE_MAX,
@@ -222,6 +222,8 @@ export class AxonaManager {
       out.push({
         topicId: idHex(r.topicId),
         isRoot: !!r.isRoot,
+        nature: roleNature(r),                           // ROOT | BACKUP | CHILD (Phase 7; I-6)
+        holder: this._hostedTopics.has(r.topicId) || this.mySubscriptions.has(r.topicId),
         children: [...r.children],
         subscribers: r.subscribers.size,
         replayCacheSize: r.cache.length,

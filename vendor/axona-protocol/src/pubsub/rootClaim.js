@@ -34,6 +34,28 @@ const idHex = (big) => big.toString(16).padStart(66, '0');
 const idBig = asId;
 const lc    = (s) => String(s ?? '').toLowerCase();
 
+// ── Role NATURES (v4.26.0, Phase 7 of the v0.2 program) ────────────────────
+// A role acts in exactly one PRIMARY nature — ROOT, BACKUP, or CHILD — plus an
+// orthogonal HOLDER flag (hosted / app-subscribed retention). The natures are
+// DERIVED from the ground facts (isRoot, backupOf), never stored separately:
+// a stored copy would drift, and drift here is the #333 bug class (a BACKUP
+// whose principal was dead — a state nobody had modeled — self-perpetuated
+// into the backbone collapse). Each nature carries obligations and a named
+// eviction path; the table is normative in Axona-Architecture §VIII and
+// enforced by smoke_role_natures.mjs.
+//
+//   ROOT    stamps, beacons, verifies, replicates, serves    → demote / idle sweep
+//   BACKUP  holds warm copy; subscribes as election standby  → principal gone + re-homed + BACKUP_EVICT_MS
+//   CHILD   renews upstream, re-fans down once               → subscriber loss + idle sweep
+//   +HOLDER renews; advertises hw                            → unhost / unsub / TTL
+export const NATURES = Object.freeze(['root', 'backup', 'child']);
+
+export function roleNature(role) {
+  if (role.isRoot) return 'root';
+  if (role.backupOf !== null) return 'backup';
+  return 'child';
+}
+
 /** A relay's per-topic state (root or non-root child relay). */
 export function makeRole(topicId, isRoot) {
   return {
@@ -149,9 +171,48 @@ export class RootClaim {
   // The ONLY place role.isRoot changes. One structured log per flip.
   _set(role, isRoot, why, ctx = {}) {
     if (role.isRoot === isRoot) return;
+    // Nature hygiene (v4.26.0, Phase 7): a role flipping to ROOT sheds any
+    // BACKUP residue in the same transition. Before this, promote() left
+    // backupOf + the _backupTopics membership in place forever — a ROOT
+    // wearing BACKUP state, exactly the unmodeled-residue class the natures
+    // exist to make impossible. (If the root later demotes it re-enters
+    // BACKUP only through a fresh REPLICATE from the new live principal.)
+    if (isRoot && role.backupOf !== null) this.retireBackup(role.topicId, role, 'promoted');
     role.isRoot = isRoot;
     this.m._log('info', 'root-transition',
       { topic: idHex(role.topicId).slice(0, 12), isRoot, why, ...ctx });
+  }
+
+  // ── BACKUP nature transitions (v4.26.0, Phase 7) ──────────────────────────
+  // Every entry to / exit from the BACKUP nature passes through these two
+  // methods — the same single-transition-site discipline rootClaim gave
+  // isRoot in Phase 1, extended to the nature whose unmodeled residue caused
+  // #333. One structured `role-nature` log per genuine transition (a replica
+  // refresh from the SAME principal is bookkeeping, not a transition).
+  becomeBackup(topicBig, role, principalHex) {
+    const m = this.m;
+    const entering = role.backupOf === null;
+    const rePrincipaled = !entering && role.backupOf !== principalHex;
+    role.backupOf = principalHex;
+    role.lastReplicaAt = m._now();
+    m._backupTopics.add(topicBig);
+    if (entering || rePrincipaled) {
+      m._log('info', 'role-nature', {
+        topic: idHex(topicBig).slice(0, 12), nature: 'backup',
+        principal: String(principalHex).slice(0, 10),
+        why: entering ? 'replicate' : 're-principaled',
+      });
+    }
+  }
+
+  retireBackup(topicBig, role, why) {
+    const m = this.m;
+    if (role.backupOf === null && !m._backupTopics.has(topicBig)) return;
+    role.backupOf = null;
+    m._backupTopics.delete(topicBig);
+    m._log('info', 'role-nature', {
+      topic: idHex(topicBig).slice(0, 12), nature: role.isRoot ? 'root' : 'child', why,
+    });
   }
 
   // Create the role AS root — the routing-terminal fallback (the node closest

@@ -460,9 +460,7 @@ export const wireHandlersMethods = {
     else if (meta.fromId != null) { try { from = lc(idHex(idBig(meta.fromId))); } catch { /* */ } }
     let role = this.axonRoles.get(topicBig);
     if (!role) { role = makeRole(topicBig, false); this.axonRoles.set(topicBig, role); }
-    role.backupOf = from;
-    role.lastReplicaAt = this._now();
-    this._backupTopics.add(topicBig);                   // participate as a subscribing child relay (single-root election)
+    this._rootClaim.becomeBackup(topicBig, role, from);   // nature transition (subscribing child relay; single-root election)
     this._applyDels(role, topicBig, payload.dels);   // tombstones FIRST → a killed body in the same push is suppressed
     await this._ingestStampedBatch(role, payload.msgs);
     return 'consumed';
