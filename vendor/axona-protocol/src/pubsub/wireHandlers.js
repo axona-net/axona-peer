@@ -348,10 +348,25 @@ export const wireHandlersMethods = {
     const role = this.axonRoles.get(topicBig);
     if (!role) return 'consumed';
     this._applyDels(role, topicBig, payload.dels);   // tombstones FIRST → suppress any killed body in this batch
-    for (const m of (Array.isArray(payload.msgs) ? payload.msgs : [])) {
-      if (m && typeof m.json === 'string' && Number.isFinite(m.publishTs)) await this._ingestStamped(role, m);
-    }
+    await this._ingestStampedBatch(role, payload.msgs);
     return 'consumed';
+  },
+
+  // Bulk-ingest with a macrotask yield (v4.24.1, #333/#332): verifying hundreds
+  // of signatures in a microtask-chained await loop starves the macrotask queue —
+  // heartbeats/pings go unanswered and the node's mesh peers evict it mid-ingest
+  // (the join-storm collapse trigger: bulk role adoption → mass eviction →
+  // state=stale). Yielding every 16 messages lets liveness traffic interleave
+  // with history adoption; correctness is untouched (ingest is idempotent and
+  // order-independent under msgId dedup).
+  async _ingestStampedBatch(role, msgs) {
+    let n = 0;
+    for (const m of (Array.isArray(msgs) ? msgs : [])) {
+      if (m && typeof m.json === 'string' && Number.isFinite(m.publishTs)) await this._ingestStamped(role, m);
+      if ((++n & 15) === 0) {
+        await new Promise(r => (typeof setImmediate === 'function' ? setImmediate(r) : setTimeout(r, 0)));
+      }
+    }
   },
 
   async _ingestStamped(role, m) {
@@ -391,9 +406,7 @@ export const wireHandlersMethods = {
     // so we serve the inherited history; routing/beacons reconcile root-ness.
     const role = this.axonRoles.get(topicBig) || this._becomeRoot(topicBig, 'handoff-heir');
     this._applyDels(role, topicBig, payload.dels);   // inherit the heir's tombstones, not just its bodies
-    for (const m of (Array.isArray(payload.msgs) ? payload.msgs : [])) {
-      if (m && typeof m.json === 'string' && Number.isFinite(m.publishTs)) await this._ingestStamped(role, m);
-    }
+    await this._ingestStampedBatch(role, payload.msgs);
     // Departure rules — purge the leaver's ghost beacon, never defer back to
     // the leaver, yield only to a strictly-closer live root — live in the
     // state machine (rootClaim.handoffArrived).
@@ -438,9 +451,7 @@ export const wireHandlersMethods = {
       // re-verifies through _ingestStamped (dedup, tombstone-suppress,
       // fanout + app delivery heal attached subscribers in place).
       this._applyDels(mine, topicBig, payload.dels);
-      for (const m of (Array.isArray(payload.msgs) ? payload.msgs : [])) {
-        if (m && typeof m.json === 'string' && Number.isFinite(m.publishTs)) await this._ingestStamped(mine, m);
-      }
+      await this._ingestStampedBatch(mine, payload.msgs);
       return 'consumed';
     }
     if (!this._rootReplicas) return 'consumed';         // backup duty disabled on this node
@@ -453,9 +464,7 @@ export const wireHandlersMethods = {
     role.lastReplicaAt = this._now();
     this._backupTopics.add(topicBig);                   // participate as a subscribing child relay (single-root election)
     this._applyDels(role, topicBig, payload.dels);   // tombstones FIRST → a killed body in the same push is suppressed
-    for (const m of (Array.isArray(payload.msgs) ? payload.msgs : [])) {
-      if (m && typeof m.json === 'string' && Number.isFinite(m.publishTs)) await this._ingestStamped(role, m);
-    }
+    await this._ingestStampedBatch(role, payload.msgs);
     return 'consumed';
   },
 

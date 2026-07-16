@@ -19,6 +19,7 @@ import {
   METRICS_PUB_MS, METRICS_COALESCE_MS,
   EMPTY_ROOT_PROBE_DELAY_MS, EMPTY_ROOT_PROBE_MAX, EMPTY_ROOT_PROBE_INTERVAL_MS,
   EMPTY_ROOT_PROBE_FANOUT, HANDOFF_ACK_MS, HANDOFF_TRIES,
+  ROOT_REPLICATE_FULL_MS,
 } from './constants.js';
 import { idHex, idBig, lc, isHexId } from './ids.js';
 
@@ -319,12 +320,24 @@ export const repairPlaneMethods = {
     const wantSet = new Set(want);
     for (const hex of [...role.replicas.keys()]) if (!wantSet.has(hex)) role.replicas.delete(hex);   // retire those no longer in the cohort
     if (want.length === 0) return;
-    const msgs = role.cache.map(c => ({ json: c.json, publishTs: c.publishTs, msgId: c.msgId, seq: c.seq }));
-    const dels = this._activeDels(role);
+    // Delta gate (v4.24.1, #333): push the FULL state only when it changed, a
+    // new cohort member needs seeding, or the anti-entropy backstop elapsed —
+    // otherwise this tick's push is an empty KEEPALIVE (refreshes the backup's
+    // lastReplicaAt; empty ingest is a no-op). The per-tick full-cache re-send
+    // was the bandwidth fuel of the #332 role-bloat collapse. The signature is
+    // cheap and captures every convergence-relevant change (count, high-water,
+    // tombstones); any union-ingest bumps it and re-arms one full push.
+    const sig = `${role.cache.length}:${this._highWater(role)}:${role.tombstones.size}`;
+    const full = sig !== role.replSig
+      || want.some((hex) => !role.replicas.has(hex))
+      || (now - (role.replLastFull || 0)) >= ROOT_REPLICATE_FULL_MS;
+    const msgs = full ? role.cache.map(c => ({ json: c.json, publishTs: c.publishTs, msgId: c.msgId, seq: c.seq })) : [];
+    const dels = full ? this._activeDels(role) : [];
     for (const hex of want) {
       try { this._route(idBig(hex), T.REPLICATE, { topicId: idHex(t), from: idHex(this.nodeId), msgs, dels }); } catch { /* best-effort */ }
       role.replicas.set(hex, { at: now });
     }
+    if (full) { role.replSig = sig; role.replLastFull = now; }
   },
 
   _nearestReachable(tBig, n, bridge) {
@@ -434,17 +447,19 @@ export const repairPlaneMethods = {
     const jobs = [];
     for (const [t, role] of this.axonRoles) {
       if (!role.isRoot || !role.cache.length) continue;
-      jobs.push({ t, role, heir: null, key: lc(idHex(t)) });
+      jobs.push({ t, role, heir: null, alt: null, key: lc(idHex(t)) });
     }
     let i = 0;
     const resolver = async () => {
       while (i < jobs.length) {
         const job = jobs[i++];
         try {
-          const arr = await this.dht.findKClosest(job.t, 3);
+          const arr = await this.dht.findKClosest(job.t, 4);
           for (const id of (Array.isArray(arr) ? arr : [])) {
             const b = idBig(id);
-            if (b !== this.nodeId) { job.heir = b; break; }   // closest node that isn't us
+            if (b === this.nodeId) continue;
+            if (job.heir === null) job.heir = b;              // closest node that isn't us
+            else if (b !== job.heir) { job.alt = b; break; }  // runner-up — the Phase C fallback target
           }
         } catch { /* fall through to the iterative probe */ }
         // findKClosest is LOCAL-only; a leaver with a thin table (fresh burst
@@ -487,18 +502,34 @@ export const repairPlaneMethods = {
       while (Date.now() < deadline && unacked().length) await sleep(25);
     }
 
-    // Phase C — durability fallback: any topic still unacked (including the
-    // heirless) gets its cache+tombstones sprayed to the K-closest cohort as
-    // REPLICATE — idempotent (backups store it, co-hosting roots union-ingest
-    // it), so SOMETHING durable holds the history even when the heir path fails.
+    // Phase C — durability fallback (v4.24.1, #333). A departing node must
+    // NEVER send REPLICATE: 4.24.0 sprayed every unacked topic's cache to the
+    // K-closest cohort here, and each recipient became a BACKUP of a root that
+    // was — by definition — about to be gone. Those orphan backups re-subscribe
+    // toward the topic every tick; under load their SUBs strand into duplicate
+    // sub-terminal roots, every duplicate replicates its cache to ITS cohort,
+    // and the soak collapsed the backbone twice on exactly this loop (roles
+    // >2000 → ingest storms → heartbeat evictions → mesh death). And because
+    // the ack window is a race against load, "unacked" usually meant "acked
+    // late" — the spray fired for topics whose heir already held the history.
+    //
+    // The fallback is now a single extra HANDOFF to the runner-up candidate:
+    // the recipient adopts through the normal heir path (proper holder, purges
+    // our beacon, never defers back to us) and the worst case plants TWO
+    // holders that reconcile via union-ingest — the 4.22.1 footprint plus one
+    // alternative, instead of an unbounded backup cascade. Heirless AND
+    // alt-less topics get the honest warn (nothing routable exists to hold the
+    // history — same terminal case as 4.22.1).
     const leftovers = jobs.filter(j => !this._handoffAcked.has(j.key));
-    if (leftovers.length) {
-      const bridge = (typeof this.dht.bridgeId === 'function') ? this.dht.bridgeId() : null;
-      await Promise.all(leftovers.map((j) => {
-        this._log('warn', 'handoff-unacked',
-          { topic: idHex(j.t).slice(0, 12), heir: j.heir === null ? 'none' : idHex(j.heir).slice(0, 10) });
-        return this._replicateRole(j.t, j.role, bridge, this._now()).catch(() => {});
-      }));
+    for (const j of leftovers) {
+      const target = (j.alt !== null && j.alt !== j.heir) ? j.alt : j.heir;
+      this._log('warn', 'handoff-unacked',
+        { topic: idHex(j.t).slice(0, 12), heir: j.heir === null ? 'none' : idHex(j.heir).slice(0, 10),
+          fallback: target === null ? 'none' : idHex(target).slice(0, 10) });
+      if (target === null) continue;
+      const msgs = j.role.cache.map(c => ({ json: c.json, publishTs: c.publishTs, msgId: c.msgId, seq: c.seq }));
+      const dels = this._activeDels(j.role);
+      try { this._route(target, T.HANDOFF, { topicId: idHex(j.t), msgs, dels, from: idHex(this.nodeId) }); } catch { /* best-effort */ }
     }
   },
 

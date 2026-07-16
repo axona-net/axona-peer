@@ -57,6 +57,8 @@ export function makeRole(topicId, isRoot) {
     probeTries: 0,                   // empty-self-root cohort pulls fired (v4.24.0; quenches at EMPTY_ROOT_PROBE_MAX)
     probeAt: 0,                      // _now() of the last cohort pull (rate-limits the refreshTick re-probe)
     replicas: new Map(),             // (when ROOT) backupHex -> { at }  nodes holding a warm copy of our cache
+    replSig: '',                     // (when ROOT) state signature at the last FULL replica push (v4.24.1 delta gate)
+    replLastFull: 0,                 // (when ROOT) _now() of the last FULL push (anti-entropy backstop re-arms at ROOT_REPLICATE_FULL_MS)
     backupOf: null,                  // (when BACKUP) hex of the root replicating to us; null if we're not a backup
     lastReplicaAt: 0,                // (when BACKUP) _now() of the last replica push from our root (staleness → presume root gone)
     metricsOn: 0,                    // (when ROOT) lease expiry ts; while > now, this root publishes snapshots to metricTopic(T)

@@ -72,6 +72,18 @@ export const ROOT_REPLICAS   = 2;
 // this long (root departed & we've since re-homed/promoted, or the root retired us) is
 // dropped from _backupTopics as cleanup — never used to trigger promotion.
 export const BACKUP_EVICT_MS = 60_000;
+// Delta-aware replication (v4.24.1, task #333): the periodic _replicateRoots sweep
+// pushes a root's FULL cache+tombstones only when its state changed since the last
+// push, a new cohort member was recruited, or this anti-entropy backstop elapsed —
+// otherwise it sends an empty REPLICATE as a liveness KEEPALIVE (the recipient
+// refreshes lastReplicaAt; ingest of an empty batch is a no-op). Before this, every
+// root re-sent its entire cache to its whole cohort EVERY tick; during the 4.24.0
+// soak's root-transition storms that per-tick × per-role full-state traffic was the
+// bandwidth fuel of the role-bloat collapse (#332 feedback loop: 2.7 GB relay RSS,
+// >1M log lines/night). Convergence is unaffected: any divergence changes the
+// diverged root's own state signature and triggers one full push (union-ingest at
+// the receiving root), then quenches back to keepalives.
+export const ROOT_REPLICATE_FULL_MS = 60_000;
 
 // ── Cache / tree shape / wire sanity ────────────────────────────────────
 export const CACHE_MAX       = 1024;            // messages cached per relay
