@@ -84,6 +84,34 @@ export const BACKUP_EVICT_MS = 60_000;
 // diverged root's own state signature and triggers one full push (union-ingest at
 // the receiving root), then quenches back to keepalives.
 export const ROOT_REPLICATE_FULL_MS = 60_000;
+// ── Join-storm pacing (task #332, invariant I-11: bulk work never starves ──
+// liveness). Two failure facets, both live-reproduced on testnet 2026-07-17:
+// a node holding N roles that gains a new cohort member (a joining relay)
+// fires N full-state pushes at it within ONE tick, and the recipient's event
+// loop drowns in per-message signature verifies — its mesh keepalives miss,
+// peers evict it, and the mesh dissolves without self-healing.
+//
+// Sender leg: at most this many FULL replications per tick (round-robin cursor
+// across roles, so deferred roles are next tick's first served). Keepalives are
+// unbudgeted (empty, cheap). Seeding a newcomer into a 1,000-role region takes
+// ~1000/32 ≈ 31 ticks ≈ 2.6 min — degraded convergence instead of a dead relay.
+// Under sustained load the 60s anti-entropy backstop stretches proportionally;
+// that is I-11 working as intended, not a bug.
+export const REPLICATE_FULL_BUDGET = 32;
+// Receiver leg (defense in depth — also bounds a malicious flood): REPLICATE /
+// REPLAYUP ingest is queued and drained in time-boxed slices so verification
+// CPU can never monopolize the loop. Queue overflow drops the NEWEST payload
+// (logged); anti-entropy re-delivers within ROOT_REPLICATE_FULL_MS.
+export const INGEST_QUEUE_MAX = 4096;           // queued ingest payloads before overflow-drop
+export const INGEST_SLICE_MS  = 8;              // ingest CPU per slice; keeps ping RTT << mesh eviction timeout
+// Mesh re-warm (facet 2: relays never re-initiated their inter-mesh after a
+// mass departure — peers=1..2 forever, systemd-green but backbone-dead). If the
+// mesh stays below MIN for TICKS consecutive ticks, re-run self-integration
+// (findKClosest(self) + open channels — idempotent, never throws), at most once
+// per cooldown.
+export const MESH_REWARM_MIN         = 3;       // mesh peers below this = starved
+export const MESH_REWARM_TICKS       = 3;       // consecutive starved ticks before acting (~15s: outlasts a blip)
+export const MESH_REWARM_COOLDOWN_MS = 60_000;  // min gap between re-warm attempts (integration takes seconds)
 
 // ── Cache / tree shape / wire sanity ────────────────────────────────────
 export const CACHE_MAX       = 1024;            // messages cached per relay

@@ -2742,6 +2742,9 @@ export class AxonaPeer extends DHT {
       // exclude it from the reachable-closest test in its root-claim fallback, the
       // same way findKClosest/routeMessage already skip it.
       bridgeId: () => node.transport?.bridgeNodeIdBig ?? null,
+      // Mesh re-warm hook (task #332 facet 2): refreshTick calls this when the
+      // mesh stays starved — _selfIntegrate is idempotent and never throws.
+      reintegrate: () => peer._selfIntegrate().catch(() => 0),
       findKClosest: async (targetIdBig, K = 5) => {
         // AxonaManager now passes BigInt targetId; the adapter is
         // BigInt-throughout.  No hex conversion needed.

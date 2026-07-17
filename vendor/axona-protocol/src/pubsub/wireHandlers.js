@@ -342,14 +342,21 @@ export const wireHandlersMethods = {
   // Stamped history arriving from below — adopt it WITHOUT re-stamping (the
   // timestamp rule, §5: a timestamp already present is kept), advance lastTs so
   // new publishes continue monotonically above it, and propagate it down.
+  // Queued (task #332, I-11): the routing verdict ('consumed') is returned
+  // immediately; the verify-heavy body drains through the time-sliced ingest
+  // pump so a storm of pushes can't starve mesh liveness.
   async _onReplayUp(payload, meta) {
     if (meta.targetId !== this.nodeId) return;
+    await this._ingestEnqueue(() => this._processReplayUp(payload));   // inline path completes here; queued path returns at once
+    return 'consumed';
+  },
+
+  async _processReplayUp(payload) {
     const topicBig = idBig(payload.topicId);
     const role = this.axonRoles.get(topicBig);
-    if (!role) return 'consumed';
+    if (!role) return;
     this._applyDels(role, topicBig, payload.dels);   // tombstones FIRST → suppress any killed body in this batch
     await this._ingestStampedBatch(role, payload.msgs);
-    return 'consumed';
   },
 
   // Bulk-ingest with a macrotask yield (v4.24.1, #333/#332): verifying hundreds
@@ -437,9 +444,19 @@ export const wireHandlersMethods = {
   // ONE new root (the closest self-roots, we re-home under it) — no bespoke local-only
   // promotion to split. The prefetched cache makes whichever backup wins take over
   // gap-free (it already holds the history a since:'all' joiner will ask for).
+  // Queued (task #332, I-11): a joining relay receives its whole region's role
+  // mass as a burst of REPLICATEs; processed inline they starve the event loop
+  // (missed keepalives → mesh eviction → the join-storm collapse). The handler
+  // returns the routing verdict immediately and the body drains through the
+  // time-sliced pump. Role state is read at PROCESSING time, not arrival time.
   async _onReplicate(payload, meta) {
     if (meta.targetId !== this.nodeId) return;          // routed to me as the backup
-    let topicBig; try { topicBig = idBig(payload.topicId); } catch { return 'consumed'; }
+    await this._ingestEnqueue(() => this._processReplicate(payload, meta));   // inline path completes here; queued path returns at once
+    return 'consumed';
+  },
+
+  async _processReplicate(payload, meta) {
+    let topicBig; try { topicBig = idBig(payload.topicId); } catch { return; }
     const mine = this.axonRoles.get(topicBig);
     if (mine?.isRoot) {
       // UNION-INGEST at a root — the cohort anti-entropy contract _replicateRole
@@ -452,9 +469,9 @@ export const wireHandlersMethods = {
       // fanout + app delivery heal attached subscribers in place).
       this._applyDels(mine, topicBig, payload.dels);
       await this._ingestStampedBatch(mine, payload.msgs);
-      return 'consumed';
+      return;
     }
-    if (!this._rootReplicas) return 'consumed';         // backup duty disabled on this node
+    if (!this._rootReplicas) return;                    // backup duty disabled on this node
     let from = null;
     if (payload.from && isHexId(lc(payload.from))) from = lc(payload.from);
     else if (meta.fromId != null) { try { from = lc(idHex(idBig(meta.fromId))); } catch { /* */ } }
@@ -463,7 +480,6 @@ export const wireHandlersMethods = {
     this._rootClaim.becomeBackup(topicBig, role, from);   // nature transition (subscribing child relay; single-root election)
     this._applyDels(role, topicBig, payload.dels);   // tombstones FIRST → a killed body in the same push is suppressed
     await this._ingestStampedBatch(role, payload.msgs);
-    return 'consumed';
   },
 
   // ── DELIVER (parent → subscriber; a relay re-fans down the tree) ──────

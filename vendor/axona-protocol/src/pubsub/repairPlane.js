@@ -19,7 +19,8 @@ import {
   METRICS_PUB_MS, METRICS_COALESCE_MS,
   EMPTY_ROOT_PROBE_DELAY_MS, EMPTY_ROOT_PROBE_MAX, EMPTY_ROOT_PROBE_INTERVAL_MS,
   EMPTY_ROOT_PROBE_FANOUT, HANDOFF_ACK_MS, HANDOFF_TRIES,
-  ROOT_REPLICATE_FULL_MS,
+  ROOT_REPLICATE_FULL_MS, REPLICATE_FULL_BUDGET, INGEST_QUEUE_MAX,
+  INGEST_SLICE_MS, MESH_REWARM_MIN, MESH_REWARM_TICKS, MESH_REWARM_COOLDOWN_MS,
 } from './constants.js';
 import { idHex, idBig, lc, isHexId } from './ids.js';
 
@@ -187,6 +188,98 @@ export const repairPlaneMethods = {
     this._verifyRoots(now);   // root self-verification (non-blocking lookups; batched)
     for (const [t, b] of this._rootBeacons) if (b.exp <= now) this._rootBeacons.delete(t);
     for (const [id, exp] of this._beaconSeen) if (exp <= now) this._beaconSeen.delete(id);
+
+    // 4. Mesh re-warm (task #332 facet 2, I-11): a relay whose inter-mesh
+    //    dissolved (mass client departure; eviction during a historic ingest
+    //    stall) never re-initiated — peers=1..2 forever, process green while the
+    //    backbone is dead. If the mesh stays starved for MESH_REWARM_TICKS
+    //    consecutive ticks, re-run self-integration (findKClosest(self) + open
+    //    authenticated channels — idempotent, never throws), rate-limited by
+    //    the cooldown. Fire-and-forget: never await a lookup inside the tick
+    //    (the 4.18.1 lesson). No-op where the host peer injects no reintegrate
+    //    hook (sim engines, unit fixtures).
+    if (typeof this.dht.reintegrate === 'function' && typeof this.dht.neighbors === 'function') {
+      const meshN = (this.dht.neighbors() || []).length;
+      if (meshN < MESH_REWARM_MIN) {
+        this._meshStarvedTicks = (this._meshStarvedTicks || 0) + 1;
+        if (this._meshStarvedTicks >= MESH_REWARM_TICKS && now - (this._meshRewarmAt || 0) >= MESH_REWARM_COOLDOWN_MS) {
+          this._meshRewarmAt = now;
+          this._meshStarvedTicks = 0;
+          this._log('info', 'mesh-rewarm', { peers: meshN });
+          Promise.resolve(this.dht.reintegrate()).catch(() => {});
+        }
+      } else {
+        this._meshStarvedTicks = 0;
+      }
+    }
+  },
+
+  // ── Bounded, time-sliced ingest queue (task #332, I-11 — receiver leg) ────
+  // REPLICATE / REPLAYUP payload processing (per-message JSON parse + Ed25519
+  // verify) is queued here instead of running inline in the wire handler. The
+  // pump drains in INGEST_SLICE_MS slices with a macrotask yield between them,
+  // so a join-storm's (or an attacker's) burst of thousands of pushes can
+  // never monopolize the event loop — mesh keepalives keep their CPU share and
+  // the node stays alive while it converges. Overflow drops the NEWEST payload
+  // (logged, counted): both verbs are idempotent full-state pushes that
+  // anti-entropy re-delivers within ROOT_REPLICATE_FULL_MS, so a drop costs
+  // convergence latency, never durability. HANDOFF is deliberately NOT queued:
+  // its ack must mean "state actually held" (#331), and departures are rare.
+  // Hybrid: light traffic processes INLINE (the caller's await sees converged
+  // state — sim harnesses and ordinary operation keep synchronous semantics);
+  // once this macrotask's inline budget (INGEST_SLICE_MS) is spent, or a
+  // backlog exists, work spills to the queue. Either way, ingest CPU per
+  // macrotask turn is bounded.
+  async _ingestEnqueue(fn) {
+    const q = (this._ingestQueue ??= []);
+    // Inline is single-flight: a burst's SECOND arrival — landing while the
+    // first is still verifying — goes to the queue, which is exactly what
+    // distinguishes a storm from ordinary sequential traffic.
+    if (q.length === 0 && !this._ingestPumping && !this._ingestInlineActive) {
+      const nowMs = Date.now();
+      if (this._inlineSliceStart == null) {
+        this._inlineSliceStart = nowMs;
+        const clear = () => { this._inlineSliceStart = null; };
+        (typeof setImmediate === 'function' ? setImmediate(clear) : setTimeout(clear, 0));
+      }
+      if (nowMs - this._inlineSliceStart < INGEST_SLICE_MS) {
+        this._ingestInlineActive = true;
+        try { await fn(); } catch { /* ingest is best-effort; anti-entropy re-heals */ }
+        finally { this._ingestInlineActive = false; }
+        return;
+      }
+    }
+    if (q.length >= INGEST_QUEUE_MAX) {
+      this._ingestDropped = (this._ingestDropped || 0) + 1;
+      if ((this._ingestDropped & 255) === 1) this._log('warn', 'ingest-overflow', { dropped: this._ingestDropped, queued: q.length });
+      return;
+    }
+    q.push(fn);
+    if (!this._ingestPumping) { this._ingestPumping = true; this._ingestPump(); }
+  },
+
+  async _ingestPump() {
+    try {
+      const q = this._ingestQueue;
+      while (q.length) {
+        const t0 = Date.now();                       // wall clock: CPU slicing, not sim time
+        while (q.length && (Date.now() - t0) < INGEST_SLICE_MS) {
+          const fn = q.shift();
+          try { await fn(); } catch { /* ingest is best-effort; anti-entropy re-heals */ }
+        }
+        if (q.length) await new Promise(r => (typeof setImmediate === 'function' ? setImmediate(r) : setTimeout(r, 0)));
+      }
+    } finally {
+      this._ingestPumping = false;
+    }
+  },
+
+  // Resolves once every queued ingest has been processed — for tests and for
+  // teardown paths that must observe converged state ("flush the queue").
+  async _ingestIdle() {
+    while (this._ingestPumping || this._ingestInlineActive || (this._ingestQueue && this._ingestQueue.length)) {
+      await new Promise(r => (typeof setImmediate === 'function' ? setImmediate(r) : setTimeout(r, 0)));
+    }
   },
 
   // Replicate each SINGLETON root's cache to its N nearest neighbours as warm
@@ -203,10 +296,27 @@ export const repairPlaneMethods = {
     if (!this._rootReplicas) return;
     const bridge = (typeof this.dht.bridgeId === 'function') ? this.dht.bridgeId() : null;
     const now = this._now();
-    for (const [t, role] of this.axonRoles) {
-      if (!role.isRoot) continue;
-      this._replicateRole(t, role, bridge, now).catch(() => {});   // async (findKClosest); fire-and-forget
+    // Full-push budget + round-robin cursor (task #332, I-11): a node holding N
+    // roles that gains a new cohort member (a joining relay) would otherwise
+    // fire N full-state pushes at it within THIS one tick — the sender half of
+    // the join-storm. At most REPLICATE_FULL_BUDGET roles get a full push per
+    // tick; a role deferred by the budget is where the next tick's sweep starts
+    // (cursor), so seeding a newcomer spreads over ticks instead of drowning
+    // it. Keepalives are unbudgeted — empty and cheap.
+    const keys = [...this.axonRoles.keys()];
+    if (keys.length === 0) return;
+    const start = (this._replicateCursor ?? 0) % keys.length;
+    const budget = { left: REPLICATE_FULL_BUDGET, deferredAt: -1 };
+    for (let i = 0; i < keys.length; i++) {
+      const idx = (start + i) % keys.length;
+      const role = this.axonRoles.get(keys[idx]);
+      if (!role || !role.isRoot) continue;
+      this._replicateRole(keys[idx], role, bridge, now, budget, idx).catch(() => {});   // async (findKClosest); fire-and-forget
     }
+    // The first role the budget defers sets this._replicateCursor to its own
+    // index (inside _replicateRole — the decision happens after an await, so a
+    // synchronous readback here would always miss it). Next tick resumes there;
+    // the rotation is best-effort, correctness rides on the sync ledger.
   },
 
   // Empty-self-root re-probe sweep (v4.24.0): a root STILL empty at renewal
@@ -300,7 +410,7 @@ export const repairPlaneMethods = {
   // heartbeat + anti-entropy: co-hosting roots converge to the union of cache+tombstones,
   // and tombstones keep killed bodies suppressed. Called every tick AND eagerly the
   // instant a message is stamped or a kill lands, so no holder lags the cohort.
-  async _replicateRole(t, role, bridge, now) {
+  async _replicateRole(t, role, bridge, now, budget = null, idx = -1) {
     if (!this._rootReplicas || !role || !role.isRoot) return;
     if (role.cache.length === 0 && role.tombstones.size === 0) return;         // nothing to preserve yet
     let want;
@@ -331,6 +441,19 @@ export const repairPlaneMethods = {
     const full = sig !== role.sync.sig
       || want.some((hex) => !role.replicas.has(hex))
       || (now - (role.sync.lastFullAt || 0)) >= ROOT_REPLICATE_FULL_MS;
+    // Full-push budget (task #332, I-11): when the tick's budget is spent, a
+    // role needing a full push is DEFERRED whole — no sends, no ledger updates,
+    // so next tick re-decides identically and the cursor resumes here. Sending
+    // only the keepalive instead would mark a new cohort member as seeded
+    // without ever giving it the state. Deferral costs convergence latency,
+    // never correctness: the sync ledger still records nothing happened.
+    if (full && budget) {
+      if (budget.left <= 0) {
+        if (budget.deferredAt < 0) { budget.deferredAt = idx; this._replicateCursor = idx; }
+        return;
+      }
+      budget.left--;
+    }
     const msgs = full ? role.cache.map(c => ({ json: c.json, publishTs: c.publishTs, msgId: c.msgId, seq: c.seq })) : [];
     const dels = full ? this._activeDels(role) : [];
     for (const hex of want) {
