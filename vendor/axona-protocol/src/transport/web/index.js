@@ -896,6 +896,19 @@ export function webTransport({
         : null;
     },
   });
+  /**
+   * Ask the bridge to resend its admitted peer-list (task #332, facet 2).
+   * The join-time peer-list is a one-shot; a peer whose WebRTC mesh later
+   * dissolved has an empty routing table, so self-integration can't find
+   * anyone to dial. On the resent list, mesh.onPeerList re-initiates to
+   * every peer it lacks — the same path that formed the mesh at join.
+   * Rate-limit at the caller (the kernel's mesh-rewarm cooldown does).
+   * Returns true if the request was sent (bridge socket open).
+   */
+  composite.requestPeerIntroductions = () => {
+    try { sendToBridge({ type: 'peer-list-request' }); return true; }
+    catch { return false; }
+  };
   /** Subscribe to bridge-state transitions.  cb(state, detail). Returns unsub. */
   composite.onBridgeState = (cb) => {
     if (typeof cb !== 'function') throw new TypeError('onBridgeState: cb must be a function');
