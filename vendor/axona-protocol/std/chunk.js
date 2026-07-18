@@ -265,14 +265,25 @@ async function _cachedChunkSet(peer, topic, fileId, n, waitMs) {
  * the PUBLISH side by publishChunkedBytes's verify+repair — a reload subscriber
  * relies on every chunk being cached; the receiver cannot conjure a chunk the
  * mesh never stored.)
- * @returns {Promise<{ bytes, name, mime, size, meta, id }>}
+ *
+ * `msgIds` are the envelope ids of THIS file's messages (manifest + chunks) as
+ * observed up to completion — what a caller needs to peer.kill() the transfer
+ * later. The publisher's session has them from publishChunkedBytes, but the
+ * same author on another device/session does not; the subscribe side is its
+ * only source. Collected PER FILE ID: a topic commonly streams many files, and
+ * handing back another file's ids would let an app delete the wrong transfer.
+ * @returns {Promise<{ bytes, name, mime, size, meta, id, msgIds: string[] }>}
  */
 export async function receiveChunkedBytes(peer, topic, {
   timeoutMs = 30000, onProgress = null,
 } = {}) {
   return new Promise((resolve, reject) => {
     let settled = false, timer = null, handle = null;
-    const reassembler = createReassembler((file) => finish(null, file), { onProgress });
+    const msgIdsByFile = new Map();                       // fileId -> Set(envelope msgId)
+    const reassembler = createReassembler((file) => {
+      file.msgIds = Array.from(msgIdsByFile.get(file.id) ?? []);
+      finish(null, file);
+    }, { onProgress });
     const finish = async (err, file) => {
       if (settled) return; settled = true;
       if (timer) clearTimeout(timer);
@@ -287,7 +298,15 @@ export async function receiveChunkedBytes(peer, topic, {
     }, timeoutMs);
     peer.sub(topic, (envelope) => {
       if (!envelope || envelope.deleted) return;
-      reassembler.accept(envelope.message);
+      const m = envelope.message;
+      // Record BEFORE accept: accept() can complete the file synchronously, and
+      // the completing chunk's own msgId must be in the set it hands back.
+      if (envelope.msgId && m && m.f === CHUNK_FORMAT && typeof m.id === 'string') {
+        let ids = msgIdsByFile.get(m.id);
+        if (!ids) msgIdsByFile.set(m.id, ids = new Set());
+        ids.add(envelope.msgId);
+      }
+      reassembler.accept(m);
     }, { since: 'all' }).then((h) => { handle = h; if (settled) { try { h?.stop?.(); } catch { /* */ } } }).catch((e) => finish(e));
   });
 }

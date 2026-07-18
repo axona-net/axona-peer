@@ -2830,14 +2830,27 @@ export class AxonaPeer extends DHT {
       onRoutedMessage: (type, h) => peer.onRoutedMessage(type, h),
       onDirectMessage: (type, h) => peer.onDirectMessage(type, h),
       // Robust ITERATIVE lookup (α-parallel, escapes the greedy local minima that
-      // strand subscribers on a sparse mesh). The routing-only manager uses this
-      // to find a topic's TRUE root for publish + initial/unpinned subscribe, so
-      // publisher and subscribers converge on the same root. Returns the single
-      // closest live node id (BigInt) or null.
+      // strand subscribers on a sparse mesh). Every consumer — rootElection's
+      // _rootHint_ self-closest escape and _verifyRoots, repairPlane's
+      // _emptyRootProbe and pubsubLeaveHandoff heir fallback — reads the
+      // LookupResult shape `{ found, path, hops }` with the terminus at
+      // path[path.length-1]. Task #354: this adapter used to return the bare
+      // closest id, so `r.path` was never an array and ALL of those healing
+      // mechanisms silently no-opped on standalone peers (a spurious/interloper
+      // root claim was never self-verified away; the iterative strand-escape
+      // never fired) — the warm-topic live-delivery gap's enabling bug.
+      // Contract note: path[] here is the K closest nodes found
+      // (farthest→closest), not the traversal hops. Consumers use it as
+      // "terminus + nearby candidates"; EMPTY_ROOT_PROBE_FANOUT-aligned K so
+      // the empty-root probe sees real holder candidates.
       lookup: async (targetIdBig) => {
         if (typeof targetIdBig !== 'bigint') return null;
-        try { const arr = await peer.findKClosest(targetIdBig, 1); return (Array.isArray(arr) && arr.length) ? arr[0] : null; }
-        catch { return null; }
+        try {
+          const arr = await peer.findKClosest(targetIdBig, 4);
+          if (!Array.isArray(arr) || arr.length === 0) return { found: false, path: [], hops: 0, time: 0 };
+          const path = arr.slice().reverse();            // ascending distance → terminus last
+          return { found: true, path, hops: path.length - 1, time: 0 };
+        } catch { return { found: false, path: [], hops: 0, time: 0 }; }
       },
     };
 
