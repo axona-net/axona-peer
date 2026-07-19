@@ -724,7 +724,13 @@ export const wireHandlersMethods = {
     this._pending.delete(payload.corrId);
     let parsed = null;
     if (payload.json) { try { parsed = JSON.parse(payload.json); } catch { parsed = null; } }
-    p.resolve(parsed ? (parsed.message ?? parsed) : null);
+    // Resolve the FULL envelope (msgId/ts/signer/message …) — the same shape a
+    // sub() callback delivers, and what peer.pull has always documented. The
+    // previous `parsed.message ?? parsed` unwrap discarded the identity at the
+    // last step (task #355): publish-confirm loops comparing env.msgId could
+    // never succeed, and pull-then-act (kill/reply/verify by msgId) was
+    // impossible even though the wire carried everything.
+    p.resolve(parsed ?? null);
     return 'consumed';
   },
 
