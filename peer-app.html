@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Axona Peer — Phase 2</title>
+  <link rel="stylesheet" href="src/styles.css">
+  <!-- v0.100.0 (kernel 4.28.1) — importmap resolves `@axona/protocol/*` to the
+       vendored slim subset under vendor/axona-protocol/.  Sync the
+       vendored files from the canonical source at
+       github.com/axona-net/axona-protocol by running
+       `./scripts/sync-protocol.sh` from the repo root. -->
+  <script type="importmap">
+  {
+    "imports": {
+      "@axona/protocol": "./vendor/axona-protocol/src/index.js?v=0.79.0",
+      "@axona/protocol/": "./vendor/axona-protocol/src/"
+    }
+  }
+  </script>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>Axona Peer</h1>
+      <p class="subtitle">Phase 3 · WebRTC mesh + Axona protocol</p>
+    </header>
+
+    <!-- Region picker shown on first visit when geolocation is denied
+         or unavailable.  Persists into localStorage; subsequent
+         visits load the stored identity and skip this. -->
+    <section id="region-picker" class="region-picker" hidden>
+      <div class="region-row">
+        <label class="me-label" for="region-select">pick a region</label>
+        <select id="region-select" class="region-select"></select>
+        <button id="region-save" class="region-save" type="button">save</button>
+      </div>
+      <p class="region-help">
+        Sets the 8-bit S2 geographic prefix of your node ID.  The
+        bottom 56 bits are random and persisted locally, so returning
+        visits use the same identity.
+      </p>
+    </section>
+
+    <section class="me">
+      <div class="me-row">
+        <span class="me-label">connection id</span>
+        <span id="my-id" class="me-value">—</span>
+      </div>
+      <div class="me-row">
+        <span class="me-label">axona node id</span>
+        <span id="axona-id" class="me-value mono">—</span>
+      </div>
+      <div class="me-row">
+        <span class="me-label">region</span>
+        <span id="axona-region" class="me-value">—</span>
+      </div>
+      <div class="me-row">
+        <span class="me-label">bridge</span>
+        <span id="bridge-url" class="me-value mono"></span>
+      </div>
+      <div class="me-row">
+        <span class="me-label">mesh peers (open / known · bound)</span>
+        <span id="mesh-count" class="me-value">0 of 0</span>
+      </div>
+      <div class="me-row">
+        <span class="me-label">synaptome</span>
+        <span id="synaptome-size" class="me-value">0</span>
+      </div>
+      <div class="me-row">
+        <span class="me-label">version</span>
+        <span id="version" class="me-value mono">—</span>
+      </div>
+    </section>
+
+    <!-- DHT lookup harness.  Type a target node-id (hex) and press
+         lookup; the result lands in the result row. -->
+    <section class="lookup">
+      <h2>DHT lookup</h2>
+      <div class="lookup-row">
+        <input id="lookup-target" type="text"
+               class="lookup-input"
+               placeholder="target node id (hex, 66 chars)"
+               spellcheck="false" autocomplete="off">
+        <button id="lookup-go" class="lookup-go" type="button" disabled>lookup</button>
+      </div>
+      <pre id="lookup-result" class="lookup-result"></pre>
+    </section>
+
+    <!-- Pub/Sub harness.  Topic addresses share the 64-bit node-id
+         space: top 8 bits = chosen region's S2 prefix, low 56 bits =
+         SHA-256 of the event name.  Publishes flood to every direct
+         synapse with dedup; subscribers anywhere in the mesh see the
+         message under the matching subscription card. -->
+    <section class="pubsub">
+      <h2>Pub / Sub</h2>
+
+      <!-- Publish forms.  One card per configured publisher; client.js
+           manages them as a list so the user can keep several topics
+           pre-configured.  Each card has its own region, event-name,
+           message, and send-on-Enter wiring. -->
+      <div class="pubsub-publish-header">
+        <h3>Publish</h3>
+        <button id="pub-add" class="pubsub-add" type="button" disabled>+ add publish</button>
+      </div>
+      <div id="pub-list" class="pubsub-publish-list">
+        <!-- rendered by client.js: one <div class="pubsub-publish"> per form -->
+      </div>
+
+      <!-- Subscription list ────────────────────────────────────────── -->
+      <div class="pubsub-subs-header">
+        <h3>Subscriptions</h3>
+        <button id="sub-add" class="pubsub-add" type="button" disabled>+ add subscription</button>
+      </div>
+
+      <!-- Modal form for adding a subscription. -->
+      <div id="sub-form" class="pubsub-sub-form" hidden>
+        <div class="pubsub-row">
+          <label class="me-label" for="sub-region">prefix</label>
+          <select id="sub-region" class="pubsub-region"></select>
+        </div>
+        <div class="pubsub-row">
+          <input id="sub-event" type="text"
+                 class="pubsub-input"
+                 placeholder="subscription topic"
+                 spellcheck="false" autocomplete="off">
+          <button id="sub-save" class="pubsub-send" type="button">subscribe</button>
+          <button id="sub-cancel" class="pubsub-cancel" type="button">cancel</button>
+        </div>
+      </div>
+
+      <ul id="sub-list" class="pubsub-sub-list">
+        <!-- rendered by client.js: one <li> per active subscription -->
+      </ul>
+    </section>
+
+    <section class="peers">
+      <table class="peer-table">
+        <thead>
+          <tr>
+            <th class="col-ind"></th>
+            <th class="col-peer">peer</th>
+            <th class="col-rtt">RTT</th>
+            <th class="col-traf">pongs</th>
+            <th class="col-up">up</th>
+          </tr>
+        </thead>
+        <tbody id="peer-table-body">
+          <!-- rows are rendered by client.js -->
+        </tbody>
+      </table>
+    </section>
+
+    <section class="log">
+      <div class="log-header">
+        <h2>Event log</h2>
+        <button id="log-clear" class="log-clear" type="button">clear</button>
+      </div>
+      <ul id="log-list" class="log-list"></ul>
+    </section>
+
+    <footer>
+      <p>
+        Override the bridge URL with <code>?bridge=ws://&hellip;</code> in the query string.
+        Source: <a href="https://github.com/axona-net/axona-peer">axona-net/axona-peer</a>.
+      </p>
+    </footer>
+  </main>
+
+  <!-- Floating QR launcher: small thumbnail in the top-right corner.
+       Tap to open the overlay with a large scannable version. -->
+  <button id="qr-launcher" class="qr-launcher" type="button"
+          aria-label="Show join QR code" aria-haspopup="dialog"></button>
+
+  <!-- Modal overlay with the large QR.  Hidden by default; shown when
+       the launcher is clicked.  Click anywhere (backdrop, card, or the
+       × button) to dismiss. -->
+  <div id="qr-overlay" class="qr-overlay" role="dialog"
+       aria-modal="true" aria-label="Join this mesh" hidden>
+    <div class="qr-overlay-card">
+      <button id="qr-overlay-close" class="qr-overlay-close" type="button"
+              aria-label="Close">&times;</button>
+      <div id="qr-overlay-image" class="qr-overlay-image"></div>
+      <code id="qr-overlay-url" class="qr-overlay-url"></code>
+    </div>
+  </div>
+
+  <script type="module" src="src/client.js?v=0.79.0"></script>
+</body>
+</html>
