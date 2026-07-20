@@ -1,33 +1,24 @@
-# axona-peer — the axona.net site
+# axona-peer — the reference browser peer (deprecated)
 
-This repo serves **<https://axona.net>**, the front door of the
-[Axona](https://github.com/axona-net) peer-to-peer protocol: the story, the two
-design commitments (end-to-end — encryption is the application's
-responsibility; transport ID and author ID deliberately separate), the
-whitepaper, the applications, a **For AI Agents Only** section pointing at the
-protocol's AI documentation, and the popup menu with the full inventory of
-documents and repositories.
+The original **axona.net** application: a full `@axona/protocol` kernel node
+that runs in a browser tab. It bootstraps to an
+[`axona-bridge`](https://github.com/axona-net/axona-bridge) over WebSocket,
+forms a WebRTC mesh (with bridgeless, peer-relayed signaling), derives a
+region-anchored identity in-page, and exposes a raw pub/sub + `lookup()`
+harness. It is kept as a bare-metal reference — a view of the protocol with no
+application on top.
 
-- `index.html` — the site. A single static file (no build step): chat/tufte
-  palette, light + dark, ant logo, `assets/` images, and the whitepaper PDF
-  under `whitepaper/`.
-- `peer-app.html` — the **previous axona.net application**, the reference
-  browser peer, preserved unmodified and linked from the site footer as
-  deprecated. It still runs: a full `@axona/protocol` kernel node in the page —
-  bridge WebSocket bootstrap, WebRTC mesh with bridgeless (peer-relayed)
-  signaling, region-anchored identity, and a raw pub/sub + `lookup()` harness.
+> **This repo no longer serves axona.net.** The website moved to its own
+> repository, **[axona-net/axona-web](https://github.com/axona-net/axona-web)**,
+> which now owns the `axona.net` domain. For a real application use
+> **<https://axona.chat>**
+> ([repo](https://github.com/axona-net/axona-chat)); for the minimal
+> build-along demo, **<https://demo.axona.net>**. GitHub Pages is disabled on
+> this repo — the peer app lives here as source, not as a hosted site.
 
-Deploys are GitHub Pages from `main` (work happens on `testnet`;
-`git push origin testnet:main` publishes). The custom domain (`CNAME`) is
-`axona.net`.
-
-## The deprecated peer app
-
-Everything below applies to `peer-app.html` + `src/`, kept for reference and
-for anyone who wants a bare-metal view of the protocol without an
-application on top. For a real application, use **<https://axona.chat>**
-([repo](https://github.com/axona-net/axona-chat)); for the minimal build-along
-demo, **<https://demo.axona.net>**.
+`peer-app.html` (+ `src/`) is the peer application; `index.html` is the old
+story-site copy, superseded by axona-web. Everything below documents the peer
+app.
 
 - **Runs a kernel peer in the browser** on the kernel's `webTransport()`
   (reconnect/backoff, ping/pong, version gate + authenticated `hello`) and
