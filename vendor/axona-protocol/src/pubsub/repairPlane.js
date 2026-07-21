@@ -386,11 +386,26 @@ export const repairPlaneMethods = {
     // Re-check after the awaits: a REPLAYUP/HANDOFF may have landed meanwhile.
     const role = this.axonRoles.get(topicBig);
     if (!role || !role.isRoot || role.cache.length || !cand.size) return;
+    // Candidate hardening (#364-A2, diagnosis 2026-07-21): the probe chain
+    // itself is sound (smoke_ghost_read: ungraceful root death heals from
+    // backups) — live failures came from WHERE the probes went. Two rules:
+    //  · REACHABLE-FIRST — a candidate we hold an open channel to can
+    //    actually receive the PULLUP; an unbound id (dead slice, WAN island)
+    //    soaks up fanout for nothing.
+    //  · NO RE-PROBING NON-RESPONDERS — with 3 tries × fanout 4, hitting the
+    //    same silent top-4 every round burns the whole budget on corpses.
+    //    Rotate: exclude ids probed in earlier rounds while fresh candidates
+    //    remain (a responder would have filled the cache and ended probing).
+    if (!(role.sync.probed instanceof Set)) role.sync.probed = new Set();
+    const reach = (b) => { try { return typeof this._isReachableId === 'function' && this._isReachableId(lc(idHex(b))); } catch { return false; } };
+    const ordered = [...cand].sort((a, b) => (reach(b) ? 1 : 0) - (reach(a) ? 1 : 0));
+    const fresh = ordered.filter((b) => !role.sync.probed.has(b));
+    const targets = (fresh.length ? fresh : ordered).slice(0, EMPTY_ROOT_PROBE_FANOUT);
     let n = 0;
-    for (const b of cand) {
-      if (n >= EMPTY_ROOT_PROBE_FANOUT) break;
+    for (const b of targets) {
       try {
         this._syncPull(b, topicBig, 'EMPTY_ROOT_PROBE', { sinceHw: 0 });
+        role.sync.probed.add(b);
         n++;
       } catch { /* best-effort */ }
     }

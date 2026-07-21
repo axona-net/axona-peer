@@ -424,6 +424,37 @@ export class WebRTCTransport extends Transport {
     };
   }
 
+  /**
+   * Bridge departure hint (#364-B, TEMPORARY testnet-era crutch): the bridge
+   * observed this node's WebSocket close and told us via the peer-left
+   * broadcast. Fire the peer-died path so pub/sub state (ghost beacons, table
+   * entries) is purged immediately — the ghost-slice class that otherwise
+   * takes hours of natural forgetting (runs 6-8, 2026-07-21: 0/38 healed).
+   *
+   * REACHABILITY GUARD — what keeps this safe when it becomes inaccurate: a
+   * hint is IGNORED whenever we hold an active channel to the subject. Today
+   * a bridge-socket close ≈ node death (everyone holds the socket all
+   * session), but a grown network's nodes will legitimately drop the bridge
+   * while remaining valid mesh members; for any node we can still reach
+   * ourselves, our own channel outranks the bridge's opinion. The hint can
+   * therefore only ever purge memories of nodes we cannot reach anyway.
+   *
+   * @param {bigint} nodeId  departed node (from the bridge's authenticated binding)
+   * @returns {boolean} true if the hint was acted on
+   */
+  reportPeerDeparted(nodeId) {
+    if (typeof nodeId !== 'bigint') return false;
+    if (this._meshIdByNodeId.has(nodeId)) {
+      this._log('peer-departed-hint-ignored-live-channel', { nodeId: String(nodeId) });
+      return false;
+    }
+    for (const h of this._peerDiedHandlers) {
+      try { h(nodeId); }
+      catch (err) { this._log('peer-died-handler-threw', { reportedId: String(nodeId), err: err.message }); }
+    }
+    return true;
+  }
+
   getLatency(nodeId) {
     const meshId = this._meshIdByNodeId.get(nodeId);
     return meshId ? this._mesh.getLatency(meshId) : -1;

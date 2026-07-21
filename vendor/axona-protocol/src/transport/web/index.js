@@ -426,11 +426,23 @@ export function webTransport({
             return mesh.onPeerJoined(frame.peerId);
           }
           break;
-        case 'peer-left':
+        case 'peer-left': {
+          // Departure hint (#364-B): a bridge that knows the departed
+          // connection's authenticated nodeId includes it — purge the node's
+          // pub/sub ghosts via the standard peer-died path. Guarded inside
+          // reportPeerDeparted: ignored whenever we hold a live channel to
+          // the subject (see the method's comment for why that keeps the
+          // hint safe once large-network nodes drop bridge sockets while
+          // staying valid mesh members). Additive + optional: old bridges
+          // send no nodeId and this clause is a no-op.
+          if (typeof frame.nodeId === 'string' && /^[0-9a-f]{6,}$/i.test(frame.nodeId)) {
+            try { webrtc.reportPeerDeparted(BigInt('0x' + frame.nodeId)); } catch { /* malformed hint */ }
+          }
           if (typeof mesh.onPeerLeft === 'function' && typeof frame.peerId === 'string') {
             return mesh.onPeerLeft(frame.peerId);
           }
           break;
+        }
         case 'signal':
           if (typeof mesh.onSignal === 'function' && typeof frame.from === 'string') {
             return mesh.onSignal(frame.from, frame.payload);
