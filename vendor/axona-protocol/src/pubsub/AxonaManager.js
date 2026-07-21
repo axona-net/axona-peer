@@ -60,6 +60,7 @@ import { topicStoreMethods }   from './topicStore.js';
 import { rootElectionMethods } from './rootElection.js';
 import { repairPlaneMethods }  from './repairPlane.js';
 import { wireHandlersMethods }  from './wireHandlers.js';
+import { syncEngineMethods }    from './syncEngine.js';
 
 // Constants, wire types, and the region-lock switch live in constants.js
 // (refactor Phase 2); the caps and region-lock functions are re-exported here
@@ -493,7 +494,8 @@ Object.assign(
   topicStoreMethods,     // cache, tombstones, exactly-once app delivery
   rootElectionMethods,   // beacons, hints, self-verification, liveness
   repairPlaneMethods,    // the tick scheduler, retries, replication, departure
-  wireHandlersMethods,    // routed handlers + axon-tree mechanics
+  wireHandlersMethods,   // routed handlers + axon-tree mechanics
+  syncEngineMethods,     // Phase 8: the ONE repair/durability sync operation + policy table
 );
 
 export default AxonaManager;

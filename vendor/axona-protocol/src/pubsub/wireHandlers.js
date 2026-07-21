@@ -22,7 +22,6 @@ import { idHex, idBig, lc, isHexId } from './ids.js';
 import { verifyEnvelope, checkFreshness } from './envelope.js';
 import { verifyKill } from './kill.js';
 import { deriveTopicIdBig } from './post.js';
-import { makeRole } from './rootClaim.js';
 
 export const wireHandlersMethods = {
   _registerHandlers() {
@@ -131,13 +130,9 @@ export const wireHandlersMethods = {
     //    (a deeper split — genuinely new history).
     const myHw = this._highWater(role);
     if (Number.isFinite(payload.hw) && payload.hw > myHw) {
-      this._route(idBig(subHex), T.PULLUP, { topicId: idHex(topicBig), sinceHw: myHw, parentId: idHex(this.nodeId) });
+      this._syncPull(idBig(subHex), topicBig, 'REPLAY_UP', { sinceHw: myHw });
     } else if (Number.isFinite(payload.lw) && payload.lw > 0 && role.cache.length && payload.lw < this._lowWater(role)) {
-      const prev = role.sync.pulledLw.get(subHex);
-      if (prev === undefined || payload.lw < prev) {
-        role.sync.pulledLw.set(subHex, payload.lw);
-        this._route(idBig(subHex), T.PULLUP, { topicId: idHex(topicBig), sinceHw: 0, parentId: idHex(this.nodeId) });
-      }
+      this._syncPull(idBig(subHex), topicBig, 'SPLIT_UNION', { sinceHw: 0, lw: payload.lw, role });
     }
     this._accept(role, subHex, since, !!payload.latest);
     return 'consumed';
@@ -306,36 +301,36 @@ export const wireHandlersMethods = {
     const seq = ++role.seq;                                              // dense per-topic counter (gap detection)
     const msg = { json, publishTs: ts, msgId: env.msgId, seq };
     this._cachePush(role, { msgId: env.msgId, publishTs: ts, json, seq });
-    this._confirmPending(role.topicId, env.msgId);                       // our own publish landed (we're its root) → stop retrying
     this._fanout(role, msg, null);                                       // to subscribers
     this._deliverToApp(role.topicId, json, env.msgId, ts, seq);          // local app (if subscribed)
     // EAGER cohort distribution: push the freshly-stamped message to the K-closest the
     // instant it's stamped — a kill is just a publish with a side effect, so a publish
     // must reach the whole cohort exactly as a kill must, else a subscriber landing on a
-    // co-hosting root misses it (the post-churn loss). Fire-and-forget; the periodic tick
-    // reconciles any miss.
-    if (role.isRoot) {
+    // co-hosting root misses it (the post-churn loss). The periodic tick reconciles any miss.
+    //
+    // PUB_DURABLE gate (Phase 8, #353 — FLAGGED behavior change): a SELF-ROOTED
+    // publisher used to confirm its own pending the instant it stamped locally,
+    // so leave()'s evidence drain saw nothing pending and an ephemeral publisher
+    // could exit before the eager replicate ever dispatched — its root claim
+    // (and the message) died with the process (field-proven on prod: the same
+    // post stranded twice from a die-fast publisher, landed instantly from a
+    // held-alive one). The confirm now waits for the eager cohort replicate's
+    // dispatch, so pub→leave() holds until the history has left the node.
+    // Cohort-less nodes (rootReplicas 0 / solo network) confirm immediately.
+    if (role.isRoot && this._rootReplicas) {
       const bridge = (typeof this.dht.bridgeId === 'function') ? this.dht.bridgeId() : null;
-      this._replicateRole(role.topicId, role, bridge, this._now()).catch(() => {});
+      await this._replicateRole(role.topicId, role, bridge, this._now()).catch(() => {});
     }
+    this._confirmPending(role.topicId, env.msgId);                       // our own publish landed (we're its root) → stop retrying
   },
 
   // ── stamped-replay-up durability (§6) ────────────────────────────────
-  // A behind parent asked us to replay our stamped history up to it; send the
-  // cache delta newer than its high-water, routed to that parent.
+  // A behind parent asked us to replay our stamped history up to it — the
+  // engine sends the cache delta (and active tombstones: a behind parent
+  // adopting history must not resurrect a killed message).
   _onPullUp(payload, meta) {
     if (meta.targetId !== this.nodeId) return;
-    const role = this.axonRoles.get(idBig(payload.topicId));
-    if (!role || !role.cache.length) return 'consumed';
-    const sinceHw = Number.isFinite(payload.sinceHw) ? payload.sinceHw : 0;
-    const msgs = role.cache.filter(c => c.publishTs > sinceHw)
-                           .map(c => ({ json: c.json, publishTs: c.publishTs, msgId: c.msgId, seq: c.seq }));
-    // Carry tombstones UP too — else a behind parent adopting this history would
-    // resurrect a message we've already killed (kill-leak via cache migration).
-    const dels = this._activeDels(role);
-    if ((msgs.length || dels.length) && isHexId(lc(payload.parentId))) {
-      this._route(idBig(payload.parentId), T.REPLAYUP, { topicId: idHex(role.topicId), msgs, dels });
-    }
+    this._syncAnswerPull(payload);
     return 'consumed';
   },
 
@@ -347,16 +342,8 @@ export const wireHandlersMethods = {
   // pump so a storm of pushes can't starve mesh liveness.
   async _onReplayUp(payload, meta) {
     if (meta.targetId !== this.nodeId) return;
-    await this._ingestEnqueue(() => this._processReplayUp(payload));   // inline path completes here; queued path returns at once
+    await this._ingestEnqueue(() => this._syncIngest(payload, meta, 'REPLAY_UP'));   // inline path completes here; queued path returns at once
     return 'consumed';
-  },
-
-  async _processReplayUp(payload) {
-    const topicBig = idBig(payload.topicId);
-    const role = this.axonRoles.get(topicBig);
-    if (!role) return;
-    this._applyDels(role, topicBig, payload.dels);   // tombstones FIRST → suppress any killed body in this batch
-    await this._ingestStampedBatch(role, payload.msgs);
   },
 
   // Bulk-ingest with a macrotask yield (v4.24.1, #333/#332): verifying hundreds
@@ -408,23 +395,11 @@ export const wireHandlersMethods = {
   // abrupt death still needs a replica/in-region host (separate work).
   async _onHandoff(payload, meta) {
     if (meta.targetId !== this.nodeId) return;
-    const topicBig = idBig(payload.topicId);
-    // Adopt as a root: _becomeRoot makes the role (isRoot) if we don't have one,
-    // so we serve the inherited history; routing/beacons reconcile root-ness.
-    const role = this.axonRoles.get(topicBig) || this._becomeRoot(topicBig, 'handoff-heir');
-    this._applyDels(role, topicBig, payload.dels);   // inherit the heir's tombstones, not just its bodies
-    await this._ingestStampedBatch(role, payload.msgs);
-    // Departure rules — purge the leaver's ghost beacon, never defer back to
-    // the leaver, yield only to a strictly-closer live root — live in the
-    // state machine (rootClaim.handoffArrived).
-    const leaver = typeof payload.from === 'string' ? lc(payload.from) : null;
-    this._rootClaim.handoffArrived(topicBig, leaver);
-    // Confirm receipt (v4.24.0): the leaver retries / cohort-sprays topics it
-    // never hears an ack for — the old fire-and-forget silently dropped the
-    // topic's last copy whenever this HANDOFF didn't land.
-    if (leaver && isHexId(leaver)) {
-      try { this._route(idBig(leaver), T.HANDOFFACK, { topicId: payload.topicId }); } catch { /* best-effort */ }
-    }
+    // NOT queued: the HANDOFFACK the engine sends must mean "state actually
+    // held" (#331), and departures are rare. Adoption rules (become root,
+    // purge the leaver's ghost beacon, never defer back to the leaver) are
+    // the HANDOFF policy hooks in _syncIngest.
+    await this._syncIngest(payload, meta, 'HANDOFF');
     return 'consumed';
   },
 
@@ -451,35 +426,11 @@ export const wireHandlersMethods = {
   // time-sliced pump. Role state is read at PROCESSING time, not arrival time.
   async _onReplicate(payload, meta) {
     if (meta.targetId !== this.nodeId) return;          // routed to me as the backup
-    await this._ingestEnqueue(() => this._processReplicate(payload, meta));   // inline path completes here; queued path returns at once
+    // Root-side: UNION_AT_ROOT (keep the claim, converge to the union). Else:
+    // enter the BACKUP nature. Both are the REPLICATE policy hooks in
+    // _syncIngest; the body drains through the time-sliced pump (I-11).
+    await this._ingestEnqueue(() => this._syncIngest(payload, meta, 'REPLICATE'));   // inline path completes here; queued path returns at once
     return 'consumed';
-  },
-
-  async _processReplicate(payload, meta) {
-    let topicBig; try { topicBig = idBig(payload.topicId); } catch { return; }
-    const mine = this.axonRoles.get(topicBig);
-    if (mine?.isRoot) {
-      // UNION-INGEST at a root — the cohort anti-entropy contract _replicateRole
-      // documents ("co-hosting roots converge to the union of cache+tombstones").
-      // This used to be dropped, so two roots straddling a transition never
-      // merged and the pushing ex-root's half stayed stranded (a fresh
-      // since:'all' subscriber on the surviving root replayed exactly half the
-      // timeline). No backup bookkeeping here — we keep our claim; every body
-      // re-verifies through _ingestStamped (dedup, tombstone-suppress,
-      // fanout + app delivery heal attached subscribers in place).
-      this._applyDels(mine, topicBig, payload.dels);
-      await this._ingestStampedBatch(mine, payload.msgs);
-      return;
-    }
-    if (!this._rootReplicas) return;                    // backup duty disabled on this node
-    let from = null;
-    if (payload.from && isHexId(lc(payload.from))) from = lc(payload.from);
-    else if (meta.fromId != null) { try { from = lc(idHex(idBig(meta.fromId))); } catch { /* */ } }
-    let role = this.axonRoles.get(topicBig);
-    if (!role) { role = makeRole(topicBig, false); this.axonRoles.set(topicBig, role); }
-    this._rootClaim.becomeBackup(topicBig, role, from);   // nature transition (subscribing child relay; single-root election)
-    this._applyDels(role, topicBig, payload.dels);   // tombstones FIRST → a killed body in the same push is suppressed
-    await this._ingestStampedBatch(role, payload.msgs);
   },
 
   // ── DELIVER (parent → subscriber; a relay re-fans down the tree) ──────
@@ -619,9 +570,15 @@ export const wireHandlersMethods = {
       // new tombstone to the cohort EAGERLY (not on the next tick) so a co-hosting root or a
       // backup that promotes mid-window can't serve the killed body it already holds (the
       // kill-leak race). Same eager path a publish takes — a kill is just a publish + side effect.
-      if (role.isRoot) {
+      // PUB_DURABLE applies to kills too (#353): a self-rooted kill confirms only after the
+      // eager replicate dispatch, so a kill→leave() publisher holds until the tombstone left.
+      if (role.isRoot && this._rootReplicas) {
         const bridge = (typeof this.dht.bridgeId === 'function') ? this.dht.bridgeId() : null;
-        this._replicateRole(topicBig, role, bridge, this._now()).catch(() => {});
+        this._replicateRole(topicBig, role, bridge, this._now())
+          .catch(() => {})
+          .then(() => this._confirmPending(topicBig, target));
+        this._deliverKillToApp(topicBig, target, killTs, seq);
+        return;
       }
     }
     this._confirmPending(topicBig, target);            // our own kill landed → stop retrying it
