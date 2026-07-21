@@ -238,6 +238,10 @@ export class AxonaManager {
       topics: [...this._hostedTopics].map((t) => idHex(t)),
       subscriptions: this.mySubscriptions.size,
       backups: this._backupTopics.size,
+      // Cache-bearing roots with NO replica anywhere — this node holds the
+      // network's only copy of each (#362). Apps can check before leaving.
+      singletonRoots: [...this.axonRoles.values()]
+        .filter((r) => r.isRoot && (r.replicas?.size ?? 0) === 0 && r.cache.length > 0).length,
     };
   }
 

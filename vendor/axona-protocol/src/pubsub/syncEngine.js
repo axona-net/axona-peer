@@ -173,6 +173,9 @@ export const syncEngineMethods = {
       if (leaver && isHexId(leaver)) {
         try { this._route(idBig(leaver), T.HANDOFFACK, { topicId: payload.topicId }); } catch { /* best-effort */ }
       }
+      // Diagnostic (#362): ingest + ack confirmation for the leaver's retry loop.
+      this._log('debug', 'handoff-ingested',
+        { topic: String(payload.topicId).slice(0, 12), msgs: Array.isArray(payload.msgs) ? payload.msgs.length : 0, acked: !!(leaver && isHexId(leaver)) });
       return;
     }
 

@@ -1059,14 +1059,56 @@ export class AxonaPeer extends DHT {
       }
     }
 
-    // (2) notify peers — parallel and time-bounded (the old serial await
-    // chain paid one WAN round-trip per peer and delayed the departure).
-    // Resolve the transport the same way the routing path does: prefer
-    // the constructor-supplied transport, else node.transport.  Hosts
+    // (2) graceful-leave cache handoff — and it MUST run BEFORE the
+    // peer-leaving notify. The receiver's peer-leaving fast path (see
+    // onNotification('peer-leaving')) deletes our synapse, drops the
+    // connection record, AND hard-closes the channel — proactive sub-second
+    // re-anchor, built for bridge restarts. Announcing first therefore
+    // dismantles the very routes the handoff needs: within the 2 s notify
+    // wait every remote closes its channel to us, our bound-peer set empties,
+    // and each routed HANDOFF — finding no candidate strictly closer to the
+    // heir — terminates AT SELF, where the targetId guard silently discards
+    // it. Observed live (#362, burst-repro 2026-07-21): 173/173 leave
+    // HANDOFFs boomeranged back to the leaver as self-deliveries, zero
+    // reached any heir, zero acks, and every topic whose only copy rode the
+    // handoff died — the alert-bot "published but never preserved"
+    // deterministic loss. Mid-life the identical routed sends deliver
+    // (probe-verified) — the failure is purely this ordering.
+    // Data first, funeral announcement second.
+    //
+    // Push any topic we ROOT to its heir (next-closest live node) while the
+    // transport is still fully alive, so the topic's history survives our
+    // departure (since:'all' replay keeps working for subscribers that
+    // re-home or join after we go). Best-effort and genuinely TIME-BOUNDED.
+    try {
+      // The bound SCALES WITH ROLE COUNT (floor = caller's timeoutMs, cap 60s).
+      // A flat 5s covered the 25-root field case, but an in-region burst
+      // publisher can legitimately hold 300+ roles — many of them SINGLETON
+      // self-roots holding the network's ONLY copy (alert-bot field case:
+      // ~50 topics past the flat cutoff died with the publisher on every run,
+      // deterministically in handoff iteration order — the "9-13% of pubs
+      // never preserved" loss). The handoff is parallelized, so the bound
+      // remains a safety net; a departure carrying that much sole-copy
+      // history is worth tens of seconds. pubsubLeaveHandoff itself hands
+      // off singleton roots FIRST, so even a cut-off departure saves the
+      // most vulnerable topics.
+      const roleCount = this._axonaManager?.axonRoles?.size ?? 0;
+      const handoffMs = Math.max(timeoutMs, Math.min(60_000, 2_000 + 100 * roleCount));
+      await Promise.race([
+        this._axonaManager?.pubsubLeaveHandoff?.(),
+        sleep(handoffMs),
+      ]);
+    } catch { /* best-effort */ }
+
+    // (2b) notify peers — AFTER the handoff (see (2) above): receivers
+    // hard-close our channel on this signal, so anything still needing the
+    // wire must already have happened. Parallel and time-bounded (the old
+    // serial await chain paid one WAN round-trip per peer and delayed the
+    // departure). Resolve the transport the same way the routing path does:
+    // prefer the constructor-supplied transport, else node.transport. Hosts
     // like the bridge wire their transport onto node.transport (not the
     // constructor opt), so without this fallback leave() would silently
-    // skip the announcement and the graceful-departure handoff would
-    // never fire on a bridge restart.
+    // skip the announcement and receivers would only notice reactively.
     const announceVia = this._transport ?? this._node?.transport;
     if (notify && announceVia && typeof announceVia.notify === 'function') {
       // peers() returns hex (display); convert to BigInt for the
@@ -1082,26 +1124,6 @@ export class AxonaPeer extends DHT {
         sleep(Math.min(timeoutMs, 2000)),
       ]);
     }
-
-    // (2b) graceful-leave cache handoff: push any topic we ROOT to its heir
-    // (next-closest live node) while the transport is still up, so the topic's
-    // history survives our departure (since:'all' replay keeps working for
-    // subscribers that re-home or join after we go). Best-effort and now
-    // genuinely TIME-BOUNDED: the handoff awaits a network lookup per rooted
-    // topic, so on a slow or dying mesh it could previously hold leave() open
-    // indefinitely (the old comment claimed "bounded by the drain window" but
-    // nothing raced it). Must run BEFORE we tear down transport/listeners.
-    try {
-      // Full timeoutMs, not a smaller slice: the handoff is the LAST copy of
-      // every topic this node roots (field case: a burst publisher left
-      // holding 25 roots — topics past a tighter cutoff died with it). The
-      // handoff itself is parallelized (bounded concurrency), so the bound is
-      // a safety net, not the expected path.
-      await Promise.race([
-        this._axonaManager?.pubsubLeaveHandoff?.(),
-        sleep(timeoutMs),
-      ]);
-    } catch { /* best-effort */ }
 
     // (2c) retire the pub/sub machinery — tick, retries, verifies, beacons.
     // A departed peer must go SILENT. Previously nothing ever called

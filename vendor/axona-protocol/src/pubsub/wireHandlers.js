@@ -320,6 +320,20 @@ export const wireHandlersMethods = {
     if (role.isRoot && this._rootReplicas) {
       const bridge = (typeof this.dht.bridgeId === 'function') ? this.dht.bridgeId() : null;
       await this._replicateRole(role.topicId, role, bridge, this._now()).catch(() => {});
+      // Honesty signal (#362): the eager replicate could recruit NOBODY — this
+      // node is a SINGLETON root and the confirm below asserts only "I, one
+      // process, hold it" (field case: an in-region burst publisher self-rooted
+      // ~50 topics whose cohort never existed because it had discovered no
+      // other in-region node; the confirms read as durable, then the histories
+      // died with its departure). Confirming anyway is deliberate — a solo/
+      // sparse network must still publish — but the condition is surfaced: a
+      // once-per-topic warn plus the inspectHosting().singletonRoots count, so
+      // apps (and leave()) can see how much sole-copy history they carry.
+      if ((role.replicas?.size ?? 0) === 0 && !role._warnedSingleton) {
+        role._warnedSingleton = true;
+        this._log('warn', 'pubsub:singleton-root-confirm',
+          { topic: idHex(role.topicId).slice(0, 12), cache: role.cache.length });
+      }
     }
     this._confirmPending(role.topicId, env.msgId);                       // our own publish landed (we're its root) → stop retrying
   },
@@ -394,6 +408,14 @@ export const wireHandlersMethods = {
   // for single-root topics — nodes that leave gracefully (peer.leave()) hand off;
   // abrupt death still needs a replica/in-region host (separate work).
   async _onHandoff(payload, meta) {
+    // Diagnostic (#362): every HANDOFF arrival, including misrouted drops —
+    // mine:false here means a handoff terminated at the wrong node (the
+    // leave-order boomerang signature; see AxonaPeer.leave()).
+    this._log('debug', 'handoff-recv', {
+      topic: typeof payload?.topicId === 'string' ? payload.topicId.slice(0, 12) : '?',
+      from: typeof payload?.from === 'string' ? payload.from.slice(0, 10) : '?',
+      mine: meta.targetId === this.nodeId,
+    });
     if (meta.targetId !== this.nodeId) return;
     // NOT queued: the HANDOFFACK the engine sends must mean "state actually
     // held" (#331), and departures are rare. Adoption rules (become root,
