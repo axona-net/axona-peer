@@ -23,6 +23,7 @@ import {
   INGEST_SLICE_MS, MESH_REWARM_MIN, MESH_REWARM_TICKS, MESH_REWARM_COOLDOWN_MS,
 } from './constants.js';
 import { idHex, idBig, lc, isHexId } from './ids.js';
+import { makeRole } from './rootClaim.js';
 
 export const repairPlaneMethods = {
   async refreshTick() {
@@ -55,9 +56,22 @@ export const repairPlaneMethods = {
           this._unattachedSince.delete(t);
         } else {
           if (!this._unattachedSince.has(t)) this._unattachedSince.set(t, now);
-          if (now - this._unattachedSince.get(t) >= ROOT_CLAIM_MS && this._regionOk(t) && this._rootClaim.selfClosestReachable(t)) {
-            this._rootClaim.claimReachable(t);
-            continue;                          // we are root now — no upstream to renew toward
+          if (now - this._unattachedSince.get(t) >= ROOT_CLAIM_MS && this._regionOk(t)) {
+            if (this._rootClaim.selfClosestReachable(t)) {
+              this._rootClaim.claimReachable(t);
+              continue;                        // we are root now — no upstream to renew toward
+            }
+            // Read-repair (#364 part 2): still unattached past the window but we
+            // are NOT the closest reachable node → the topic-closest node is
+            // reachable but not serving us (degraded / overloaded / ingest-
+            // stalled — the alive-but-black-hole class the empty-root probe can't
+            // reach, since that only fires for a node that IS a root). Routing
+            // keeps pinning every SUB to it, so waiting is futile: recover the
+            // history straight from the cohort backups into a non-root read-
+            // holder. Fire-and-forget — never await a lookup in the tick (the
+            // 4.18.1 lesson). The normal renew below still runs, so the instant
+            // the primary recovers we re-home to it and the holder quiesces.
+            this._readRepair(t).catch(() => {});
           }
         }
         const iv = attached ? (s.interval || this.renewFastMs) : this.renewFastMs;
@@ -411,6 +425,92 @@ export const repairPlaneMethods = {
     }
     if (n) this._log('info', 'empty-root-probe',
       { topic: idHex(topicBig).slice(0, 12), fanout: n, tries: role.sync.probeTries });
+  },
+
+  // ── stuck-subscriber cohort read-repair (#364 part 2) ─────────────────────
+  // The read-side mirror of the eager cohort WRITE. The empty-root probe above
+  // heals a node that IS a root but sits empty; it cannot help the OTHER read
+  // failure the 4.32 forensics named — a subscriber pinned by routing to a
+  // topic-closest node that is ALIVE-but-not-serving (degraded / overloaded /
+  // ingest-stalled). That node is still a mesh neighbour, so it isn't purged as
+  // a ghost; it's still XOR-closest, so every renewing SUB terminates AT it and
+  // dies; and it isn't us, so the reachable-root self-claim can't fire. The
+  // subscriber holds no role, so nothing recovers the history the cohort backups
+  // still hold (repro_degraded_read: 0/5 today).
+  //
+  // Fix: once genuinely stuck (subscribed, unattached past the confirmation
+  // window, and NOT the closest reachable node), pull the history DIRECTLY from
+  // the K nearest reachable cohort backups — SKIPPING the degraded primary that
+  // routing pins us to — into a NON-ROOT read-holder role. isRoot stays false:
+  // we never claim the topic, so no root split (the previously-rejected
+  // reluctant-root failure mode). The holder ingests via the standard verified
+  // REPLAYUP → union → _deliverToApp path and is protected from GC while the
+  // subscription is live (the mySubscriptions guard in the role sweep); it tears
+  // down like any subscriber role on unsubscribe. If the primary recovers, the
+  // normal SUB renewal re-homes us onto it and the holder simply stops probing.
+  // Bounded (EMPTY_ROOT_PROBE_MAX) + rate-limited (EMPTY_ROOT_PROBE_INTERVAL_MS),
+  // reusing the probe ledger; reachable-first + rotate (the 4.33 hardening).
+  async _readRepair(topicBig) {
+    if (!this.mySubscriptions.has(topicBig)) return;                 // not (any longer) subscribed
+    if ((this._upstream.get(topicBig) || []).length) return;         // attached → the live tree serves us
+    let role = this.axonRoles.get(topicBig);
+    // A real root heals via the empty-root sweep; a filled holder is done; a
+    // legit relay/backup role is never ours to repair-pull into.
+    if (role && (role.isRoot || role.cache.length || role.backupOf || this._backupTopics.has(topicBig))) return;
+    const now = this._now();
+    if (!role) { role = makeRole(topicBig, false); role.readHolder = true; this.axonRoles.set(topicBig, role); }
+    if (!role.readHolder) return;
+    if (role.sync.probeTries >= EMPTY_ROOT_PROBE_MAX) return;
+    if (now - role.sync.probeAt < EMPTY_ROOT_PROBE_INTERVAL_MS) return;
+    role.sync.probeAt = now;                                         // rate-limit BEFORE the await (races quench)
+
+    // Cohort = K-closest to the topic. Exclude self, the bridge, and the primary
+    // hint (the reachable-but-degraded closest routing already pins us to — the
+    // non-server; re-pulling the black hole wastes the budget).
+    const bridge = (typeof this.dht.bridgeId === 'function') ? this.dht.bridgeId() : null;
+    const primary = this._rootHint_(topicBig);
+    const cand = new Set();
+    if (typeof this.dht.findKClosest === 'function') {
+      try {
+        for (const id of (await this.dht.findKClosest(topicBig, EMPTY_ROOT_PROBE_FANOUT + 2)) || []) {
+          let b; try { b = idBig(id); } catch { continue; }
+          if (b === this.nodeId || (bridge != null && b === bridge)) continue;
+          if (primary && lc(idHex(b)) === primary) continue;        // skip the non-server
+          cand.add(b);
+        }
+      } catch { /* thin table — nothing to pull from this round */ }
+    }
+    // Re-check after the await: a REPLAYUP may have landed, we may have attached,
+    // or become root, or unsubscribed.
+    const r2 = this.axonRoles.get(topicBig);
+    if (!this.mySubscriptions.has(topicBig) || !r2 || r2 !== role || r2.isRoot || r2.cache.length ||
+        (this._upstream.get(topicBig) || []).length || !cand.size) return;
+    if (!(role.sync.probed instanceof Set)) role.sync.probed = new Set();
+    const reach = (b) => { try { return typeof this._isReachableId === 'function' && this._isReachableId(lc(idHex(b))); } catch { return false; } };
+    const ordered = [...cand].sort((a, b) => (reach(b) ? 1 : 0) - (reach(a) ? 1 : 0));
+    const fresh = ordered.filter((b) => !role.sync.probed.has(b));
+    const targets = (fresh.length ? fresh : ordered).slice(0, EMPTY_ROOT_PROBE_FANOUT);
+    let n = 0;
+    role.sync.probeTries++;
+    for (const b of targets) {
+      try { this._syncPull(b, topicBig, 'READ_REPAIR', { sinceHw: 0 }); role.sync.probed.add(b); n++; } catch { /* best-effort */ }
+    }
+    if (n) this._log('info', 'read-repair',
+      { topic: idHex(topicBig).slice(0, 12), fanout: n, tries: role.sync.probeTries });
+  },
+
+  // Drive read-repair for every stuck subscription. refreshTick fires _readRepair
+  // per-subscription inline (fire-and-forget); this sweep is the awaitable form
+  // used by deterministic tests to settle the probes on demand.
+  async _readRepairSweep(now = this._now()) {
+    for (const t of [...this.mySubscriptions.keys()]) {
+      if ((this._upstream.get(t) || []).length) continue;
+      const since = this._unattachedSince.get(t);
+      if (since == null || now - since < ROOT_CLAIM_MS) continue;
+      if (!this._regionOk(t)) continue;
+      if (typeof this._rootClaim?.selfClosestReachable === 'function' && this._rootClaim.selfClosestReachable(t)) continue;
+      await this._readRepair(t).catch(() => {});
+    }
   },
 
   // Replicate a root's full cache+tombstones to its K-closest COHORT — the set a
