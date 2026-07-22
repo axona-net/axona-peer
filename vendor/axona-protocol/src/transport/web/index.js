@@ -843,7 +843,12 @@ export function webTransport({
     pingTimer = setInterval(() => {
       if (!socket || !socketOpen) return;
       try {
-        socket.send(JSON.stringify({ type: 'ping', t: Date.now() }));
+        // Piggyback the peer's mesh vitality on the heartbeat: meshBound is the
+        // count of authenticated, currently-bound mesh peers — the same value
+        // the graduation floor trusts locally. The bridge uses it to graduate
+        // the best-meshed peer first (vitality-based graduation, #374), rather
+        // than guessing from uptime. Additive field; no wire-version change.
+        socket.send(JSON.stringify({ type: 'ping', t: Date.now(), meshBound: meshBoundCount() }));
         bridge._emitPingTraffic('sent');
       } catch (err) {
         log('bridge-ping-send-failed', { err: err.message });
@@ -866,6 +871,16 @@ export function webTransport({
   composite.mesh    = mesh;
   composite.webrtc  = webrtc;
   composite.bridge  = bridge;
+
+  // Probe/observability affordance (graduation_probe.mjs, #374): close ONLY
+  // the bridge WebSocket, leaving the WebRTC mesh untouched, to observe
+  // whether the mesh survives a bridge departure. This is deliberately NOT a
+  // graceful transport.stop() — it severs the bridge link exactly as a
+  // graduation 4200 does, so the probe can watch what tears the mesh down.
+  // No production code path calls this; it is a no-op if the socket is gone.
+  composite.__probeCloseBridgeSocket = (code = 1000, reason = 'probe') => {
+    try { socket?.close(code, reason); } catch { /* already gone */ }
+  };
 
   // ── Peer-relayed signaling surface (bridgeless connect) ──────────────
   // Only meaningful when meshRelay is enabled; an AxonaPeer detects these
