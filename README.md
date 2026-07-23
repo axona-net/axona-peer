@@ -1,5 +1,21 @@
 # axona-peer — the reference browser peer (deprecated)
 
+> ## ⛔ FROZEN — no further updates
+>
+> This repository is **deprecated and frozen as of kernel v4.38.0**. It is kept
+> only as a bare-metal source reference; it is **not hosted** (GitHub Pages is
+> disabled, no domain) and receives **no further changes** — not doc-link
+> refreshes, whitepaper/PDF syncs, review copy, kernel re-vendors, or version
+> bumps. Do not update anything in this repo. The kernel it vendors under
+> `vendor/axona-protocol/` will drift from the live protocol and that is
+> expected.
+>
+> **Where the living projects moved:**
+> - **axona.net** (the website) → **[axona-net/axona-web](https://github.com/axona-net/axona-web)**
+> - **a real application** → **<https://axona.chat>** ([axona-net/axona-chat](https://github.com/axona-net/axona-chat))
+> - **the minimal build-along demo** → **<https://demo.axona.net>** (`apps/axona-minimal` in [axona-net/axona-protocol](https://github.com/axona-net/axona-protocol))
+> - **headless node** → **[axona-net/axona-relay](https://github.com/axona-net/axona-relay)**
+
 The original **axona.net** application: a full `@axona/protocol` kernel node
 that runs in a browser tab. It bootstraps to an
 [`axona-bridge`](https://github.com/axona-net/axona-bridge) over WebSocket,
